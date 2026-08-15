@@ -84,20 +84,45 @@ off with a warning.
 Threading
 ---------
 
-PAFF forces single-threaded encoding (i_threads = 1):
+PAFF supports frame-based threading.  Slice-based threading
+(--sliced-threads) is rejected at validation with an explicit error.
 
-  * Slice-based threading (--sliced-threads) is rejected at validation with an
-    explicit error.
-  * Frame-based threading is not yet supported and is forced down to 1 with a
-    warning.  Requesting --threads N under --paff therefore produces output
-    byte-identical to --threads 1.
+A complementary field pair is coded as one frame-thread job (both field
+passes synchronously on one slot).  Reference readiness is hybrid:
 
-A complementary field pair is coded within one frame-thread slot, and the pair
-is only usable as a reference after both of its fields are reconstructed and
-filtered.  That whole-pair availability does not fit x264's frame-thread model
-(which pipelines on per-row filter completion), so frame threads are deferred
-to future work.  Low-latency slicing is likewise future work.  This is the main
-throughput cost of PAFF today -- expect roughly single-core speed.
+  * the pair's FIRST field becomes usable as a reference at a phase
+    boundary: after the intermediate full-frame sweep between the two passes
+    (reconstruction, field-layout copy, borders and hpel complete for that
+    parity);
+  * rows of the pair's SECOND field become usable at row cadence during the
+    second pass, trailing the deblock by one field row, exactly like the
+    progressive per-row filter-completion model.
+
+Dependent pairs gate through the standard frame-thread machinery: at each MB
+row start the encoder waits per reference field until its completed row
+count covers the search window (thresholds in field lines), then restricts
+the vertical MV range accordingly.  The pair's own first field (referenced
+by its second field) is produced by the same job and is never waited on.
+Because every pass references BOTH fields of the previous pair while both
+passes of a pair are serial inside one job, a P-chain tops out at roughly
+2x (pair time / pass time) minus MV-clamp losses no matter the thread
+count; B-pyramid siblings gate on the same anchor and overlap more.  See
+doc/threads.txt for measured numbers.
+
+Determinism contract: output is deterministic at a fixed thread count
+(two runs with identical parameters and N produce byte-identical output,
+including --non-deterministic semantics), matching progressive frame
+threading.  Output at N > 1 threads is NOT byte-identical to --threads 1:
+the MV-range clamp of frame threading applies as in progressive encoding.
+--threads 1 output never broadcasts or waits and stays identical to the
+pre-threading implementation.
+
+Known pre-existing issue (future work): the vertical MV-limit geometry is
+frame-based (sized by the full frame height, about 2x wider than a field
+needs), so motion search can over-search into the padding; only the
+thread clamp is in field units.  Row-granular readiness for the FIRST
+field (dropping the intermediate sweep) and low-latency slicing are
+likewise future work.
 
 
 Unsupported combinations (rejected at validation)
@@ -129,7 +154,7 @@ On genuinely interlaced content PAFF is the best interlaced mode x264 has, and
 competitive with progressive coding of the same material.  Measured on
 tinterlace'd test clips at matched bitrate (CRF sweep, PSNR-Y):
 
-  * PAFF vs MBAFF: roughly +2.9 dB on detailed content, ~+3.5 dB on
+  * PAFF vs MBAFF: roughly +2.9 dB on detailed content, ~+3 dB on
     blurred/"natural" content.
   * PAFF vs progressive: about parity (+0.25 dB) -- PAFF's per-field motion
     compensation recovers the cost of coding two slice headers.

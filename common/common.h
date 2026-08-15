@@ -277,6 +277,40 @@ typedef struct
     int i_ssim_cnt;
 } x264_frame_stat_t;
 
+/* PAFF frame-thread job parameters: written by the caller (serially, after
+ * this slot's context sync, before dispatch) and read-only by the pool job.
+ * Kept outside the thread_sync_context memcpy region. */
+typedef struct
+{
+    /* pair-level reference lists, per pass: [0] = pre-marking (pass 0),
+     * [1] = post-marking (pass 1, with the first field's DPB marking
+     * applied).  The job presents these to slice_init and restores the
+     * post-marking view for frame-end consumers. */
+    int          pair_count[2][2];                 /* [pass][list] */
+    x264_frame_t *pair_fref[2][2][X264_REF_MAX+3]; /* [pass][list][entry] */
+    /* per-pass field-expanded lists (decoder default order, 8.2.4.2.4/8.2.4.2.5)
+     * and per-entry parity/frame maps, expanded by the caller before dispatch. */
+    int          i_ref[2][2];                      /* [pass][list] */
+    x264_frame_t *fref[2][2][X264_REF_MAX+3];      /* [pass][list][entry] */
+    int8_t       i_fref_frame[2][2][X264_REF_MAX*2];
+    int8_t       i_fref_parity[2][2][X264_REF_MAX*2];
+    int          i_paff_field_ref[2][2];           /* [pass][list] */
+    int          i_num_ref_idx_active[2][2];       /* [pass][list] */
+    int          b_num_ref_idx_override[2];        /* [pass] */
+    /* slice-header values fixed by the caller (the job never writes the
+     * canonical counters): the pre-increment frame_num (7.4.3: one per
+     * complementary pair) and the pre-toggle idr_pic_id of an IDR first field. */
+    int          i_frame_num;
+    int          i_idr_pic_id;
+    /* pair-level coding parameters (the caller's locals at dispatch time).
+     * No i_nal_ref_idc: the job codes both passes against the live
+     * h->i_nal_ref_idc, as slice_write does. */
+    int          i_global_qp;
+    int          i_nal_type;
+    int          base_poc;
+    int          pair_slice_type;
+} x264_paff_job_t;
+
 struct x264_t
 {
     /* encoder parameters */
@@ -318,6 +352,14 @@ struct x264_t
 
     x264_t          *reconfig_h;
     int             reconfig;
+
+    /* PAFF frame-thread state (slot-local, outside the sync region):
+     * job parameters for the pool work item, and the DPB pairs evicted by
+     * this slot's caller-side first-field marking whose push_unused is
+     * deferred until this slot's job is harvested (a pass-0 list may still
+     * reference them; NULL-terminated). */
+    x264_paff_job_t paff_job;
+    x264_frame_t   *paff_evicted[X264_REF_MAX+3];
 
     /**** thread synchronization starts here ****/
 

@@ -223,11 +223,30 @@ void x264_analyse_weight_frame( x264_t *h, int end )
         if( h->sh.weight[j][0].weightfn )
         {
             x264_frame_t *frame = h->fref[0][j];
+            /* PAFF: the weighted plane is frame-layout (it covers rows of
+             * both parities), while the analyse wait loop only gated this
+             * entry's own parity -- the other parity of the same frame may
+             * have been truncated out of the field-expanded list, so gate
+             * both parities of the source frame here (end is in field lines).
+             * fdec never carries a weight (weighted_pred_init skips the
+             * complementary entry), so this never waits on the pair's own job.
+             * The i_thread_frames guard is load-bearing, not redundant with
+             * the caller's: the per-parity counters are never broadcast at
+             * i_thread_frames == 1, so an unguarded wait would block forever. */
+            if( h->param.b_paff && h->i_thread_frames > 1 )
+                for( int p = 0; p < 2; p++ )
+                    x264_frame_cond_wait_fld( frame->orig, p, end );
             int width = frame->i_width[0] + PADH2;
-            int i_padv = PADV << PARAM_INTERLACED;
-            int offset, height;
+            int i_padv = PADV << PARAM_FIELDCODE;
+            int offset, height, need;
             pixel *src = frame->filtered[0][0] - frame->i_stride[0]*i_padv - PADH_ALIGN;
-            height = X264_MIN( 16 + end + i_padv, h->fref[0][j]->i_lines[0] + i_padv*2 ) - h->fenc->i_lines_weighted;
+            /* PAFF: end is in field lines, but the weighted plane is frame
+             * layout and MC reads it through the woven field view (one field
+             * line = 2 frame rows), so the extent -- including the 16-line
+             * block margin of the formula -- doubles; +1 covers the
+             * opposite-parity row of the last field line. */
+            need = h->param.b_paff ? 2*(16 + end) + 1 : 16 + end;
+            height = X264_MIN( need + i_padv, h->fref[0][j]->i_lines[0] + i_padv*2 ) - h->fenc->i_lines_weighted;
             offset = h->fenc->i_lines_weighted*frame->i_stride[0];
             h->fenc->i_lines_weighted += height;
             if( height )
@@ -356,12 +375,35 @@ static void mb_analyse_init( x264_t *h, x264_mb_analysis_t *a, int qp )
             {
                 int pix_y = (h->mb.i_mb_y | PARAM_INTERLACED) * 16;
                 int thresh = pix_y + h->param.analyse.i_mv_range_thread;
-                for( int i = (h->sh.i_type == SLICE_TYPE_B); i >= 0; i-- )
-                    for( int j = 0; j < h->i_ref[i]; j++ )
+                if( h->param.b_paff )
+                {
+                    /* PAFF: wait per reference FIELD, in field lines of each
+                     * entry's own parity; the current MB's top field line is
+                     * 16*(i_mb_y>>1) (the field has i_lines/2 lines).  The
+                     * pair's own first field (fref == h->fdec, the
+                     * complementary entry) is coded by this same job and is
+                     * always complete -- waiting on it would deadlock. */
+                    pix_y = (h->mb.i_mb_y >> 1) * 16;
+                    thresh = pix_y + h->param.analyse.i_mv_range_thread;
+                    for( int i = (h->sh.i_type == SLICE_TYPE_B); i >= 0; i-- )
                     {
-                        int completed = x264_frame_cond_wait( h->fref[i][j]->orig, thresh );
-                        thread_mvy_range = X264_MIN( thread_mvy_range, completed - pix_y );
+                        int8_t *parity_map = i ? h->mb.pic.i_fref_parity_l1 : h->mb.pic.i_fref_parity;
+                        for( int j = 0; j < h->i_ref[i]; j++ )
+                        {
+                            if( h->fref[i][j] == h->fdec )
+                                continue;
+                            int completed = x264_frame_cond_wait_fld( h->fref[i][j]->orig, parity_map[j], thresh );
+                            thread_mvy_range = X264_MIN( thread_mvy_range, completed - pix_y );
+                        }
                     }
+                }
+                else
+                    for( int i = (h->sh.i_type == SLICE_TYPE_B); i >= 0; i-- )
+                        for( int j = 0; j < h->i_ref[i]; j++ )
+                        {
+                            int completed = x264_frame_cond_wait( h->fref[i][j]->orig, thresh );
+                            thread_mvy_range = X264_MIN( thread_mvy_range, completed - pix_y );
+                        }
 
                 if( h->param.b_deterministic )
                     thread_mvy_range = h->param.analyse.i_mv_range_thread;
@@ -3870,8 +3912,26 @@ static void analyse_update_cache( x264_t *h, x264_mb_analysis_t *a  )
             int ref = h->mb.cache.ref[l][x264_scan8[0]];
             if( ref < 0 )
                 continue;
-            completed = x264_frame_cond_wait( h->fref[l][ ref >> MB_INTERLACED ]->orig, -1 );
-            if( (h->mb.cache.mv[l][x264_scan8[15]][1] >> (2 - MB_INTERLACED)) + h->mb.i_mb_y*16 > completed )
+            int mvy_limit;
+            if( h->param.b_paff )
+            {
+                /* PAFF: ref indexes the field-expanded list directly (no
+                 * MBAFF-style ref>>1); the MV is in field units and the
+                 * per-parity counter is in field lines.  The pair's own
+                 * complementary field is produced by this same job and is
+                 * always complete. */
+                if( h->fref[l][ref] == h->fdec )
+                    continue;
+                int8_t *parity_map = l ? h->mb.pic.i_fref_parity_l1 : h->mb.pic.i_fref_parity;
+                completed = x264_frame_cond_wait_fld( h->fref[l][ref]->orig, parity_map[ref], -1 );
+                mvy_limit = (h->mb.cache.mv[l][x264_scan8[15]][1] >> 2) + (h->mb.i_mb_y >> 1)*16;
+            }
+            else
+            {
+                completed = x264_frame_cond_wait( h->fref[l][ ref >> MB_INTERLACED ]->orig, -1 );
+                mvy_limit = (h->mb.cache.mv[l][x264_scan8[15]][1] >> (2 - MB_INTERLACED)) + h->mb.i_mb_y*16;
+            }
+            if( mvy_limit > completed )
             {
                 x264_log( h, X264_LOG_WARNING, "internal error (MV out of thread range)\n");
                 x264_log( h, X264_LOG_DEBUG, "mb type: %d \n", h->mb.i_type);

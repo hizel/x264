@@ -71,17 +71,25 @@ before reconfiguring.
   C prototype and be registered the same way.
 - **Threading**: slice/frame threads + lookahead thread
   (`common/threadpool.c`, `encoder/lookahead.c`). See `doc/threads.txt`.
-  Determinism only with `--threads 1` (used by tests).
+  Output is deterministic at a fixed thread count (progressive and PAFF);
+  byte-exact regression uses `--threads 1` since N > 1 applies the MV-range
+  clamp.
 - **Interlacing / PAFF**: two interlaced modes. MBAFF (`--interlaced`) codes a
   whole frame with optional field macroblock pairs. PAFF (`--paff`) codes each
   field as its own coded picture — a complementary field pair per input frame,
-  driven by the two-pass loop in `x264_encoder_encode` (`encoder/encoder.c`,
-  the `paff_*` helpers). PAFF keeps frame-level RC decisions but accounts bits
-  per field and steps VBV per field access unit; per-field SEI (`pic_timing`
-  pic_struct 1/2, `buffering_period`). PAFF forces `i_threads=1` (sliced
-  threads rejected, frame threads deferred). PAFF and MBAFF are mutually
-  exclusive. See `doc/paff.txt`. Non-PAFF output must stay bit-identical: all
-  PAFF paths are gated on `param.b_paff`.
+  driven by the pool job in `paff_pair_write` (`encoder/encoder.c`); the
+  caller performs pair-list snapshots, the first field's DPB marking,
+  `i_frame_num`/`i_idr_pic_id` advancement and both passes' field-list
+  expansions serially before dispatch.  PAFF keeps frame-level RC decisions
+  but accounts bits per field and steps VBV per field access unit; per-field
+  SEI (`pic_timing` pic_struct 1/2, `buffering_period`).  Frame threading is
+  supported: readiness is hybrid (first field gated on the intermediate-sweep
+  phase, second-field rows gated at row cadence), dependent pairs wait per
+  reference field and clamp their vertical MV range in field lines; output
+  is deterministic at a fixed thread count but not byte-identical to
+  `--threads 1`.  Sliced threads are rejected; PAFF and MBAFF are mutually
+  exclusive.  See `doc/paff.txt`.  Non-PAFF output must stay bit-identical:
+  all PAFF paths are gated on `param.b_paff`.
 - **API versioning**: `version.sh` derives `X264_VERSION`/`X264_POINTVER`
   from git history; `x264_encoder_open` is `#define`d to
   `x264_encoder_open_<X264_BUILD>`.
@@ -100,6 +108,25 @@ before reconfiguring.
   (e.g. PAFF MMCO/DPB-marking messages live in
   `libavcodec/h264_refs.c`). The installed binary is a separate build
   (`ffmpeg -version`); for trace decode logs use `ffmpeg -v trace`.
+- **rr (record/replay debugger)**: installed (5.9.0); used to root-cause
+  the PAFF fixed-N determinism bug (`ref_blind_dupe`, change
+  `paff-frame-threads` task 9.3). Machine setup: AMD Zen needs the
+  SpecLockMap MSR workaround — fetch
+  `scripts/zen_workaround.py` from the rr repo and run as root
+  (`modprobe msr` first), rerun after every reboot — plus
+  `kernel.perf_event_paranoid=1`; and rr 5.9 predates
+  `MADV_GUARD_INSTALL` (kernel 6.14+, which glibc pthread now uses for
+  thread guard pages) and aborts on it — LD_PRELOAD a tiny seccomp
+  shim returning EINVAL for `madvise(102/103)` so glibc falls back to
+  mprotect. Workflow for nondeterminism bugs: build `--disable-asm
+  -O1 -g` in a git worktree, `rr record` a series, group outputs by
+  checksum, `rr replay` a diverging pair with a gdb script on stdin.
+  gdb caveats at -O1: run `run` before `break` (rr loads symbols only
+  at the first stop), conditions referencing optimized-out parameters
+  fail silently (prefer file:line breakpoints and verify every stop
+  with `bt`), and function breakpoints on fully inlined callees never
+  hit. Related trick: `-ftrivial-auto-var-init=pattern` determinizes
+  stack-garbage bugs (proof of mechanism), but is not a fix.
 - `tools/test_x264.py` is legacy (Python 2, depends on bundled `digress`);
   don't rely on it for new work.
 - There is no unit-test framework; correctness is checked via checkasm +

@@ -177,6 +177,11 @@ typedef struct x264_frame
 
     /* threading */
     int     i_lines_completed; /* in pixels */
+    /* PAFF: per-parity reconstruction progress, in field lines of each
+     * parity's own field (the field has i_lines/2 lines).  Same protocol
+     * as i_lines_completed: -1 = not started, X264 sentinel 10000 = done.
+     * Shares this frame's mutex/cv.  Unused outside PAFF. */
+    int     i_lines_completed_fld[2];
     int     i_lines_weighted; /* FIXME: this only supports weighting of one reference frame */
     int     i_reference_count; /* number of threads using this frame (not necessarily the number of pointers) */
     x264_pthread_mutex_t mutex;
@@ -277,8 +282,12 @@ void          x264_deblock_init( uint32_t cpu, x264_deblock_function_t *pf, int 
 
 #define x264_frame_cond_broadcast x264_template(frame_cond_broadcast)
 void          x264_frame_cond_broadcast( x264_frame_t *frame, int i_lines_completed );
+#define x264_frame_cond_broadcast_fld x264_template(frame_cond_broadcast_fld)
+void          x264_frame_cond_broadcast_fld( x264_frame_t *frame, int parity, int i_lines_completed );
 #define x264_frame_cond_wait x264_template(frame_cond_wait)
 int           x264_frame_cond_wait( x264_frame_t *frame, int i_lines_completed );
+#define x264_frame_cond_wait_fld x264_template(frame_cond_wait_fld)
+int           x264_frame_cond_wait_fld( x264_frame_t *frame, int parity, int i_lines_completed );
 #define x264_frame_new_slice x264_template(frame_new_slice)
 int           x264_frame_new_slice( x264_t *h, x264_frame_t *frame );
 

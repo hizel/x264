@@ -39,6 +39,32 @@ _Avoid_: pure-field picture
 **Field order (TFF/BFF)**:
 Which field is displayed first: top (TFF) or bottom (BFF).
 
+## Threading
+
+**Frame-thread slot**:
+One of the `i_thread_frames` encoder contexts. Each slot codes one unit at
+a time (progressive: a frame; PAFF: a complementary field pair) and slots
+rotate round-robin per coded unit; the output of a slot is returned to the
+caller several units later.
+_Avoid_: frame thread (that is the thread, not the slot)
+
+**Readiness**:
+How much of an in-flight reference picture is final and safe to read from
+another slot's motion search. **Phase-granular**: fixed points only (after
+the intermediate sweep, after the pair finishes). **Row-granular**: rows of
+the picture become readable as the coding pass progresses. Row-granular
+readiness forces a motion-vector range clamp, exactly as progressive frame
+threads do. **Hybrid**: the PAFF model — the first field of a pair is
+phase-granular, the second is row-granular.
+_Avoid_: progress (of a reference)
+
+**Intermediate sweep**:
+The reference-data generation run between the two field passes
+(`paff_sync_references`): copies the reconstructed rows into the field
+layout and builds field borders + half-pixel data, making the first field
+usable as a reference before the second pass starts.
+_Avoid_: sync pass
+
 ## Bitstream
 
 **Coded picture**:
