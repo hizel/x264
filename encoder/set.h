@@ -48,7 +48,7 @@ int  x264_validate_levels( x264_t *h, int verbose );
 #define x264_sei_buffering_period_write x264_template(sei_buffering_period_write)
 void x264_sei_buffering_period_write( x264_t *h, bs_t *s );
 #define x264_sei_pic_timing_write x264_template(sei_pic_timing_write)
-void x264_sei_pic_timing_write( x264_t *h, bs_t *s );
+void x264_sei_pic_timing_write( x264_t *h, bs_t *s, int i_field_tick_offset );
 #define x264_sei_dec_ref_pic_marking_write x264_template(sei_dec_ref_pic_marking_write)
 void x264_sei_dec_ref_pic_marking_write( x264_t *h, bs_t *s );
 #define x264_sei_frame_packing_write x264_template(sei_frame_packing_write)

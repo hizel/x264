@@ -389,7 +389,8 @@ REALIGN_STACK void x264_param_default( x264_param_t *param )
     param->i_bframe_adaptive = X264_B_ADAPT_FAST;
     param->i_bframe_bias = 0;
     param->i_bframe_pyramid = X264_B_PYRAMID_NORMAL;
-    param->b_interlaced = 0;
+    param->b_interlaced = X264_INTERLACED_OFF;
+    param->b_paff = 0;
     param->b_constrained_intra = 0;
 
     param->b_deblocking_filter = 1;
@@ -803,6 +804,11 @@ REALIGN_STACK int x264_param_apply_profile( x264_param_t *param, const char *pro
             x264_log_internal( X264_LOG_ERROR, "baseline profile doesn't support fake interlacing\n" );
             return -1;
         }
+        if( param->b_paff )
+        {
+            x264_log_internal( X264_LOG_ERROR, "baseline profile doesn't support PAFF\n" );
+            return -1;
+        }
     }
     else if( p == PROFILE_MAIN )
     {
@@ -1155,6 +1161,8 @@ REALIGN_STACK int x264_param_parse( x264_param_t *p, const char *name, const cha
         p->i_cabac_init_idc = atoi(value);
     OPT("interlaced")
         p->b_interlaced = atobool(value);
+    OPT("paff")
+        p->b_paff = atobool(value);
     OPT("tff")
         p->b_interlaced = p->b_tff = atobool(value);
     OPT("bff")
@@ -1480,6 +1488,7 @@ char *x264_param2string( x264_param_t *p, int b_res )
     s += sprintf( s, " nr=%d", p->analyse.i_noise_reduction );
     s += sprintf( s, " decimate=%d", p->analyse.b_dct_decimate );
     s += sprintf( s, " interlaced=%s", p->b_interlaced ? p->b_tff ? "tff" : "bff" : p->b_fake_interlaced ? "fake" : "0" );
+    s += sprintf( s, " paff=%d", p->b_paff );
     s += sprintf( s, " bluray_compat=%d", p->b_bluray_compat );
     if( p->b_stitchable )
         s += sprintf( s, " stitchable=%d", p->b_stitchable );

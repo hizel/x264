@@ -703,9 +703,9 @@ void x264_mc_init( uint32_t cpu, x264_mc_functions_t *pf, int cpu_independent )
 
 void x264_frame_filter( x264_t *h, x264_frame_t *frame, int mb_y, int b_end )
 {
-    const int b_interlaced = PARAM_INTERLACED;
+    const int b_interlaced = PARAM_INTERLACED || FIELD_PIC;
     int start = mb_y*16 - 8; // buffer = 4 for deblock + 3 for 6tap, rounded to 8
-    int height = (b_end ? frame->i_lines[0] + 16*PARAM_INTERLACED : (mb_y+b_interlaced)*16) + 8;
+    int height = (b_end ? frame->i_lines[0] + 16*b_interlaced : (mb_y+b_interlaced)*16) + 8;
 
     if( mb_y & b_interlaced )
         return;

@@ -70,12 +70,16 @@
 #if HAVE_INTERLACED
 #   define MB_INTERLACED h->mb.b_interlaced
 #   define SLICE_MBAFF h->sh.b_mbaff
+#   define FIELD_PIC h->sh.b_field_pic
 #   define PARAM_INTERLACED h->param.b_interlaced
 #else
 #   define MB_INTERLACED 0
 #   define SLICE_MBAFF 0
+#   define FIELD_PIC 0
 #   define PARAM_INTERLACED 0
 #endif
+/* any field-coding mode: MBAFF or PAFF field pictures */
+#define PARAM_FIELDCODE (PARAM_INTERLACED || h->param.b_paff)
 
 #ifdef CHROMA_FORMAT
 #    define CHROMA_H_SHIFT (CHROMA_FORMAT == CHROMA_420 || CHROMA_FORMAT == CHROMA_422)
@@ -198,6 +202,12 @@ typedef struct
     {
         int i_difference_of_pic_nums;
         int i_poc;
+        /* PAFF (D4): target field parity of this opcode (0=top, 1=bottom).
+         * Encoder-internal only -- not written to the bitstream (the decoder
+         * resolves the target field from difference_of_pic_nums and the
+         * current slice's field_pic_flag per 8.2.5.4.1).  Unused for frame
+         * pictures. */
+        uint8_t i_field_parity;
     } mmco[X264_REF_MAX];
 
     int i_cabac_init_idc;
@@ -296,6 +306,11 @@ struct x264_t
         int         i_bitstream;    /* size of p_bitstream */
         uint8_t     *p_bitstream;   /* will hold data for all nal */
         bs_t        bs;
+        /* PAFF: NAL index where the pair's second field AU starts (count of
+         * NALs completed by the end of the first field pass).  Set by the
+         * PAFF pair driver every pair; the per-field VBV model splits the
+         * frame's NAL payload sums at this boundary. */
+        int         i_paff_au_boundary;
     } out;
 
     uint8_t *nal_buffer;
@@ -368,6 +383,16 @@ struct x264_t
     /* Slice header backup, for SEI_DEC_REF_PIC_MARKING */
     int b_sh_backup;
     x264_slice_header_t sh_backup;
+
+    /* PAFF (D4): one-shot warning flag for ignored per-frame pic_struct
+     * (pulldown) inputs, which PAFF cannot honour. */
+    int b_paff_pic_struct_warned;
+
+    /* PAFF (task 5.3): one-shot warning flag for the hard-clamped mmco[]
+     * capacity guard -- PAFF emits two eviction opcodes per field pair,
+     * halving the X264_REF_MAX opcode budget; once exhausted further
+     * evictions are skipped rather than overflowing the buffer. */
+    int b_paff_mmco_clamp_warned;
 
     /* cabac context */
     x264_cabac_t    cabac;
@@ -601,6 +626,31 @@ struct x264_t
 
             /* pointer over mb of the references */
             int i_fref[2];
+            /* PAFF field pictures (D16): the expanded L0 list interleaves
+             * single-parity entries (the complementary first field sits
+             * mid-list), so expanded index j no longer maps to frame j>>1.
+             * i_fref_parity[j] is the absolute parity (0=top, 1=bottom) of
+             * field entry j; set once per pass by paff_expand_field_list and
+             * read by MC plane selection (macroblock_load_pic_pointers), the
+             * chroma v-offset (me.c), deblock_ref_table and ref_poc.
+             * i_fref_frame[j] is field entry j's index into the pair-level
+             * fref[0] (-1 for the complementary field = h->fdec); it is read
+             * ONLY by the ratecontrol ref-count folding (ratecontrol.c).
+             * i_paff_field_ref0 is the field-entry count of the last pass
+             * (same value as i_fref[0] after expansion), kept for that fold. */
+            int8_t i_fref_parity[X264_REF_MAX*2];
+            int8_t i_fref_frame[X264_REF_MAX*2];
+            int i_paff_field_ref0;          /* field-entry count of the last pass */
+            /* PAFF (1.1b): L1 counterparts of the L0 field-entry maps above,
+             * filled by the L1 field expansion (paff_expand_field_list with
+             * i_list=1).  i_fref_parity_l1 is read by MC plane selection, the
+             * chroma v-offset and the colocated-parity route in
+             * map_col_to_list0.  i_fref_frame_l1 currently has NO readers
+             * (ratecontrol folds L0 only); it is kept for symmetry with L0
+             * and for future per-field colocated consumers. */
+            int8_t i_fref_parity_l1[X264_REF_MAX*2];
+            int8_t i_fref_frame_l1[X264_REF_MAX*2];
+            int i_paff_field_ref1;          /* field-entry count of the last L1 pass */
             /* [12]: yN, yH, yV, yHV, (NV12 ? uv : I444 ? (uN, uH, uV, uHV, vN, ...)) */
             pixel *p_fref[2][X264_REF_MAX*2][12];
             pixel *p_fref_w[X264_REF_MAX*2];  /* weighted fullpel luma */

@@ -26,6 +26,8 @@ config.log
 x264_config.h
 x264
 checkasm
+checkasm8
+checkasm10
 
 *.264
 *.h264
@@ -49,3 +51,6 @@ dataDec.txt
 log.dec
 common/oclobj.h
 x264_lookahead.clbin
+
+.pi/
+T-REC-H.264-*-E.pdf

@@ -49,6 +49,10 @@ typedef struct x264_frame
     int64_t i_duration;  /* in SPS time_scale units (i.e 2 * timebase units) used for vfr */
     float   f_duration;  /* in seconds */
     int64_t i_cpb_duration;
+    /* PAFF (D2): per-coded-field stat bits of this complementary pair
+     * ([0] = first coded field), written by the field-pair driver for the
+     * per-field VBV model.  Unused (stale) for frame pictures. */
+    int i_field_bits[2];
     int64_t i_cpb_delay; /* in SPS time_scale units (i.e 2 * timebase units) */
     int64_t i_dpb_output_delay;
     x264_param_t *param;
@@ -58,6 +62,12 @@ typedef struct x264_frame
     int64_t i_field_cnt; /* Presentation field count */
     int     i_frame_num; /* 7.4.3 frame_num */
     int     b_kept_as_ref;
+    /* PAFF (D4): per-field "used for reference" marking.  [0]=top, [1]=bottom.
+     * A complementary pair is one DPB slot and stays in h->frames.reference[]
+     * while either field is kept; MMCO opcode 1 with field_pic_flag (8.2.5.4.1)
+     * clears a single field, and the frame is dropped only once both fields are
+     * free.  Non-PAFF frame pictures use only the frame-level b_kept_as_ref. */
+    uint8_t b_field_kept_as_ref[2];
     int     i_pic_struct;
     int     b_keyframe;
     uint8_t b_fdec;
@@ -66,7 +76,10 @@ typedef struct x264_frame
     float   f_qp_avg_rc; /* QPs as decided by ratecontrol */
     float   f_qp_avg_aq; /* QPs as decided by AQ in addition to ratecontrol */
     float   f_crf_avg;   /* Average effective CRF for this frame */
-    int     i_poc_l0ref0; /* poc of first refframe in L0, used to check if direct temporal is possible */
+    /* PAFF (1.1d): poc of first refframe in L0 per field parity, used to check
+     * if direct temporal is possible.  [0]=top, [1]=bottom; non-PAFF uses [0].
+     * Under PAFF it is recomputed per pass from the field-expanded L0[0]. */
+    int     i_poc_l0ref0[2];
 
     /* YUV buffer */
     int     i_csp; /* Internal csp */
@@ -113,9 +126,21 @@ typedef struct x264_frame
 
     int     *lowres_mv_costs[2][X264_BFRAME_MAX+1];
     int8_t  *ref[2];
-    int     i_ref[2];
-    int     ref_poc[2][X264_REF_MAX];
+    /* PAFF (D7/ADR-0004/1.1c): per-field ref storage with a parity dimension
+     * ([list][parity][ref]); non-PAFF / MBAFF / progressive use parity 0
+     * (canonical).  Under PAFF the per-pass expansion writes the current
+     * pass's parity slot so both coexist on the frame for a later B field
+     * colocating to either parity. */
+    int     i_ref[2][2];
+    int     ref_poc[2][2][X264_REF_MAX];
     int16_t inv_ref_poc[2]; // inverse values of ref0 poc to avoid divisions in temporal MV prediction
+    /* PAFF (2.2a): bitmask of which fields of this stored frame are currently
+     * marked 'used for reference' in the DPB (bit0=top, bit1=bottom).  Set by
+     * paff_expand_field_list (mirroring its internal ent_avail) so the temporal
+     * direct colocated path can skip an absent field per 8.4.1.2.4 (the IDR
+     * second-field survivor contributes only one field).  Zero-initialised;
+     * set only by paff_expand_field_list under PAFF, never read outside PAFF. */
+    uint8_t i_field_avail;
 
     /* for adaptive B-frame decision.
      * contains the SATD cost of the lowres frame encoded in various modes

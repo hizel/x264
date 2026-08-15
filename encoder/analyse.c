@@ -1243,6 +1243,7 @@ static void intra_rd_refine( x264_t *h, x264_mb_analysis_t *a )
         (m)->integral = &h->mb.pic.p_integral[list][ref][(xoff)+(yoff)*(m)->i_stride[0]]; \
     (m)->weight = x264_weight_none; \
     (m)->i_ref = ref; \
+    (m)->i_list = list; \
 }
 
 #define LOAD_WPELS(m, src, list, ref, xoff, yoff) \
@@ -1618,7 +1619,7 @@ static ALWAYS_INLINE int mb_analyse_inter_p4x4_chroma_internal( x264_t *h, x264_
     int chroma_v_shift = chroma == CHROMA_420;
     int or = 8*(i8x8&1) + (4>>chroma_v_shift)*(i8x8&2)*i_stride;
     int i_ref = a->l0.me8x8[i8x8].i_ref;
-    int mvy_offset = chroma_v_shift && MB_INTERLACED & i_ref ? (h->mb.i_mb_y & 1)*4 - 2 : 0;
+    int mvy_offset = chroma_v_shift && MB_INTERLACED & (FIELD_PIC ? (h->mb.pic.i_fref_parity[i_ref] ^ h->sh.b_bottom_field) : i_ref) ? (h->mb.i_mb_y & 1)*4 - 2 : 0;
     x264_weight_t *weight = h->sh.weight[i_ref];
 
     // FIXME weight can be done on 4x4 blocks even if mc is smaller
@@ -1816,8 +1817,8 @@ static ALWAYS_INLINE int analyse_bi_chroma( x264_t *h, x264_mb_analysis_t *a, in
     else \
     { \
         int v_shift = CHROMA_V_SHIFT; \
-        int l0_mvy_offset = v_shift & MB_INTERLACED & m0.i_ref ? (h->mb.i_mb_y & 1)*4 - 2 : 0; \
-        int l1_mvy_offset = v_shift & MB_INTERLACED & m1.i_ref ? (h->mb.i_mb_y & 1)*4 - 2 : 0; \
+        int l0_mvy_offset = v_shift & MB_INTERLACED & (FIELD_PIC ? (h->mb.pic.i_fref_parity[m0.i_ref] ^ h->sh.b_bottom_field) : m0.i_ref) ? (h->mb.i_mb_y & 1)*4 - 2 : 0; \
+        int l1_mvy_offset = v_shift & MB_INTERLACED & (FIELD_PIC ? (h->mb.pic.i_fref_parity_l1[m1.i_ref] ^ h->sh.b_bottom_field) : m1.i_ref) ? (h->mb.i_mb_y & 1)*4 - 2 : 0; \
         h->mc.mc_chroma( pix[0], pix[1], 16, m0.p_fref[4], m0.i_stride[1], \
                          m0.mv[0], 2*(m0.mv[1]+l0_mvy_offset)>>v_shift, width>>1, height>>v_shift ); \
         h->mc.mc_chroma( pix[2], pix[3], 16, m1.p_fref[4], m1.i_stride[1], \
@@ -2027,7 +2028,7 @@ static void mb_analyse_inter_b16x16( x264_t *h, x264_mb_analysis_t *a )
                 int chromapix = h->luma2chroma_pixel[PIXEL_16x16];
                 int v_shift = CHROMA_V_SHIFT;
 
-                if( v_shift & MB_INTERLACED & a->l0.bi16x16.i_ref )
+                if( v_shift & MB_INTERLACED & (FIELD_PIC ? (h->mb.pic.i_fref_parity[a->l0.bi16x16.i_ref] ^ h->sh.b_bottom_field) : a->l0.bi16x16.i_ref) )
                 {
                     int l0_mvy_offset = (h->mb.i_mb_y & 1)*4 - 2;
                     h->mc.mc_chroma( pixuv[0], pixuv[0]+8, FENC_STRIDE, h->mb.pic.p_fref[0][a->l0.bi16x16.i_ref][4],
@@ -2037,7 +2038,7 @@ static void mb_analyse_inter_b16x16( x264_t *h, x264_mb_analysis_t *a )
                     h->mc.load_deinterleave_chroma_fenc( pixuv[0], h->mb.pic.p_fref[0][a->l0.bi16x16.i_ref][4],
                                                          h->mb.pic.i_stride[1], 16>>v_shift );
 
-                if( v_shift & MB_INTERLACED & a->l1.bi16x16.i_ref )
+                if( v_shift & MB_INTERLACED & (FIELD_PIC ? (h->mb.pic.i_fref_parity_l1[a->l1.bi16x16.i_ref] ^ h->sh.b_bottom_field) : a->l1.bi16x16.i_ref) )
                 {
                     int l1_mvy_offset = (h->mb.i_mb_y & 1)*4 - 2;
                     h->mc.mc_chroma( pixuv[1], pixuv[1]+8, FENC_STRIDE, h->mb.pic.p_fref[1][a->l1.bi16x16.i_ref][4],

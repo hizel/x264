@@ -136,7 +136,7 @@ static void slice_header_init( x264_t *h, x264_slice_header_t *sh,
     sh->i_frame_num = i_frame;
 
     sh->b_mbaff = PARAM_INTERLACED;
-    sh->b_field_pic = 0;    /* no field support for now */
+    sh->b_field_pic = 0;    /* set later by the PAFF field-pair driver */
     sh->b_bottom_field = 0; /* not yet used */
 
     sh->i_idr_pic_id = i_idr_pic_id;
@@ -155,7 +155,10 @@ static void slice_header_init( x264_t *h, x264_slice_header_t *sh,
 
     if( !h->mb.b_direct_auto_read && sh->i_type == SLICE_TYPE_B )
     {
-        if( h->fref[1][0]->i_poc_l0ref0 == h->fref[0][0]->i_poc )
+        /* PAFF (1.1d): i_poc_l0ref0 is per-parity on the frame.  ponytail:
+         * the colocated field parity is a direct-mode detail resolved in task
+         * 2.2; read parity 0 canonically for now (correct for non-PAFF). */
+        if( h->fref[1][0]->i_poc_l0ref0[0] == h->fref[0][0]->i_poc )
         {
             if( h->mb.b_direct_auto_write )
                 sh->b_direct_spatial_mv_pred = ( h->stat.i_direct_score[1] > h->stat.i_direct_score[0] );
@@ -218,6 +221,14 @@ static void slice_header_write( bs_t *s, x264_slice_header_t *sh, int i_nal_ref_
         int first_y = sh->i_first_mb / sh->sps->i_mb_width;
         assert( (first_y&1) == 0 );
         bs_write_ue( s, (2*first_x + sh->sps->i_mb_width*(first_y&~1) + (first_y&1)) >> 1 );
+    }
+    else if( sh->b_field_pic )
+    {
+        /* internally PAFF tracks MBs in frame coordinates (two field rows per
+         * frame MB pair); the bitstream wants the field's own raster. */
+        int first_x = sh->i_first_mb % sh->sps->i_mb_width;
+        int first_y = sh->i_first_mb / sh->sps->i_mb_width;
+        bs_write_ue( s, first_x + sh->sps->i_mb_width*(first_y >> 1) );
     }
     else
         bs_write_ue( s, sh->i_first_mb );
@@ -456,8 +467,58 @@ static int validate_parameters( x264_t *h, int b_open )
 
 #if HAVE_INTERLACED
     h->param.b_interlaced = !!PARAM_INTERLACED;
+    if( h->param.b_paff )
+    {
+        if( h->param.b_interlaced )
+        {
+            x264_log( h, X264_LOG_ERROR, "PAFF is mutually exclusive with MBAFF (--interlaced)\n" );
+            return -1;
+        }
+        if( h->param.b_fake_interlaced )
+        {
+            x264_log( h, X264_LOG_ERROR, "PAFF is mutually exclusive with fake interlacing\n" );
+            return -1;
+        }
+        if( h->param.i_avcintra_class )
+        {
+            x264_log( h, X264_LOG_ERROR, "PAFF is not supported with AVC-Intra\n" );
+            return -1;
+        }
+        /* Weighted prediction (weightp) on P fields: pair-level estimated
+         * weights are mapped onto field-entry references in
+         * weighted_pred_init (task 2.5).  Weighted biprediction (weightb):
+         * the bipred weight tables (bipred_weight_buf[1][parity]) are
+         * filled per PAFF pass with field POCs (implicit weights, task
+         * 2.2d) but do not honour explicit weights, so enabling weightb
+         * would mis-weight B-field bipred.  Warn and disable (implicit
+         * 32/32 weighting stays correct). */
+        if( h->param.analyse.b_weighted_bipred )
+        {
+            x264_log( h, X264_LOG_WARNING, "PAFF does not support weighted biprediction yet: disabling\n" );
+            h->param.analyse.b_weighted_bipred = 0;
+        }
+        if( h->param.b_sliced_threads )
+        {
+            x264_log( h, X264_LOG_ERROR, "PAFF does not support sliced threads\n" );
+            return -1;
+        }
+        if( h->param.i_threads != 1 )
+        {
+            if( h->param.i_threads > 1 )
+                x264_log( h, X264_LOG_WARNING, "PAFF does not support frame threads yet: forcing single-threaded\n" );
+            h->param.i_threads = 1;
+        }
+        /* D8/D2: rate-control soundness boundary.  Rate control runs once
+         * per PAFF pair (ratecontrol_start/end are pair-level, one
+         * i_global_qp feeds both field passes, ratecontrol_end sees the
+         * merged bit-count), which is sound for average-rate control (ABR,
+         * CRF): one pair = one coded picture in the RC sense.  The VBV
+         * buffer model steps per field access unit (vbv_au_step in
+         * ratecontrol.c, task 2.3): each field's AU is removed one field
+         * tick apart with the actual per-AU NAL sizes, per Annex C.1.2. */
+    }
 #else
-    if( h->param.b_interlaced )
+    if( h->param.b_interlaced || h->param.b_paff )
     {
         x264_log( h, X264_LOG_ERROR, "not compiled with interlaced support\n" );
         return -1;
@@ -504,7 +565,7 @@ static int validate_parameters( x264_t *h, int b_open )
     }
 
     int w_mod = 1;
-    int h_mod = 1 << (PARAM_INTERLACED || h->param.b_fake_interlaced);
+    int h_mod = 1 << (PARAM_INTERLACED || h->param.b_fake_interlaced || h->param.b_paff);
     if( i_csp == X264_CSP_I400 )
     {
         h->param.analyse.i_chroma_qp_offset = 0;
@@ -697,7 +758,7 @@ static int validate_parameters( x264_t *h, int b_open )
         return -1;
     }
 
-    if( PARAM_INTERLACED )
+    if( PARAM_INTERLACED || h->param.b_paff )
         h->param.b_pic_struct = 1;
 
     if( h->param.i_avcintra_class )
@@ -1263,9 +1324,9 @@ static int validate_parameters( x264_t *h, int b_open )
             }
         }
         if( h->param.analyse.i_mv_range <= 0 )
-            h->param.analyse.i_mv_range = l->mv_range >> PARAM_INTERLACED;
+            h->param.analyse.i_mv_range = l->mv_range >> PARAM_FIELDCODE;
         else
-            h->param.analyse.i_mv_range = x264_clip3(h->param.analyse.i_mv_range, 32, 8192 >> PARAM_INTERLACED);
+            h->param.analyse.i_mv_range = x264_clip3(h->param.analyse.i_mv_range, 32, 8192 >> PARAM_FIELDCODE);
     }
 
     h->param.analyse.i_weighted_pred = x264_clip3( h->param.analyse.i_weighted_pred, X264_WEIGHTP_NONE, X264_WEIGHTP_SMART );
@@ -1374,6 +1435,7 @@ static int validate_parameters( x264_t *h, int b_open )
     BOOLIFY( b_deterministic );
     BOOLIFY( b_sliced_threads );
     BOOLIFY( b_interlaced );
+    BOOLIFY( b_paff );
     BOOLIFY( b_intra_refresh );
     BOOLIFY( b_aud );
     BOOLIFY( b_repeat_headers );
@@ -1660,7 +1722,7 @@ x264_t *x264_encoder_open( x264_param_t *param, void *api )
     x264_pixel_init( h->param.cpu, &h->pixf );
     x264_dct_init( h->param.cpu, &h->dctf );
     x264_zigzag_init( h->param.cpu, &h->zigzagf_progressive, &h->zigzagf_interlaced );
-    memcpy( &h->zigzagf, PARAM_INTERLACED ? &h->zigzagf_interlaced : &h->zigzagf_progressive, sizeof(h->zigzagf) );
+    memcpy( &h->zigzagf, PARAM_FIELDCODE ? &h->zigzagf_interlaced : &h->zigzagf_progressive, sizeof(h->zigzagf) );
     x264_mc_init( h->param.cpu, &h->mc, h->param.b_cpu_independent );
     x264_quant_init( h, h->param.cpu, &h->quantf );
     x264_deblock_init( h->param.cpu, &h->loopf, PARAM_INTERLACED );
@@ -2079,8 +2141,17 @@ static int encoder_encapsulate_nals( x264_t *h, int start )
 
     for( int i = start; i < h->out.i_nal; i++ )
     {
+        /* b_long_startcode emits the Annex B leading zero_byte (4-byte
+         * 00 00 00 01 vs 3-byte 00 00 01).  Annex B (7.4.1 / B.1.1) requires
+         * a zero_byte before the first NAL of every access unit.  `!i`
+         * covers the first AU of the encode call; under PAFF a single call
+         * carries TWO field access units (the pair), so the second field's
+         * first NAL (tracked by h->out.i_paff_au_boundary, set between the
+         * pair's two passes) also needs a long startcode, else a strict
+         * decoder warns `zero_byte shall exist` (task 8.2 / JM ldecod). */
         h->out.nal[i].b_long_startcode = !i || h->out.nal[i].i_type == NAL_SPS || h->out.nal[i].i_type == NAL_PPS ||
-                                         h->param.i_avcintra_class;
+                                         h->param.i_avcintra_class ||
+                                         (h->param.b_paff && i == h->out.i_paff_au_boundary);
         x264_nal_encode( h, nal_buffer, &h->out.nal[i] );
         nal_buffer += h->out.nal[i].i_payload;
     }
@@ -2217,17 +2288,38 @@ static void weighted_pred_init( x264_t *h )
     if( h->sh.i_type != SLICE_TYPE_P || h->param.analyse.i_weighted_pred <= 0 )
         return;
 
-    int i_padv = PADV << PARAM_INTERLACED;
+    int i_padv = PADV << PARAM_FIELDCODE;
     int denom = -1;
     int weightplane[2] = { 0, 0 };
     int buffer_next = 0;
+#if HAVE_INTERLACED
+    /* PAFF: at this point h->i_ref[0] is the field-expanded list while the
+     * estimated weights (fenc->weight) are pair-level.  Map each field
+     * entry to its source pair via the expansion's i_fref_frame; entries
+     * without a pair (the current pair's complementary first field, orig
+     * < 0) get no weight.  Entries of one pair share the pair's weight and
+     * ONE scaled plane buffer -- mb.p_weight_buf has only 1-2 slots
+     * ("weighting of one reference frame"), so two entries of a pair must
+     * not take two buffers. */
+    int pair_slot[X264_REF_MAX];
+    if( h->param.b_paff )
+        for( int i = 0; i < X264_REF_MAX; i++ )
+            pair_slot[i] = -1;
+#endif
     for( int i = 0; i < 3; i++ )
     {
         for( int j = 0; j < h->i_ref[0]; j++ )
         {
-            if( h->fenc->weight[j][i].weightfn )
+#if HAVE_INTERLACED
+            int pair = h->param.b_paff ? h->mb.pic.i_fref_frame[j] : j;
+            if( pair < 0 )
+                continue;
+#else
+            int pair = j;
+#endif
+            if( h->fenc->weight[pair][i].weightfn )
             {
-                h->sh.weight[j][i] = h->fenc->weight[j][i];
+                h->sh.weight[j][i] = h->fenc->weight[pair][i];
                 // if weight is useless, don't write it to stream
                 if( h->sh.weight[j][i].i_scale == 1<<h->sh.weight[j][i].i_denom && h->sh.weight[j][i].i_offset == 0 )
                     h->sh.weight[j][i].weightfn = NULL;
@@ -2243,6 +2335,13 @@ static void weighted_pred_init( x264_t *h )
                     assert( h->sh.weight[j][i].i_denom == denom );
                     if( !i )
                     {
+#if HAVE_INTERLACED
+                        if( h->param.b_paff && pair_slot[pair] >= 0 )
+                        {
+                            h->fenc->weighted[j] = h->fenc->weighted[pair_slot[pair]];
+                            continue;
+                        }
+#endif
                         h->fenc->weighted[j] = h->mb.p_weight_buf[buffer_next++] + h->fenc->i_stride[0] * i_padv + PADH_ALIGN;
                         //scale full resolution frame
                         if( h->param.i_threads == 1 )
@@ -2255,6 +2354,10 @@ static void weighted_pred_init( x264_t *h )
                             x264_weight_scale_plane( h, dst, stride, src, stride, width, height, &h->sh.weight[j][0] );
                             h->fenc->i_lines_weighted = height;
                         }
+#if HAVE_INTERLACED
+                        if( h->param.b_paff )
+                            pair_slot[pair] = j;
+#endif
                     }
                 }
             }
@@ -2290,6 +2393,30 @@ static inline int reference_distance( x264_t *h, x264_frame_t *frame )
                   ((h->fenc->i_frame&1) != (frame->i_frame&1));
     else
         return abs(h->fenc->i_frame - frame->i_frame);
+}
+
+/* PAFF (D4/a, 8.2.4.1): field PicNum arithmetic for MMCO opcode 1.
+ * Per spec eq 8-30 CurrPicNum is 2*frame_num + 1 for EVERY field picture --
+ * it does NOT depend on the current field's parity (top or bottom).  A stored
+ * reference field of parity p is RELATIVE to the current field: it has
+ * PicNum = 2*FrameNumWrap + (p == cur_parity) -- the same-parity field gets
+ * the +1, the opposite-parity field gets +0 (eq 8-30/8-31).  The decoder
+ * derives the same relativity, so a consistent CurrPicNum makes picNumX land
+ * on the intended field.  Returns difference_of_pic_nums (=
+ * difference_of_pic_nums_minus1 + 1) targeting parity p of the reference
+ * frame whose (unwrapped) frame_num is ref_frame_num.  cur_parity is the
+ * parity of the field whose slice header carries the opcode (field 1 of the
+ * pair, i.e. pass 0).  PAFF-only; frame pictures keep the frame-level
+ * i_frame_num difference emitted by the non-PAFF paths. */
+static inline int paff_difference_of_pic_nums( x264_t *h, int ref_frame_num, int cur_parity, int p )
+{
+    int max_frame_num = 1 << h->sps->i_log2_max_frame_num;
+    int cur_fn = h->i_frame_num & (max_frame_num - 1);
+    int ref_fn = ref_frame_num & (max_frame_num - 1);
+    int frame_num_wrap = ref_fn > cur_fn ? ref_fn - max_frame_num : ref_fn;
+    int cur_pic_num = 2 * cur_fn + 1;
+    int target_pic_num = 2 * frame_num_wrap + (p == cur_parity);
+    return cur_pic_num - target_pic_num;
 }
 
 static inline void reference_build_list( x264_t *h, int i_poc )
@@ -2331,9 +2458,45 @@ static inline void reference_build_list( x264_t *h, int i_poc )
 
         for( int i = h->i_ref[0]-1; i >= h->i_ref[0] - h->sh.i_mmco_remove_from_end; i-- )
         {
-            int diff = h->i_frame_num - h->fref[0][i]->i_frame_num;
-            h->sh.mmco[h->sh.i_mmco_command_count].i_poc = h->fref[0][i]->i_poc;
-            h->sh.mmco[h->sh.i_mmco_command_count++].i_difference_of_pic_nums = diff;
+            x264_frame_t *frame = h->fref[0][i];
+            if( h->param.b_paff )
+            {
+                /* D4/a/b: DPB-slot trim of a field pair needs two opcode-1
+                 * commands (one per field/PicNum, 8.2.5.4.1), both emitted in
+                 * field 1's slice header. */
+                int cur_parity = h->param.b_tff ? 0 : 1;
+                /* PAFF emits two opcodes per evicted pair, halving the mmco[]
+                 * capacity vs the frame path.  Hard-clamp the X264_REF_MAX
+                 * bound (an assert would vanish under NDEBUG): once the
+                 * opcode buffer is full, skip further evictions and leak the
+                 * pair into the DPB until the next IDR rather than
+                 * overflowing mmco[].  Reachable only with pathological
+                 * --ref/--b-pyramid combinations. */
+                if( h->sh.i_mmco_command_count + 2 > X264_REF_MAX )
+                {
+                    if( !h->b_paff_mmco_clamp_warned )
+                    {
+                        h->b_paff_mmco_clamp_warned = 1;
+                        x264_log( h, X264_LOG_WARNING,
+                                  "PAFF MMCO opcode buffer full: skipping DPB-tail eviction "
+                                  "(reduce --ref/--b-pyramid)\n" );
+                    }
+                    continue;
+                }
+                for( int p = 0; p < 2; p++ )
+                {
+                    h->sh.mmco[h->sh.i_mmco_command_count].i_poc = frame->i_poc;
+                    h->sh.mmco[h->sh.i_mmco_command_count].i_field_parity = p;
+                    h->sh.mmco[h->sh.i_mmco_command_count++].i_difference_of_pic_nums =
+                        paff_difference_of_pic_nums( h, frame->i_frame_num, cur_parity, p );
+                }
+            }
+            else
+            {
+                int diff = h->i_frame_num - frame->i_frame_num;
+                h->sh.mmco[h->sh.i_mmco_command_count].i_poc = frame->i_poc;
+                h->sh.mmco[h->sh.i_mmco_command_count++].i_difference_of_pic_nums = diff;
+            }
         }
     }
 
@@ -2370,7 +2533,12 @@ static inline void reference_build_list( x264_t *h, int i_poc )
         h->i_ref[0] = X264_MIN( h->i_ref[0], IS_X264_TYPE_B( h->fref[0][0]->i_type ) + 1 );
 
     /* add duplicates */
-    if( h->fenc->i_type == X264_TYPE_P )
+    /* PAFF: reference duplicates need ref_pic_list_modification to exist in
+     * the decoder's list (the decoder's default field-expanded list has no
+     * dupes), but PAFF pins b_ref_pic_list_reordering = 0 and expands the
+     * decoder default (task 2.1).  Skip dupes: weightp 2 degrades to
+     * weightp 1 semantics under PAFF. */
+    if( h->fenc->i_type == X264_TYPE_P && !h->param.b_paff )
     {
         int idx = -1;
         if( h->param.analyse.i_weighted_pred >= X264_WEIGHTP_SIMPLE )
@@ -2408,6 +2576,47 @@ static inline void reference_build_list( x264_t *h, int i_poc )
     assert( h->i_ref[0] + h->i_ref[1] <= X264_REF_MAX );
     h->mb.pic.i_fref[0] = h->i_ref[0];
     h->mb.pic.i_fref[1] = h->i_ref[1];
+}
+
+/* Measure PSNR/SSIM of the reconstructed band [minpix_y, maxpix_y).
+ * b_start: this band is the top of the frame (SSIM offsets down instead of up). */
+static void fdec_measure_quality( x264_t *h, int minpix_y, int maxpix_y, int b_start )
+{
+    maxpix_y = X264_MIN( maxpix_y, h->param.i_height );
+    if( h->param.analyse.b_psnr )
+    {
+        for( int p = 0; p < (CHROMA444 ? 3 : 1); p++ )
+            h->stat.frame.i_ssd[p] += x264_pixel_ssd_wxh( &h->pixf,
+                h->fdec->plane[p] + minpix_y * h->fdec->i_stride[p], h->fdec->i_stride[p],
+                h->fenc->plane[p] + minpix_y * h->fenc->i_stride[p], h->fenc->i_stride[p],
+                h->param.i_width, maxpix_y-minpix_y );
+        if( !CHROMA444 )
+        {
+            uint64_t ssd_u, ssd_v;
+            int v_shift = CHROMA_V_SHIFT;
+            x264_pixel_ssd_nv12( &h->pixf,
+                h->fdec->plane[1] + (minpix_y>>v_shift) * h->fdec->i_stride[1], h->fdec->i_stride[1],
+                h->fenc->plane[1] + (minpix_y>>v_shift) * h->fenc->i_stride[1], h->fenc->i_stride[1],
+                h->param.i_width>>1, (maxpix_y-minpix_y)>>v_shift, &ssd_u, &ssd_v );
+            h->stat.frame.i_ssd[1] += ssd_u;
+            h->stat.frame.i_ssd[2] += ssd_v;
+        }
+    }
+
+    if( h->param.analyse.b_ssim )
+    {
+        int ssim_cnt;
+        x264_emms();
+        /* offset by 2 pixels to avoid alignment of ssim blocks with dct blocks,
+         * and overlap by 4 */
+        minpix_y += b_start ? 2 : -6;
+        h->stat.frame.f_ssim +=
+            x264_pixel_ssim_wxh( &h->pixf,
+                h->fdec->plane[0] + 2+minpix_y*h->fdec->i_stride[0], h->fdec->i_stride[0],
+                h->fenc->plane[0] + 2+minpix_y*h->fenc->i_stride[0], h->fenc->i_stride[0],
+                h->param.i_width-2, maxpix_y-minpix_y, h->scratch_buffer, &ssim_cnt );
+        h->stat.frame.i_ssim_cnt += ssim_cnt;
+    }
 }
 
 static void fdec_filter_row( x264_t *h, int mb_y, int pass )
@@ -2491,43 +2700,7 @@ static void fdec_filter_row( x264_t *h, int mb_y, int pass )
         x264_frame_cond_broadcast( h->fdec, mb_y*16 + (b_end ? 10000 : -(X264_THREAD_HEIGHT << SLICE_MBAFF)) );
 
     if( b_measure_quality )
-    {
-        maxpix_y = X264_MIN( maxpix_y, h->param.i_height );
-        if( h->param.analyse.b_psnr )
-        {
-            for( int p = 0; p < (CHROMA444 ? 3 : 1); p++ )
-                h->stat.frame.i_ssd[p] += x264_pixel_ssd_wxh( &h->pixf,
-                    h->fdec->plane[p] + minpix_y * h->fdec->i_stride[p], h->fdec->i_stride[p],
-                    h->fenc->plane[p] + minpix_y * h->fenc->i_stride[p], h->fenc->i_stride[p],
-                    h->param.i_width, maxpix_y-minpix_y );
-            if( !CHROMA444 )
-            {
-                uint64_t ssd_u, ssd_v;
-                int v_shift = CHROMA_V_SHIFT;
-                x264_pixel_ssd_nv12( &h->pixf,
-                    h->fdec->plane[1] + (minpix_y>>v_shift) * h->fdec->i_stride[1], h->fdec->i_stride[1],
-                    h->fenc->plane[1] + (minpix_y>>v_shift) * h->fenc->i_stride[1], h->fenc->i_stride[1],
-                    h->param.i_width>>1, (maxpix_y-minpix_y)>>v_shift, &ssd_u, &ssd_v );
-                h->stat.frame.i_ssd[1] += ssd_u;
-                h->stat.frame.i_ssd[2] += ssd_v;
-            }
-        }
-
-        if( h->param.analyse.b_ssim )
-        {
-            int ssim_cnt;
-            x264_emms();
-            /* offset by 2 pixels to avoid alignment of ssim blocks with dct blocks,
-             * and overlap by 4 */
-            minpix_y += b_start ? 2 : -6;
-            h->stat.frame.f_ssim +=
-                x264_pixel_ssim_wxh( &h->pixf,
-                    h->fdec->plane[0] + 2+minpix_y*h->fdec->i_stride[0], h->fdec->i_stride[0],
-                    h->fenc->plane[0] + 2+minpix_y*h->fenc->i_stride[0], h->fenc->i_stride[0],
-                    h->param.i_width-2, maxpix_y-minpix_y, h->scratch_buffer, &ssim_cnt );
-            h->stat.frame.i_ssim_cnt += ssim_cnt;
-        }
-    }
+        fdec_measure_quality( h, minpix_y, maxpix_y, b_start );
 }
 
 static inline int reference_update( x264_t *h )
@@ -2548,7 +2721,20 @@ static inline int reference_update( x264_t *h )
     for( int i = 0; i < h->sh.i_mmco_command_count; i++ )
         for( int j = 0; h->frames.reference[j]; j++ )
             if( h->frames.reference[j]->i_poc == h->sh.mmco[i].i_poc )
-                x264_frame_push_unused( h, x264_frame_shift( &h->frames.reference[j] ) );
+            {
+                if( h->param.b_paff )
+                {
+                    /* D4/c: opcode 1 with field_pic_flag targets a single
+                     * field (8.2.5.4.1); un-mark it and drop the frame (one
+                     * DPB slot, 8.2.5) only once both fields are free. */
+                    x264_frame_t *ref = h->frames.reference[j];
+                    ref->b_field_kept_as_ref[h->sh.mmco[i].i_field_parity] = 0;
+                    if( !ref->b_field_kept_as_ref[0] && !ref->b_field_kept_as_ref[1] )
+                        x264_frame_push_unused( h, x264_frame_shift( &h->frames.reference[j] ) );
+                }
+                else
+                    x264_frame_push_unused( h, x264_frame_shift( &h->frames.reference[j] ) );
+            }
 
     /* move frame in the buffer */
     x264_frame_push( h->frames.reference, h->fdec );
@@ -2572,6 +2758,9 @@ static inline void reference_hierarchy_reset( x264_t *h )
 {
     int ref;
     int b_hasdelayframe = 0;
+    int n_removed = 0;  /* PAFF: pairs whose eviction is deferred to the
+                           marking point (see below); the DPB-room trim must
+                           still account for them. */
 
     /* look for delay frames -- chain must only contain frames that are disposable */
     for( int i = 0; h->frames.current[i] && IS_DISPOSABLE( h->frames.current[i]->i_type ); i++ )
@@ -2591,18 +2780,68 @@ static inline void reference_hierarchy_reset( x264_t *h )
             || ( h->frames.reference[ref]->i_poc < h->frames.i_poc_last_open_gop
             && h->sh.i_type != SLICE_TYPE_B ) )
         {
-            int diff = h->i_frame_num - h->frames.reference[ref]->i_frame_num;
-            h->sh.mmco[h->sh.i_mmco_command_count].i_difference_of_pic_nums = diff;
-            h->sh.mmco[h->sh.i_mmco_command_count++].i_poc = h->frames.reference[ref]->i_poc;
-            x264_frame_push_unused( h, x264_frame_shift( &h->frames.reference[ref] ) );
+            x264_frame_t *frame = h->frames.reference[ref];
+            if( h->param.b_paff )
+            {
+                /* D4/a/b: evicting a BREF field pair needs two opcode-1
+                 * commands (one per field/PicNum, 8.2.5.4.1), both emitted in
+                 * field 1's slice header with field PicNum arithmetic. */
+                int cur_parity = h->param.b_tff ? 0 : 1;
+                /* PAFF emits two opcodes per evicted pair, halving the mmco[]
+                 * capacity vs the frame path.  Hard-clamp the X264_REF_MAX
+                 * bound (an assert would vanish under NDEBUG): once the
+                 * opcode buffer is full, skip further evictions and leak the
+                 * pair into the DPB until the next IDR rather than
+                 * overflowing mmco[].  Reachable only with pathological
+                 * --ref/--b-pyramid combinations. */
+                if( h->sh.i_mmco_command_count + 2 > X264_REF_MAX )
+                {
+                    if( !h->b_paff_mmco_clamp_warned )
+                    {
+                        h->b_paff_mmco_clamp_warned = 1;
+                        x264_log( h, X264_LOG_WARNING,
+                                  "PAFF MMCO opcode buffer full: skipping BREF-pair eviction "
+                                  "(reduce --ref/--b-pyramid)\n" );
+                    }
+                    continue;
+                }
+                for( int p = 0; p < 2; p++ )
+                {
+                    h->sh.mmco[h->sh.i_mmco_command_count].i_poc = frame->i_poc;
+                    h->sh.mmco[h->sh.i_mmco_command_count].i_field_parity = p;
+                    h->sh.mmco[h->sh.i_mmco_command_count++].i_difference_of_pic_nums =
+                        paff_difference_of_pic_nums( h, frame->i_frame_num, cur_parity, p );
+                }
+            }
+            else
+            {
+                int diff = h->i_frame_num - frame->i_frame_num;
+                h->sh.mmco[h->sh.i_mmco_command_count].i_difference_of_pic_nums = diff;
+                h->sh.mmco[h->sh.i_mmco_command_count++].i_poc = frame->i_poc;
+            }
+            if( h->param.b_paff )
+                /* PAFF: do NOT shift the pair out of frames.reference here.
+                 * The opcodes above ride in THIS picture's field-1 slice
+                 * header, where the decoder applies them only AFTER building
+                 * that field's reference list (8.2.4 runs before 8.2.5) --
+                 * the evicted pair must still be visible to this pass's
+                 * default-list construction.  The actual shift happens at
+                 * the marking point: the inter-pass D20 marking between the
+                 * two field passes applies the opcodes (and drops the pair),
+                 * mirroring the decoder. */
+                n_removed++;
+            else
+            {
+                x264_frame_push_unused( h, x264_frame_shift( &h->frames.reference[ref] ) );
+                ref--;
+            }
             h->b_ref_reorder[0] = 1;
-            ref--;
         }
     }
 
     /* Prepare room in the dpb for the delayed display time of the later b-frame's */
     if( h->param.i_bframe_pyramid )
-        h->sh.i_mmco_remove_from_end = X264_MAX( ref + 2 - h->frames.i_max_dpb, 0 );
+        h->sh.i_mmco_remove_from_end = X264_MAX( ref - n_removed + 2 - h->frames.i_max_dpb, 0 );
 }
 
 static inline void slice_init( x264_t *h, int i_nal_type, int i_global_qp )
@@ -2665,6 +2904,21 @@ static inline void slice_init( x264_t *h, int i_nal_type, int i_global_qp )
             h->sh.i_delta_poc_bottom = 0;
         h->fdec->i_delta_poc[0] = h->sh.i_delta_poc_bottom == -1;
         h->fdec->i_delta_poc[1] = h->sh.i_delta_poc_bottom ==  1;
+        if( h->param.b_paff )
+        {
+            /* PAFF field pictures (D11): a complementary pair shares one even
+             * frame-level POC (fdec->i_poc, never mutated per pass); each
+             * field carries a per-field POC offset in i_delta_poc so that
+             * macroblock.c's curpoc = i_poc + i_delta_poc[field] yields the
+             * correct per-field POC.  Field pics never signal delta_poc_bottom
+             * in the slice header (7.4.3: that field is gated on !b_field_pic),
+             * so it stays 0; the per-field POC is written to sh.i_poc directly
+             * by the PAFF driver after slice_init.  TFF -> {0,1}, BFF -> {1,0}
+             * (i_delta_poc[0]/[1] are the top/bottom slots, as for MBAFF;
+             * values differ because a field picture has one POC per field). */
+            h->fdec->i_delta_poc[0] = !h->param.b_tff;  /* top field */
+            h->fdec->i_delta_poc[1] =  h->param.b_tff;  /* bottom field */
+        }
     }
     else
     {
@@ -2749,6 +3003,251 @@ static ALWAYS_INLINE void bitstream_restore( x264_t *h, x264_bs_bak_t *bak, int 
     }
 }
 
+/* PAFF: per-pass row filtering, called at each same-parity row start (and once
+ * more after the last MB of the pass).  Only the deblock of the previous
+ * same-parity row is done here; hpel, borders and the field-buffer copy run
+ * after both passes of the pair complete (paff_frame_finish). */
+static void paff_filter_row( x264_t *h, int mb_y )
+{
+    int b_deblock = h->sh.i_disable_deblocking_filter_idc != 1;
+    if( mb_y - 2 < h->i_threadslice_start )
+        return;
+    b_deblock &= h->fdec->b_kept_as_ref || h->param.b_full_recon || h->param.psz_dump_yuv;
+    if( b_deblock )
+        x264_frame_deblock_row( h, mb_y - 2 );
+    /* keep field intra border backups in sync, same cadence as MBAFF pairs */
+    if( !h->mb.b_reencode_mb )
+        for( int i = 0; i < 3; i++ )
+        {
+            XCHG( pixel *, h->intra_border_backup[0][i], h->intra_border_backup[3][i] );
+            XCHG( pixel *, h->intra_border_backup[1][i], h->intra_border_backup[4][i] );
+        }
+}
+
+/* PAFF: finishing work for a complementary field pair, run after both field
+ * passes: sync the field-layout reference copy, expand borders and generate
+ * hpel data for both fields, and measure full-frame quality. */
+static void paff_sync_references( x264_t *h )
+{
+    /* D15: copy reconstructed rows plane[] -> plane_fld[] and generate the
+     * field borders + hpel (filtered_fld) so the picture is usable as a
+     * reference.  Run between passes (only the first field is valid then; the
+     * stale second-field rows are copied/filtered but never referenced by the
+     * next pass, and are overwritten when this runs again after both passes)
+     * and after both passes. */
+    int b_hpel = h->fdec->b_kept_as_ref && h->param.analyse.i_subpel_refine;
+    int saved_start = h->i_threadslice_start;
+    int saved_end = h->i_threadslice_end;
+
+    for( int p = 0; p < h->fdec->i_plane; p++ )
+        for( int i = 0; i < h->fdec->i_lines[p]; i++ )
+            memcpy( h->fdec->plane_fld[p] + i*h->fdec->i_stride[p],
+                    h->fdec->plane[p]     + i*h->fdec->i_stride[p],
+                    h->mb.i_mb_width*16*SIZEOF_PIXEL );
+
+    /* Filter the full frame.  Some hpel/border paths transit
+     * i_threadslice_start/end (set per pass by the PAFF driver), so save and
+     * restore around the full-frame [0, i_mb_height) sweep. */
+    h->i_threadslice_start = 0;
+    h->i_threadslice_end = h->mb.i_mb_height;
+    for( int mb_y = 0; mb_y < h->mb.i_mb_height; mb_y += 2 )
+    {
+        int b_end = mb_y + 2 >= h->mb.i_mb_height;
+        if( h->fdec->b_kept_as_ref )
+            x264_frame_expand_border( h, h->fdec, mb_y );
+        if( b_hpel )
+        {
+            x264_frame_filter( h, h->fdec, mb_y, b_end );
+            x264_frame_expand_border_filtered( h, h->fdec, mb_y, b_end );
+        }
+    }
+    h->i_threadslice_start = saved_start;
+    h->i_threadslice_end = saved_end;
+}
+
+static void paff_frame_finish( x264_t *h )
+{
+    paff_sync_references( h );
+
+    if( h->param.analyse.b_psnr || h->param.analyse.b_ssim )
+        fdec_measure_quality( h, 0, h->mb.i_mb_height*16, 1 );
+}
+
+/* PAFF (D7/D13/D14/D16/1.1b): expand the pair-level reference list (built
+ * once per pair by reference_build_list + x264_reference_build_list_optimal)
+ * into the per-field RefPicListX for the current pass, per H.264 8.2.4.2.5:
+ *  - field references alternate parity, starting with the current field's
+ *    parity;
+ *  - when coding the second field of a P/B pair, the already-coded first
+ *    field (complementary, opposite parity) is the highest-FrameNumWrap
+ *    short-term reference and is inserted mid-list (8.2.4.2.2).  For L1 the
+ *    complementary field is a past ref and sits beyond num_ref_idx_l1_active
+ *    (L1 is future-only in x264's convention), so the driver passes
+ *    b_complementary=0 for L1;
+ *  - the list is capped at 2*i_frame_reference field entries (D14) and
+ *    X264_REF_MAX (D6).
+ * The 8.2.4.2.5 expansion is IDENTICAL for L0 and L1 (only the input frame
+ * list differs); this function is parameterised by i_list.  Because the
+ * complementary field is a single-parity slot among full pairs, expanded
+ * index j no longer equals frame j>>1; the per-entry frame/parity map (D16)
+ * is recorded in mb.pic.i_fref_{frame,parity} (L0) / _l1 (L1) for MC,
+ * deblock_ref_table, ref_poc and ratecontrol.  h->fref[i_list][j] is set to
+ * the entry's frame pointer (a previous pair, or h->fdec for the
+ * complementary field). */
+/* PAFF (D7/D13/D14/D16/1.1b/DEC): expand the pair-level reference lists into
+ * the per-field RefPicListX for the current pass, reproducing the decoder's
+ * DEFAULT field reference list (H.264 8.2.4.2.4 + 8.2.4.2.5) exactly.  Because
+ * x264 signals no ref_pic_list_modification (b_ref_pic_list_reordering[*]=0),
+ * the decoder builds this same default list from its DPB; the encoder MUST
+ * motion-compensate against the identical list or its reconstruction diverges.
+ *
+ * reference_build_list partitions the DPB into past (POC<Curr, fref[0]) and
+ * future (POC>Curr, fref[1]) refs, each already in the spec's per-direction
+ * order (past = POC-descending, future = POC-ascending).  8.2.4.2.4 builds the
+ * frame lists from BOTH halves:
+ *   refFrameList0ShortTerm = [PicOrderCnt<=Curr, desc] ++ [>Curr, asc]
+ *                           = [complementary] ++ past ++ future
+ *   refFrameList1ShortTerm = [>Curr, asc] ++ [<=Curr, desc]
+ *                           = future ++ [complementary] ++ past
+ * (the complementary first field, present only for a REFERENCE pair's second
+ * pass, has the current frame's even POC -- the largest <=Curr value -- so it
+ * leads the <=Curr-descending runs in both lists.)
+ *
+ * 8.2.4.2.5 then expands a frame list into field entries with TWO INDEPENDENT
+ * parity cursors (one for the current field's parity, one for the opposite):
+ * each round emits the current-parity field of the lowest-index frame still
+ * offering it, then the opposite-parity field of the lowest-index frame still
+ * offering it.  A frame missing a field (e.g. an IDR pair whose first field
+ * was cleared by its second IDR field -- only that survivor is 'used for
+ * reference') is simply skipped for that parity, so a later frame of the
+ * desired parity is pulled forward.  The previous single-cursor round-robin
+ * expansion failed this: it took whatever field a frame had, never skipping,
+ * so it could not reproduce the decoder's skip-and-pull-forward and placed a
+ * wrong picture at RefPicListX[0].  This mirrors ffmpeg's build_def_list.
+ *
+ * Output is capped at 2*i_frame_reference field entries (D14) / X264_REF_MAX.
+ * The per-entry frame/parity map (D16) is recorded in mb.pic.i_fref_{frame,
+ * parity} (L0) / _l1 (L1) for MC, deblock_ref_table, ref_poc and ratecontrol.
+ * h->fref[i_list][j] is the entry's frame pointer (a previous pair, or h->fdec
+ * for the complementary field). */
+static void paff_expand_field_list( x264_t *h, int i_list, int parity, int b_complementary,
+                                    int past_count, x264_frame_t *past_fref[],
+                                    int future_count, x264_frame_t *future_fref[] )
+{
+    x264_frame_t *ent_frame[2*X264_REF_MAX+3];
+    int ent_avail[2*X264_REF_MAX+3];  /* bitmask of still-available parities */
+    int ent_origin[2*X264_REF_MAX+3]; /* -1=complementary, else pair index (past) / past_count+k (future) */
+    int n = 0;
+    int cap = X264_MIN( 2 * h->param.i_frame_reference, X264_REF_MAX );
+    int8_t *parity_map = i_list ? h->mb.pic.i_fref_parity_l1 : h->mb.pic.i_fref_parity;
+    int8_t *frame_map  = i_list ? h->mb.pic.i_fref_frame_l1 : h->mb.pic.i_fref_frame;
+
+    /* Push one frame into the ent table with its available-parity mask.
+     * comp: this entry is the current pair's complementary first field (only
+     *   the opposite-of-current-parity field exists).  Otherwise both fields
+     *   are 'used for reference'.  (Pre-Ip the macro special-cased
+     *   X264_TYPE_IDR to a single survivor field, matching the old "II"
+     *   keyframe structure whose second IDR wiped the first from the DPB;
+     *   task 7.1/D5 codes keyframe pairs Ip -- first field IDR, second field
+     *   a non-IDR P -- so an IDR pair is a full 2-field reference like any
+     *   other, and that special case is gone.) */
+#define PAFF_PUSH( fr, comp, orig ) do {            \
+        ent_frame[n] = (fr);                        \
+        ent_origin[n] = (orig);                     \
+        if( (comp) )                                \
+            ent_avail[n] = 1 << (parity ^ 1);        \
+        else                                        \
+            ent_avail[n] = 3;                       \
+        n++;                                        \
+    } while( 0 )
+
+    /* 8.2.4.2.4 frame list (see function header). */
+    if( i_list == 0 )
+    {
+        if( b_complementary )
+            PAFF_PUSH( h->fdec, 1, -1 );
+        for( int k = 0; k < past_count; k++ )
+            PAFF_PUSH( past_fref[k], 0, k );
+        for( int k = 0; k < future_count; k++ )
+            PAFF_PUSH( future_fref[k], 0, past_count + k );
+    }
+    else
+    {
+        for( int k = 0; k < future_count; k++ )
+            PAFF_PUSH( future_fref[k], 0, past_count + k );
+        if( b_complementary )
+            PAFF_PUSH( h->fdec, 1, -1 );
+        for( int k = 0; k < past_count; k++ )
+            PAFF_PUSH( past_fref[k], 0, k );
+    }
+#undef PAFF_PUSH
+
+    /* PAFF (2.2a): publish the per-reference available-parity mask onto each
+     * stored frame (bit0=top, bit1=bottom) so the temporal-direct colocated
+     * path can skip an absent field per 8.4.1.2.4. */
+    for( int e = 0; e < n; e++ )
+        ent_frame[e]->i_field_avail = ent_avail[e];
+
+    /* 8.2.4.2.5 expansion: two independent parity cursors over the frame list
+     * (current parity first), skipping a frame that lacks the wanted parity --
+     * identical to the decoder's build_def_list.  sel is the current field's
+     * parity bit (1=top, 2=bottom); sel^3 is the opposite. */
+    int sel = 1 << parity;
+    int sel_opp = sel ^ 3;
+    int i0 = 0, i1 = 0, out = 0;
+    while( (i0 < n || i1 < n) && out < cap )
+    {
+        while( i0 < n && !(ent_avail[i0] & sel) )
+            i0++;
+        while( i1 < n && !(ent_avail[i1] & sel_opp) )
+            i1++;
+        if( i0 < n )
+        {
+            h->fref[i_list][out] = ent_frame[i0];
+            parity_map[out] = parity;
+            frame_map[out] = ent_origin[i0];
+            ent_avail[i0] &= ~sel;
+            i0++;
+            out++;
+        }
+        if( i1 < n && out < cap )
+        {
+            h->fref[i_list][out] = ent_frame[i1];
+            parity_map[out] = parity ^ 1;
+            frame_map[out] = ent_origin[i1];
+            ent_avail[i1] &= ~sel_opp;
+            i1++;
+            out++;
+        }
+    }
+
+    /* PAFF-B (D9, 2.2e): dist_scale_factor_buf / bipred_weight_buf cap the L1
+     * index at 4 (common.h: last dim [...][4]), and the per-ref MV store
+     * mvr[1] is sized for at most 4 field entries (pyramid).  A field-doubled
+     * L1 > 4 would overflow both.  Clamp at 4 field entries -- the list stays
+     * conformant via num_ref_idx_l1_active (signalled below), just fewer refs. */
+    if( i_list && out > 4 )
+    {
+        x264_log( h, X264_LOG_WARNING, "PAFF B L1 clamped to 4 field references (bipred table cap)\n" );
+        out = 4;
+    }
+
+    h->i_ref[i_list] = h->mb.pic.i_fref[i_list] = out;
+    if( i_list )
+        h->mb.pic.i_paff_field_ref1 = out;
+    else
+        h->mb.pic.i_paff_field_ref0 = out;
+    /* slice_init sized num_ref_idx from the pair-level count; re-size it for
+     * the expanded field list.  No ref_pic_list_modification is signalled
+     * (DEC-C) because this expansion equals the decoder's default list. */
+    if( i_list )
+        h->sh.i_num_ref_idx_l1_active = out <= 0 ? 1 : out;
+    else
+        h->sh.i_num_ref_idx_l0_active = out <= 0 ? 1 : out;
+    h->sh.b_num_ref_idx_override = h->sh.i_num_ref_idx_l0_active != h->pps->i_num_ref_idx_l0_default_active
+                                 || (h->sh.i_type == SLICE_TYPE_B && h->sh.i_num_ref_idx_l1_active != h->pps->i_num_ref_idx_l1_default_active);
+}
+
 static intptr_t slice_write( x264_t *h )
 {
     int i_skip;
@@ -2821,7 +3320,12 @@ static intptr_t slice_write( x264_t *h )
             if( !(i_mb_y & SLICE_MBAFF) && h->param.rc.i_vbv_buffer_size )
                 bitstream_backup( h, &bs_bak[BS_BAK_ROW_VBV], i_skip, 1 );
             if( !h->mb.b_reencode_mb )
-                fdec_filter_row( h, i_mb_y, 0 );
+            {
+                if( FIELD_PIC )
+                    paff_filter_row( h, i_mb_y );
+                else
+                    fdec_filter_row( h, i_mb_y, 0 );
+            }
         }
 
         if( back_up_bitstream )
@@ -2836,9 +3340,9 @@ static intptr_t slice_write( x264_t *h )
             }
         }
 
-        if( PARAM_INTERLACED )
+        if( PARAM_INTERLACED || FIELD_PIC )
         {
-            if( h->mb.b_adaptive_mbaff )
+            if( PARAM_INTERLACED && h->mb.b_adaptive_mbaff )
             {
                 if( !(i_mb_y&1) )
                 {
@@ -2853,7 +3357,7 @@ static intptr_t slice_write( x264_t *h )
         }
 
         /* load cache */
-        if( SLICE_MBAFF )
+        if( SLICE_MBAFF || FIELD_PIC )
             x264_macroblock_cache_load_interlaced( h, i_mb_x, i_mb_y );
         else
             x264_macroblock_cache_load_progressive( h, i_mb_x, i_mb_y );
@@ -3068,7 +3572,7 @@ cont:
             i_mb_x++;
         if( i_mb_x == h->mb.i_mb_width )
         {
-            i_mb_y++;
+            i_mb_y += 1 + FIELD_PIC;
             i_mb_x = 0;
         }
     }
@@ -3099,7 +3603,10 @@ cont:
                                   + (h->out.i_nal*NALU_OVERHEAD * 8)
                                   - h->stat.frame.i_tex_bits
                                   - h->stat.frame.i_mv_bits;
-        fdec_filter_row( h, h->i_threadslice_end, 0 );
+        if( FIELD_PIC )
+            paff_filter_row( h, h->mb.i_mb_height + h->sh.b_bottom_field );
+        else
+            fdec_filter_row( h, h->i_threadslice_end, 0 );
 
         if( h->param.b_sliced_threads )
         {
@@ -3392,6 +3899,21 @@ int     x264_encoder_encode( x264_t *h,
         if( (fenc->i_pic_struct < PIC_STRUCT_AUTO) || (fenc->i_pic_struct > PIC_STRUCT_TRIPLE) )
             fenc->i_pic_struct = PIC_STRUCT_AUTO;
 
+        if( h->param.b_paff && fenc->i_pic_struct != PIC_STRUCT_AUTO )
+        {
+            /* D4: PAFF codes every input frame as exactly one complementary
+             * field pair, so per-frame pic_struct patterns (pulldown,
+             * doubling, ...) have no coded frame picture to attach to.
+             * Clamp to AUTO: the pair resolves to TOP_BOTTOM/BOTTOM_TOP and
+             * the per-field pic_timing SEIs carry pic_struct 1/2. */
+            if( !h->b_paff_pic_struct_warned )
+            {
+                h->b_paff_pic_struct_warned = 1;
+                x264_log( h, X264_LOG_WARNING, "PAFF does not support per-frame pic_struct patterns (pulldown): ignoring\n" );
+            }
+            fenc->i_pic_struct = PIC_STRUCT_AUTO;
+        }
+
         if( fenc->i_pic_struct == PIC_STRUCT_AUTO )
         {
 #if HAVE_INTERLACED
@@ -3399,8 +3921,11 @@ int     x264_encoder_encode( x264_t *h,
 #else
             int b_interlaced = 0;
 #endif
-            if( b_interlaced )
+            if( b_interlaced || h->param.b_paff )
             {
+                /* PAFF: the pair-level pic_struct is TOP_BOTTOM/BOTTOM_TOP
+                 * (per-field pic_timing SEI carries 1/2, see set.c); i_duration
+                 * is unaffected (delta_tfi_divisor[4] == [5] == 2). */
                 int b_tff = fenc->param ? fenc->param->b_tff : h->param.b_tff;
                 fenc->i_pic_struct = b_tff ? PIC_STRUCT_TOP_BOTTOM : PIC_STRUCT_BOTTOM_TOP;
             }
@@ -3556,8 +4081,26 @@ int     x264_encoder_encode( x264_t *h,
 
     h->fdec->i_type = h->fenc->i_type;
     h->fdec->i_frame = h->fenc->i_frame;
+    /* Under PAFF a complementary field pair always needs its first field kept
+     * as a reference -- the second field (P, or the Ip P of a keyframe pair)
+     * motion-compensates against it, and the field planes (plane_fld /
+     * filtered_fld) are only built for reference frames.  The keyint_max>1
+     * carve-out is an I-only optimisation for PROGRESSIVE streams (an
+     * all-keyframe progressive stream never references a past picture); it
+     * must not apply to field pictures, whose intra-pair reference is
+     * independent of the inter-pair keyframe cadence.  (Task 7.4: --keyint 1
+     * + --paff otherwise left the Ip second field with an empty L0 and no
+     * filtered reference plane -> NULL p_fref -> segfault.) */
     h->fenc->b_kept_as_ref =
-    h->fdec->b_kept_as_ref = i_nal_ref_idc != NAL_PRIORITY_DISPOSABLE && h->param.i_keyint_max > 1;
+    h->fdec->b_kept_as_ref = i_nal_ref_idc != NAL_PRIORITY_DISPOSABLE && (h->param.b_paff || h->param.i_keyint_max > 1);
+    if( h->param.b_paff )
+    {
+        /* D4: a complementary pair enters the DPB with both fields marked
+         * "used for reference" (both fields of a BREF pair are reference
+         * fields); MMCO opcode 1 clears them one at a time. */
+        h->fdec->b_field_kept_as_ref[0] = h->fdec->b_kept_as_ref;
+        h->fdec->b_field_kept_as_ref[1] = h->fdec->b_kept_as_ref;
+    }
 
     h->fdec->mb_info = h->fenc->mb_info;
     h->fdec->mb_info_free = h->fenc->mb_info_free;
@@ -3787,10 +4330,13 @@ int     x264_encoder_encode( x264_t *h,
     }
 
     /* generate sei pic timing */
-    if( h->sps->vui.b_pic_struct_present || h->sps->vui.b_nal_hrd_parameters_present )
+    /* PAFF (D1): pic_timing is per access unit, i.e. per coded field; the
+     * field-pair driver below emits it before each field's VCL NALs. */
+    if( !h->param.b_paff &&
+        ( h->sps->vui.b_pic_struct_present || h->sps->vui.b_nal_hrd_parameters_present ) )
     {
         nal_start( h, NAL_SEI, NAL_PRIORITY_DISPOSABLE );
-        x264_sei_pic_timing_write( h, &h->out.bs );
+        x264_sei_pic_timing_write( h, &h->out.bs, 0 );
         if( nal_end( h ) )
             return -1;
         overhead += h->out.nal[h->out.i_nal-1].i_payload + SEI_OVERHEAD;
@@ -3860,14 +4406,544 @@ int     x264_encoder_encode( x264_t *h,
     pic_out->i_qpplus1 =
     h->fdec->i_qpplus1 = i_global_qp + 1;
 
-    if( h->param.rc.b_stat_read && h->sh.i_type != SLICE_TYPE_I )
+    /* PAFF (2-pass): the field-pair driver expands the decoder's DEFAULT
+     * field order (8.2.4.2.4/8.2.4.2.5) and pins b_ref_pic_list_reordering
+     * to 0, so the optimal reorder is disabled -- honouring it would need
+     * field-PicNum ref_pic_list_modification commands (8.2.4.3) per field.
+     * Default order is kept; the usual tiny 2-pass quality cost applies. */
+    if( h->param.rc.b_stat_read && h->sh.i_type != SLICE_TYPE_I && !h->param.b_paff )
     {
         x264_reference_build_list_optimal( h );
         reference_check_reorder( h );
     }
 
     if( h->i_ref[0] )
-        h->fdec->i_poc_l0ref0 = h->fref[0][0]->i_poc;
+        /* PAFF (1.1d): i_poc_l0ref0 is now per-parity.  This pair-level write
+         * populates parity 0 (canonical); under PAFF the driver overwrites the
+         * per-parity slot after each pass's L0 expansion.  Non-PAFF reads only
+         * parity 0 (slice_header_init, encoder.c:161). */
+        h->fdec->i_poc_l0ref0[0] = h->fref[0][0]->i_poc;
+
+    if( h->param.b_paff )
+    {
+        /* PAFF field-pair driver (H.264 7.4.3): one input frame is coded as a
+         * complementary field pair within a single access unit.  Both fields
+         * share one frame_num; each pass codes one field picture.  Internally
+         * MBs are tracked in frame coordinates, with each pass iterating the
+         * rows of its own parity; MB_INTERLACED=1 selects field coding mode
+         * (field scans, field CABAC contexts) with SLICE_MBAFF=0. */
+        /* D5: the pair is encoded synchronously -- both field passes run
+         * inline here and mutate shared h->fdec state, which is safe only
+         * because they are serialized.  The validation above forces
+         * i_threads==1 (frame threads) and hard-errors b_sliced_threads, so
+         * i_thread_frames is always 1 and this driver returns via
+         * encoder_frame_end below, never reaching the thread-pool dispatch
+         * further down (x264_threadpool_run).  Assert the invariant. */
+        assert( h->i_thread_frames == 1 );
+        int base_poc = h->fdec->i_poc;
+        x264_frame_stat_t stat_first;
+        int pass0_end_bits = 0;
+        /* Snapshot the pair-level L0 and L1 lists (built once per pair above
+         * by reference_build_list + x264_reference_build_list_optimal -- DEC-D:
+         * those do NOT move per pass).  Each pass expands them into field
+         * entries (overwriting h->fref[0]/h->i_ref[0] and, for B slices,
+         * h->fref[1]/h->i_ref[1]); the pair-level view is restored at the
+         * start of every pass (so slice_init sizes num_ref_idx from the pair
+         * count and reads the colocated frame's stored per-parity state) and
+         * after both passes (so frame-end consumers -- ratecontrol,
+         * reference_update -- see pairs). */
+        int pair_count = h->i_ref[0];
+        int pair_count_l1 = h->i_ref[1];
+        x264_frame_t *pair_fref0[X264_REF_MAX+3];
+        x264_frame_t *pair_fref1[X264_REF_MAX+3];
+        memcpy( pair_fref0, h->fref[0], pair_count * sizeof(x264_frame_t *) );
+        memcpy( pair_fref1, h->fref[1], pair_count_l1 * sizeof(x264_frame_t *) );
+        if( h->sh.i_type == SLICE_TYPE_P )
+        {
+            /* 8.2.4.2.2: a P FIELD's refFrameList0ShortTerm spans the FULL DPB
+             * ordered by FrameNumWrap DESCENDING -- not the POC-distance
+             * order reference_build_list produced, and not capped at
+             * i_frame_reference pairs.  With a BREF in the DPB (b-pyramid)
+             * the orders differ (BREF: higher frame_num, lower POC) and the
+             * decoder's default-list truncation can keep a pair beyond the
+             * capped pair list, so rebuild the past list from
+             * frames.reference or the expanded L0 diverges from the
+             * decoder's default while no ref_pic_list_modification is
+             * signalled (DEC-C).  The expansion's 2*i_frame_reference field
+             * cap still bounds the ACTIVE window, mirroring the decoder's
+             * truncation to num_ref_idx_l0_active.  B pairs keep the POC
+             * order (8.2.4.2.4), which already matches. */
+            pair_count = 0;
+            for( int i = 0; h->frames.reference[i]; i++ )
+            {
+                if( h->frames.reference[i]->b_corrupt )
+                    continue;
+                assert( pair_count < X264_REF_MAX+3 );
+                pair_fref0[pair_count++] = h->frames.reference[i];
+            }
+            int max_frame_num = 1 << h->sps->i_log2_max_frame_num;
+            int cur_fn = h->i_frame_num & (max_frame_num - 1);
+            for( int i = 0; i < pair_count - 1; i++ )
+                for( int j = i + 1; j < pair_count; j++ )
+                {
+                    int fi = pair_fref0[i]->i_frame_num & (max_frame_num - 1);
+                    int fj = pair_fref0[j]->i_frame_num & (max_frame_num - 1);
+                    if( fi > cur_fn ) fi -= max_frame_num;  /* FrameNumWrap (8-27) */
+                    if( fj > cur_fn ) fj -= max_frame_num;
+                    if( fj > fi )
+                        XCHG( x264_frame_t*, pair_fref0[i], pair_fref0[j] );
+                }
+        }
+        /* D4/b: the pair-level marking commands (reference_hierarchy_reset +
+         * the i_mmco_remove_from_end trim) are populated once, before this
+         * driver, into h->sh.  Both field-PicNum opcodes per removed/trimmed
+         * pair go into field 1's slice header (8.2.5.4 allows multiple opcodes
+         * per header); field 2's header must carry none.  Snapshot the count
+         * here, suppress it for pass 1's slice_init, then restore it after the
+         * driver so the next frame's reference_update still applies the trim
+         * opcodes to evict the trimmed pairs from h->frames.reference. */
+        int mmco_command_count = h->sh.i_mmco_command_count;
+        int mmco_remove_from_end = h->sh.i_mmco_remove_from_end;
+        /* D17/b: pair-folded L0 ref counts, accumulated per pass below (each
+         * pass folds its own per-field-entry counts while ITS entry->pair
+         * map is live -- the passes' entry layouts differ, pass 1 inserts
+         * the complementary field mid-list, so folding after the merge
+         * mis-attributes counts).  Published into stat.frame.i_mb_count_ref
+         * after the stats merge. */
+        int pair_refcount[X264_REF_MAX*2] = {0};
+        /* D5 (task 7.1): snapshot the pair-level slice type so the per-pass Ip
+         * divergence (second field -> P) can be restored for frame-end
+         * consumers (ratecontrol, reference_update) that see the pair as an
+         * I/IDR. */
+        int pair_slice_type = h->sh.i_type;
+        for( int pass = 0; pass < 2; pass++ )
+        {
+            int parity = h->param.b_tff ? pass : !pass;
+            /* D5 (task 7.1): a keyframe complementary field pair is coded Ip --
+             * the first field is the IDR access unit, the second field is a
+             * NON-IDR P field referencing the pair's first field
+             * (QSV/libmfx-compatible; H.264 7.4.3 lets the two fields of a
+             * pair share one frame_num with the second a non-IDR reference
+             * field).  Only the first field's AU is an IDR, so the decoder's
+             * IDR marking (8.2.5.1) flushes the DPB exactly once and the
+             * first field survives as a short-term reference available to the
+             * second field's pass.  The second field's L0 is built solely
+             * from the complementary first field (pair_count is 0 here -- an
+             * I/IDR pair built no past list -- so paff_expand_field_list with
+             * b_complementary injects h->fdec).  This replaces the prior "II"
+             * structure whose second IDR wiped the first field, leaving a
+             * single-field DPB survivor that tripped decoders' sliding-window
+             * eviction (task 5.1 root cause).  The idr_pic_id xor-undo hack is
+             * gone: only pass 0 is IDR now, so slice_init toggles idr_pic_id
+             * once per keyframe pair and consecutive keyframes alternate
+             * (7.4.3) as intended. */
+            int pass_nal_type = i_nal_type;
+            if( pass && i_nal_type == NAL_SLICE_IDR )
+            {
+                pass_nal_type = NAL_SLICE;
+                h->sh.i_type = SLICE_TYPE_P;
+                h->i_nal_type = NAL_SLICE;
+            }
+            /* slice_init sizes num_ref_idx and reads MMCO from the pair-level
+             * list, so present the pair-level view before it runs.  L1 too:
+             * slice_header_init reads h->fref[1][0] for the direct-mode flag
+             * (encoder.c:161). */
+            h->i_ref[0] = pair_count;
+            h->i_ref[1] = pair_count_l1;
+            memcpy( h->fref[0], pair_fref0, pair_count * sizeof(x264_frame_t *) );
+            memcpy( h->fref[1], pair_fref1, pair_count_l1 * sizeof(x264_frame_t *) );
+            if( pass )
+            {
+                /* D4/b: field 2 must not duplicate field 1's marking
+                 * commands (8.2.5.4: multiple opcodes in one header). */
+                h->sh.i_mmco_command_count = 0;
+                h->sh.i_mmco_remove_from_end = 0;
+            }
+            /* ------------------------ Create slice header  ----------------------- */
+            slice_init( h, pass_nal_type, i_global_qp );
+            /* D11: fdec->i_poc stays the even frame-level POC for the whole
+             * pair (never mutated per pass); the per-field POC goes only into
+             * the slice header, derived from i_delta_poc set in slice_init.
+             * (base_poc + i_delta_poc[parity] == base_poc + pass for both
+             * TFF and BFF, so the emitted poc_lsb is unchanged.) */
+            h->sh.i_poc = base_poc + h->fdec->i_delta_poc[parity];
+            h->sh.b_field_pic = 1;
+            h->sh.b_bottom_field = parity;
+            h->sh.i_first_mb = parity * h->mb.i_mb_width;
+            h->sh.i_last_mb = (h->mb.i_mb_height - 1 + parity) * h->mb.i_mb_width - 1;
+            /* D7/D13/D14/D16/DEC: expand the pair-level lists into per-field
+             * entries for this pass, reproducing the decoder's DEFAULT field
+             * list (8.2.4.2.4 + 8.2.4.2.5) exactly so that, with no
+             * ref_pic_list_modification signalled, the encoder and decoder
+             * motion-compensate against identical lists.  paff_expand_field_list
+             * builds L0 = [complementary]++past++future and L1 =
+             * future++[complementary]++past from the pair-level past (fref[0])
+             * and future (fref[1]) snapshots, then expands with the spec's
+             * two-independent-parity-cursor rule.
+             *   b_complementary: the just-coded first field is a short-term
+             * reference ONLY for a REFERENCE pair's second pass (8.2.4.2.2 /
+             * 8.2.4.2.4 NOTE 3).  A non-reference B pair's first field is not
+             * 'used for reference', so it is absent from the decoder's DPB and
+             * must NOT be inserted -- gating on b_kept_as_ref (P and ref-B are
+             * reference; non-ref B is not) fixes the prior over-broad P||B
+             * gate that corrupted non-ref-B second-field lists. */
+            int b_complementary = pass == 1 && h->fdec->b_kept_as_ref;
+            paff_expand_field_list( h, 0, parity, b_complementary,
+                                    pair_count, pair_fref0,
+                                    pair_count_l1, pair_fref1 );
+            h->sh.b_ref_pic_list_reordering[0] = 0;
+            if( h->sh.i_type == SLICE_TYPE_B )
+            {
+                /* 1.1b: build the per-field L1.  The decoder's default L1 is
+                 * [future asc] ++ [past desc], but x264's per-ref MV store
+                 * mvr[1] is sized only for the future half ((1+pyramid)<<1
+                 * field entries, matching the OLD future-only L1), so the L1
+                 * ACTIVE window is future-only.  That is exact whenever the
+                 * future reference pairs are complete (both fields 'used for
+                 * reference') -- always the case here: the only single-field
+                 * reference an IDR pair can leave is frame 0, which is past
+                 * for every later B.  The complementary first field, when
+                 * present, is a PAST ref that sits past the future-only active
+                 * window, so it is omitted from L1 (b_complementary=0).  The
+                 * 8.2.4.2.5 expansion is identical to L0's. */
+                paff_expand_field_list( h, 1, parity, 0,
+                                        0, NULL,
+                                        pair_count_l1, pair_fref1 );
+                h->sh.b_ref_pic_list_reordering[1] = 0;
+                /* 8.2.4.2.4: if RefPicList1 has >1 entry and equals
+                 * RefPicList0 (same count, frame and per-entry parity), swap
+                 * L1[0]/L1[1].  The decoder applies the same swap to its
+                 * default lists, so mirror it exactly. */
+                if( h->i_ref[1] > 1 && h->i_ref[0] == h->i_ref[1] )
+                {
+                    int equal = 1;
+                    for( int j = 0; j < h->i_ref[1]; j++ )
+                        if( h->fref[1][j] != h->fref[0][j]
+                            || h->mb.pic.i_fref_parity_l1[j] != h->mb.pic.i_fref_parity[j] )
+                        {
+                            equal = 0;
+                            break;
+                        }
+                    if( equal )
+                    {
+                        XCHG( x264_frame_t*, h->fref[1][0], h->fref[1][1] );
+                        XCHG( int8_t, h->mb.pic.i_fref_parity_l1[0], h->mb.pic.i_fref_parity_l1[1] );
+                        XCHG( int8_t, h->mb.pic.i_fref_frame_l1[0], h->mb.pic.i_fref_frame_l1[1] );
+                    }
+                }
+            }
+            /* PAFF (1.1c/1.1d, D7): store the field-expanded ref_poc / i_ref /
+             * i_poc_l0ref0 per parity on the frame, computed AFTER the
+             * per-pass expansion.  macroblock_slice_init (which runs
+             * pair-level inside slice_init) skips these under PAFF; both
+             * parities coexist so a later B field colocating to either
+             * parity reads the right per-field POCs (map_col_to_list0).
+             * ref_poc carries the per-field POC (frame POC + delta_poc of
+             * that entry's parity), not the even frame POC. */
+            h->fdec->i_ref[0][parity] = h->i_ref[0];
+            for( int i = 0; i < h->i_ref[0]; i++ )
+                h->fdec->ref_poc[0][parity][i] = h->fref[0][i]->i_poc
+                    + h->fref[0][i]->i_delta_poc[h->mb.pic.i_fref_parity[i]];
+            if( h->i_ref[0] > 0 )
+                h->fdec->i_poc_l0ref0[parity] = h->fref[0][0]->i_poc
+                    + h->fref[0][0]->i_delta_poc[h->mb.pic.i_fref_parity[0]];
+            if( h->sh.i_type == SLICE_TYPE_B )
+            {
+                h->fdec->i_ref[1][parity] = h->i_ref[1];
+                for( int i = 0; i < h->i_ref[1]; i++ )
+                    h->fdec->ref_poc[1][parity][i] = h->fref[1][i]->i_poc
+                        + h->fref[1][i]->i_delta_poc[h->mb.pic.i_fref_parity_l1[i]];
+            }
+            /* PAFF 2-pass: the pair-level optimal reorder is disabled (see
+             * the b_stat_read block above), so the expanded field lists
+             * always match the decoder's default order and no
+             * ref_pic_list_modification needs signalling. */
+            weighted_pred_init( h );
+            /* PAFF (2.2): build map_col_to_list0 for this field pass.  The
+             * colocated picture is fref[1][0] (RefPicList1[0], a single field
+             * entry) at parity i_fref_parity_l1[0]; its L0 ref POCs are the
+             * per-parity ref_poc[0][col_parity] (stored when it was encoded).
+             * Map each to the current field-expanded L0 by per-field POC
+             * (frame POC + i_delta_poc of L0[j]'s parity), per 8.4.1.2.3
+             * MapColToList0 (field_pic_flag==1 matches the SAME-parity field).
+             * macroblock_slice_init skips this under PAFF (pair-level). */
+            if( h->sh.i_type == SLICE_TYPE_B )
+            {
+                int col_parity = h->mb.pic.i_fref_parity_l1[0];
+                map_col_to_list0(-1) = -1;
+                map_col_to_list0(-2) = -2;
+                for( int i = 0; i < h->fref[1][0]->i_ref[0][col_parity]; i++ )
+                {
+                    int poc = h->fref[1][0]->ref_poc[0][col_parity][i];
+                    map_col_to_list0(i) = -2;
+                    for( int j = 0; j < h->i_ref[0]; j++ )
+                        if( h->fref[0][j]->i_poc
+                            + h->fref[0][j]->i_delta_poc[h->mb.pic.i_fref_parity[j]] == poc )
+                        {
+                            map_col_to_list0(i) = j;
+                            break;
+                        }
+                }
+            }
+            /* PAFF (2.3): slice_header_init (encoder.c:161) read the colocated
+             * frame's i_poc_l0ref0[0] (parity-0 canonical) for the
+             * direct_spatial_mv_pred flag, but the colocated field parity
+             * (i_fref_parity_l1[0]) and the per-parity i_poc_l0ref0 are only
+             * resolved now, after the L1 expansion.  Redo the decision with
+             * the colocated field's actual L0[0] per-field POC (8.4.1.2:
+             * colPic = RefPicList1[0] at its field parity).  Both sides of the
+             * comparison are per-field POCs (frame POC + i_delta_poc of the
+             * entry's parity), so they carry the same delta convention.
+             * Faithfully mirrors slice_header_init's logic; non-PAFF is
+             * untouched (it never enters this driver).  b_direct_auto_read
+             * (2pass) is gated: in that mode the flag came from the statsfile
+             * and is left as-is. */
+            if( !h->mb.b_direct_auto_read && h->sh.i_type == SLICE_TYPE_B )
+            {
+                int col_parity = h->mb.pic.i_fref_parity_l1[0];
+                int col_l0ref0 = h->fref[1][0]->i_poc_l0ref0[col_parity];
+                int cur_l0ref0 = h->fdec->i_poc_l0ref0[parity];
+                if( col_l0ref0 == cur_l0ref0 )
+                {
+                    if( h->mb.b_direct_auto_write )
+                        h->sh.b_direct_spatial_mv_pred = ( h->stat.i_direct_score[1] > h->stat.i_direct_score[0] );
+                    else
+                        h->sh.b_direct_spatial_mv_pred = ( h->param.analyse.i_direct_mv_pred == X264_DIRECT_PRED_SPATIAL );
+                }
+                else
+                {
+                    h->mb.b_direct_auto_write = 0;
+                    h->sh.b_direct_spatial_mv_pred = 1;
+                }
+            }
+            /* PAFF (2.2d): build the bipred tables for this field pass.  The
+             * non-PAFF path calls x264_macroblock_bipred_init after slice_init
+             * (encoder.c); the PAFF driver returns before that, so without
+             * this the [1][parity] slots read by macroblock_slice_init
+             * (MB_INTERLACED=1 -> [1][mb_y&1] == [1][parity]) are uninitialised
+             * for B fields.  Must run AFTER the L0/L1 expansion (uses the
+             * field-expanded lists and per-entry parity maps). */
+            if( h->sh.i_type == SLICE_TYPE_B )
+                x264_macroblock_bipred_init_paff( h, parity );
+            h->mb.b_interlaced = 1;
+            h->i_threadslice_start = parity;
+            h->i_threadslice_end = h->mb.i_mb_height - 1 + parity;
+            /* D1: pic_timing SEI per coded field (Table D-1 mandates
+             * pic_struct 1/2 for field pictures).  Written here, after
+             * slice_init populated h->sh for this pass and before the field's
+             * VCL NALs, so it associates with this field's access unit.  Not
+             * counted in the pair-level `overhead` (ratecontrol_start already
+             * ran); the bytes still land in i_frame_size at frame end. */
+            if( h->sps->vui.b_pic_struct_present || h->sps->vui.b_nal_hrd_parameters_present )
+            {
+                nal_start( h, NAL_SEI, NAL_PRIORITY_DISPOSABLE );
+                x264_sei_pic_timing_write( h, &h->out.bs, pass );
+                if( nal_end( h ) )
+                    return -1;
+            }
+            if( (intptr_t)slices_write( h ) )
+                return -1;
+            /* out.bs spans BOTH field passes of the pair (it is re-inited
+             * per frame, not per field), so slice_write's
+             * i_misc_bits = bs_pos + NAL overhead - tex - mv at the end of
+             * pass 1 counts the first field's bytes a second time.  Undo
+             * that with the exact first-field total snapshotted at the end
+             * of pass 0 below.  The inflation (~50% on P pairs) previously
+             * made 2-pass undershoot the target bitrate by a third. */
+            if( pass )
+                h->stat.frame.i_misc_bits -= pass0_end_bits;
+            /* D17/b: fold this pass's per-field-entry L0 ref counts into
+             * reference-PAIR counts via this pass's map (set by
+             * paff_expand_field_list above).  orig < 0 entries are the
+             * current pair's complementary field and have no pair slot. */
+            for( int e = 0; e < h->mb.pic.i_paff_field_ref0; e++ )
+                if( h->mb.pic.i_fref_frame[e] >= 0 )
+                    pair_refcount[h->mb.pic.i_fref_frame[e]] += h->stat.frame.i_mb_count_ref[0][e];
+            /* D2: per-field bit accounting (stat bits of this coded field);
+             * the per-field VBV model consumes these AU sizes. */
+            h->fdec->i_field_bits[pass] = h->stat.frame.i_tex_bits
+                + h->stat.frame.i_mv_bits + h->stat.frame.i_misc_bits;
+            if( !pass )
+            {
+                /* bitstream position at the end of the first field's AU
+                 * (VCL NALs + SEIs); subtracted from pass 1's i_misc_bits
+                 * above.  Same formula as slice_write's misc accounting:
+                 * payload bits + NALU_OVERHEAD per completed NAL. */
+                pass0_end_bits = bs_pos( &h->out.bs ) + h->out.i_nal*NALU_OVERHEAD*8;
+                /* NAL index of the second field's AU start: every NAL
+                 * completed so far (frame headers + first field's SEI and
+                 * slices) belongs to the first field's access unit.  The
+                 * per-field VBV model (update_vbv) splits the pair's NAL
+                 * payload sums here. */
+                h->out.i_paff_au_boundary = h->out.i_nal;
+                stat_first = h->stat.frame;
+                /* D15: make the just-coded first field referenceable by the
+                 * second pass (sync plane_fld + borders + hpel for its parity)
+                 * before pass 1 expands the complementary field into L0. */
+                paff_sync_references( h );
+                /* D20: the decoded-reference-picture marking process runs after
+                 * each coded field (8.2.5.1).  Mirror it after the first
+                 * field so the second field's reference list is built from
+                 * the same post-marking DPB as the decoder's.  Per 8.2.5.1,
+                 * when the first field signals adaptive memory control
+                 * (i_mmco_command_count > 0 -> adaptive_ref_pic_marking_
+                 * mode_flag = 1) the decoder applies ONLY those MMCO opcodes
+                 * and does NOT run sliding window; when it signals none
+                 * (mode_flag = 0) the decoder runs sliding window.  Only
+                 * reference pairs (b_kept_as_ref) enter the DPB.
+                 *
+                 * Why this is PAFF-only: a frame picture is marked once, so
+                 * non-PAFF defers the MMCO to the next frame's
+                 * reference_update (which runs before that frame's list is
+                 * built) and lets its sliding-window check no-op because the
+                 * MMCO already freed the slots.  A field picture's SECOND
+                 * field is decoded (and its list built) before that next-frame
+                 * reference_update, so the first field's marking must be
+                 * applied here, between the two passes. */
+                if( h->fdec->b_kept_as_ref )
+                {
+                    if( h->sh.i_mmco_command_count > 0 )
+                    {
+                        /* adaptive memory control: apply the opcode-1 commands
+                         * (remove short-term by field PicNum) now, the way
+                         * reference_update does one frame later -- but here so
+                         * pass 1's expanded list excludes the removed pairs.
+                         * PAFF opcode-1 un-marks one field parity; the pair
+                         * leaves the DPB only once both parities are free
+                         * (8.2.5.4.1/8.2.5).  reference_update's later
+                         * re-application finds nothing and no-ops. */
+                        for( int i = 0; i < h->sh.i_mmco_command_count; i++ )
+                            for( int j = 0; h->frames.reference[j]; j++ )
+                                if( h->frames.reference[j]->i_poc == h->sh.mmco[i].i_poc )
+                                {
+                                    x264_frame_t *ref = h->frames.reference[j];
+                                    ref->b_field_kept_as_ref[h->sh.mmco[i].i_field_parity] = 0;
+                                    if( !ref->b_field_kept_as_ref[0] && !ref->b_field_kept_as_ref[1] )
+                                    {
+                                        x264_frame_t *evicted = x264_frame_shift( &h->frames.reference[j] );
+                                        x264_frame_push_unused( h, evicted );
+                                        /* drop it from the pair snapshots so
+                                         * pass 1's expansion excludes it */
+                                        for( int k = 0; k < pair_count; k++ )
+                                            if( pair_fref0[k] == evicted )
+                                            {
+                                                for( int m = k; m < pair_count - 1; m++ )
+                                                    pair_fref0[m] = pair_fref0[m+1];
+                                                pair_count--;
+                                                break;
+                                            }
+                                        for( int k = 0; k < pair_count_l1; k++ )
+                                            if( pair_fref1[k] == evicted )
+                                            {
+                                                for( int m = k; m < pair_count_l1 - 1; m++ )
+                                                    pair_fref1[m] = pair_fref1[m+1];
+                                                pair_count_l1--;
+                                                break;
+                                            }
+                                    }
+                                }
+                    }
+                    else
+                    {
+                        /* D20/sliding-window: mirror the decoder's field-1
+                         * marking (8.2.5.1/8.2.5.3).  With
+                         * adaptive_ref_pic_marking_mode_flag == 0 the decoder
+                         * runs sliding window and evicts the oldest short-term
+                         * pair ONLY when short_ref_count reaches
+                         * sps num_ref_frames (generate_sliding_window_mmcos:
+                         * short+long >= ref_frame_count).  short_ref_count is
+                         * the number of stored reference pairs, i.e. the length
+                         * of h->frames.reference -- the current pair is not yet
+                         * stored (reference_update pushes it next frame),
+                         * exactly as the decoder counts before adding the
+                         * current picture (8.2.5.1).
+                         *
+                         * MUST use sps->i_num_ref_frames, NOT
+                         * h->param.i_frame_reference: the SPS-declared DPB cap
+                         * is what governs the decoder, and x264 declares a
+                         * larger num_ref_frames than the active list cap so the
+                         * DPB can hold reorder/lookahead frames.  Using
+                         * i_frame_reference (the smaller --ref value) evicts the
+                         * oldest pair far too early: the decoder keeps it, so
+                         * x264's internal DPB and the decoder's desync and the
+                         * B-field reference lists diverge.  This is the
+                         * PAFF-only over-eviction -- non-PAFF never enters this
+                         * driver and its reference_update slide already uses
+                         * sps->i_num_ref_frames. */
+                        int dpb_pairs = 0;
+                        while( h->frames.reference[dpb_pairs] )
+                            dpb_pairs++;
+                        if( dpb_pairs >= h->sps->i_num_ref_frames
+                            && h->frames.reference[0] )
+                        {
+                            x264_frame_t *evicted = x264_frame_shift( h->frames.reference );
+                            x264_frame_push_unused( h, evicted );
+                            /* drop it from the pair snapshot so pass 1's
+                             * expansion excludes it (match by pointer:
+                             * pair_fref0 is POC-distance ordered, so the oldest
+                             * is not necessarily last).  pairs are pushed in
+                             * frame_num-ascending order, so reference[0] is the
+                             * oldest (smallest frame_num_wrap), matching the
+                             * decoder's oldest-short-term eviction. */
+                            for( int k = 0; k < pair_count; k++ )
+                                if( pair_fref0[k] == evicted )
+                                {
+                                    for( int m = k; m < pair_count - 1; m++ )
+                                        pair_fref0[m] = pair_fref0[m+1];
+                                    pair_count--;
+                                    break;
+                                }
+                            /* The oldest pair is structurally always a PAST
+                             * ref (the future anchor is decoded last, so it
+                             * has the highest frame_num in the DPB), hence
+                             * pair_fref1 should never contain it -- but
+                             * compact it too, mirroring the MMCO branch, so a
+                             * broken invariant cannot silently leak an
+                             * evicted pair into pass 1's L1. */
+                            for( int k = 0; k < pair_count_l1; k++ )
+                                if( pair_fref1[k] == evicted )
+                                {
+                                    for( int m = k; m < pair_count_l1 - 1; m++ )
+                                        pair_fref1[m] = pair_fref1[m+1];
+                                    pair_count_l1--;
+                                    break;
+                                }
+                        }
+                    }
+                }
+            }
+        }
+        /* restore the MMCO state consumed by the next frame's reference_update
+         * (D4/b): the trim opcodes must still evict the trimmed pairs. */
+        h->sh.i_mmco_command_count = mmco_command_count;
+        h->sh.i_mmco_remove_from_end = mmco_remove_from_end;
+        /* D5 (task 7.1): restore the pair-level slice/nal type mutated for the
+         * Ip second field so frame-end consumers see the I/IDR pair. */
+        h->sh.i_type = pair_slice_type;
+        h->i_nal_type = i_nal_type;
+        /* restore the pair-level view for frame-end consumers */
+        h->i_ref[0] = pair_count;
+        h->i_ref[1] = pair_count_l1;
+        memcpy( h->fref[0], pair_fref0, pair_count * sizeof(x264_frame_t *) );
+        memcpy( h->fref[1], pair_fref1, pair_count_l1 * sizeof(x264_frame_t *) );
+        /* frame_num increments once per complementary pair (7.4.3) */
+        if( i_nal_ref_idc != NAL_PRIORITY_DISPOSABLE )
+            h->i_frame_num++;
+        /* The reconstructed pair enters the reference buffer with the uniform
+         * even frame-level POC.  Under D11 fdec->i_poc is never mutated per
+         * pass, so this is now a no-op that just documents the invariant. */
+        h->fdec->i_poc = base_poc;
+        /* merge the stats of both passes */
+        /* All entries in stat.frame are ints except for ssd/ssim. */
+        for( size_t j = 0; j < (offsetof(x264_t,stat.frame.i_ssd) - offsetof(x264_t,stat.frame.i_mv_bits)) / sizeof(int); j++ )
+            ((int*)&h->stat.frame)[j] += ((int*)&stat_first)[j];
+        /* publish the pair-folded L0 ref counts (D17/b), overwriting the
+         * merged raw per-entry counts (mixed pass layouts). */
+        memcpy( h->stat.frame.i_mb_count_ref[0], pair_refcount, sizeof(pair_refcount) );
+        paff_frame_finish( h );
+
+        return encoder_frame_end( thread_oldest, thread_current, pp_nal, pi_nal, pic_out );
+    }
 
     /* ------------------------ Create slice header  ----------------------- */
     slice_init( h, i_nal_type, i_global_qp );

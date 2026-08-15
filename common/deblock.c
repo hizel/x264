@@ -343,7 +343,7 @@ static ALWAYS_INLINE void macroblock_cache_load_neighbours_deblock( x264_t *h, i
 
     h->mb.i_neighbour = 0;
     h->mb.i_mb_xy = mb_y * h->mb.i_mb_stride + mb_x;
-    h->mb.b_interlaced = PARAM_INTERLACED && h->mb.field[h->mb.i_mb_xy];
+    h->mb.b_interlaced = (PARAM_INTERLACED || FIELD_PIC) && h->mb.field[h->mb.i_mb_xy];
     h->mb.i_mb_top_y = mb_y - (1 << MB_INTERLACED);
     h->mb.i_mb_top_xy = mb_x + h->mb.i_mb_stride*h->mb.i_mb_top_y;
     h->mb.i_mb_left_xy[1] =
@@ -581,7 +581,7 @@ void x264_frame_deblock_row( x264_t *h, int mb_y )
                     RESET_EFFECTIVE_QP(h->mb.i_mb_top_xy);
                 }
 
-                if( (!b_interlaced || (!MB_INTERLACED && !h->mb.field[h->mb.i_mb_top_xy])) && intra_deblock )
+                if( ((!b_interlaced && !FIELD_PIC) || (!MB_INTERLACED && !h->mb.field[h->mb.i_mb_top_xy])) && intra_deblock )
                 {
                     FILTER( _intra, 1, 0, qp_top, qpc_top );
                 }
@@ -633,7 +633,7 @@ void x264_macroblock_deblock( x264_t *h )
     }
     else
         h->loopf.deblock_strength( h->mb.cache.non_zero_count, h->mb.cache.ref, h->mb.cache.mv,
-                                   bs, 4 >> MB_INTERLACED, h->sh.i_type == SLICE_TYPE_B );
+                                   bs, 4 >> (MB_INTERLACED || FIELD_PIC), h->sh.i_type == SLICE_TYPE_B );
 
     int transform_8x8 = h->mb.b_transform_8x8;
 

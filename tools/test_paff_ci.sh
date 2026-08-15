@@ -1,0 +1,186 @@
+#!/bin/bash
+# PAFF CI smoke test -- JM-free, ffmpeg-free.
+#
+# The full PAFF round-trip (tools/test_paff.sh) needs the JM reference decoder
+# (ldecod), which is not available in the CI images.  This script covers the
+# part that CAN run in CI with only the x264 binary and python3:
+#
+#   - several PAFF configs encode without error and produce non-empty output
+#     (CRF TFF/BFF, B-frames + pyramid, CBR + VBV, CBR+B, 2-pass, weightp);
+#   - the 14-config B-field regression matrix (tools/paff_matrix.sh) encodes
+#     without error (encode-only; the byte-exact round-trip is test_paff.sh);
+#   - PAFF is deterministic across thread counts (--threads 4 == --threads 1,
+#     which also exercises the forced-single-thread clamp);
+#   - an --nal-hrd cbr stream is CPB-compliant at field granularity per the
+#     independent Annex C simulator (tools/check_hrd.py);
+#   - unsupported combinations are rejected at validation (non-zero exit):
+#     --sliced-threads, --pulldown, --avcintra-class.
+#
+# It uses raw YUV input (--input-res) and raw Annex-B output, so it needs no
+# lavf/swscale linkage and no ffmpeg.  The clip is synthesized with python3.
+#
+# Usage: tools/test_paff_ci.sh
+# Env:   X264  path to the x264 CLI binary  (default: ./x264)
+# Exit:  0 if all checks pass, 1 otherwise.
+
+set -u
+
+cd "$(dirname "$0")/.."
+REPO_ROOT=$PWD
+X264=${X264:-./x264}
+
+WIDTH=176
+HEIGHT=128          # multiple of 32 so each field is a whole number of MB rows
+FRAMES=30
+WORKDIR=$(mktemp -d)
+trap 'rm -rf "$WORKDIR"' EXIT
+
+PASS=0
+FAIL=0
+ok()   { PASS=$((PASS+1)); echo "PASS: $*"; }
+bad()  { FAIL=$((FAIL+1)); echo "FAIL: $*"; }
+die()  { echo "ERROR: $*" >&2; exit 2; }
+
+[ -x "$X264" ] || die "x264 binary not found/executable: $X264"
+command -v python3 >/dev/null || die "python3 not found in PATH"
+
+# B-field regression matrix (shared with tools/test_paff.sh).
+# shellcheck source=paff_matrix.sh
+. "$REPO_ROOT/tools/paff_matrix.sh"
+
+CLIP="$WORKDIR/in.yuv"
+python3 - "$CLIP" "$WIDTH" "$HEIGHT" "$FRAMES" <<'PY' || die "clip generation failed"
+import sys
+path, w, h, n = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4])
+frame = w*h*3//2
+data = bytearray()
+for f in range(n):
+    for i in range(frame):
+        data.append((i*7 + f*13 + (i//w)*5) & 0xff)
+with open(path, "wb") as fh:
+    fh.write(data)
+PY
+
+COMMON=(--input-res ${WIDTH}x${HEIGHT} --fps 25)
+
+# Encode a config; on success the output must be non-empty.
+encode_ok() {
+    desc=$1; shift
+    out=$1; shift
+    if "$X264" "$CLIP" "${COMMON[@]}" -o "$out" "$@" >"$WORKDIR/log" 2>&1; then
+        if [ -s "$out" ]; then ok "$desc"; else bad "$desc (empty output)"; fi
+    else
+        bad "$desc (x264 failed)"; tail -n 4 "$WORKDIR/log" >&2
+    fi
+}
+
+# Encode must FAIL (validation rejection).
+encode_fail() {
+    desc=$1; shift
+    if "$X264" "$CLIP" "${COMMON[@]}" -o "$WORKDIR/reject.264" "$@" >"$WORKDIR/log" 2>&1; then
+        bad "$desc (expected failure, got success)"
+    else
+        ok "$desc (rejected as expected)"
+    fi
+}
+
+echo "== PAFF CI smoke: ${WIDTH}x${HEIGHT} ${FRAMES}f =="
+
+# 1. Encode matrix (all must succeed + non-empty).
+encode_ok "CRF TFF"                  "$WORKDIR/crf_tff.264"  --paff --tff --crf 23
+encode_ok "CRF BFF"                  "$WORKDIR/crf_bff.264"  --paff --bff --crf 23
+encode_ok "I-only keyint 1"           "$WORKDIR/ki1.264"      --paff --tff --crf 23 --keyint 1 --bframes 0
+encode_ok "B-frames + pyramid"       "$WORKDIR/bf.264"       --paff --tff --crf 23 --bframes 3 --b-pyramid normal
+encode_ok "CBR + VBV"                "$WORKDIR/cbr.264"      --paff --tff --bframes 0 --bitrate 300 --vbv-maxrate 300 --vbv-bufsize 300
+encode_ok "weightp 2"                "$WORKDIR/w2.264"       --paff --tff --crf 23 --weightp 2
+
+# 1b. SPS sanity for the keyint-1 stream: the I-only num_ref_frames = 0
+#     carve-out in set.c is progressive-only.  Under PAFF every keyframe
+#     pair's second field is a reference P field, so num_ref_frames must
+#     stay >= 1; signalling 0 sized vendor DPBs to zero and broke NVDEC-
+#     CUVID and AMD VCN decode (task 8.3 root cause).
+if python3 - "$WORKDIR/ki1.264" <<'PY'
+import sys
+data = open(sys.argv[1], 'rb').read()
+i = data.find(b'\x00\x00\x01') + 3
+while i < len(data) and (data[i] & 0x1f) != 7:
+    j = data.find(b'\x00\x00\x01', i)
+    if j < 0: sys.exit(1)
+    i = j + 3
+body = bytearray(data[i+1:])
+k = body.find(b'\x00\x00\x01')
+if k >= 0: del body[k:]
+class R:
+    def __init__(s): s.b = bytes(body); s.p = 0
+    def u(s, n):
+        v = 0
+        for _ in range(n):
+            v = (v << 1) | ((s.b[s.p >> 3] >> (7 - (s.p & 7))) & 1); s.p += 1
+        return v
+    def ue(s):
+        z = 0
+        while s.u(1) == 0: z += 1
+        return (1 << z) - 1 + (s.u(z) if z else 0)
+r = R(); prof = r.u(8); r.u(8); r.u(8); r.ue()
+if prof in (100,110,122,244,44,83,86,118,128,138,139,134,135):
+    if r.ue() == 3: r.u(1)
+    r.ue(); r.ue(); r.u(1); r.u(1)
+r.ue()                  # log2_max_frame_num_minus4
+if r.ue() == 0:         # poc_type; type 0 carries log2_max_poc_lsb_minus4
+    r.ue()
+num_ref = r.ue()
+sys.exit(0 if num_ref >= 1 else 1)
+PY
+then ok "SPS num_ref_frames >= 1 under PAFF keyint 1"
+else bad "SPS num_ref_frames == 0 under PAFF keyint 1 (regression)"
+fi
+
+# 2-pass (needs the first pass to write stats).
+if "$X264" "$CLIP" "${COMMON[@]}" -o /dev/null --paff --tff --bitrate 300 \
+        --pass 1 --slow-firstpass --stats "$WORKDIR/p.stats" >"$WORKDIR/log" 2>&1; then
+    encode_ok "2-pass" "$WORKDIR/2p.264" --paff --tff --bitrate 300 \
+        --pass 2 --slow-firstpass --stats "$WORKDIR/p.stats"
+else
+    bad "2-pass (pass 1 failed)"; tail -n 4 "$WORKDIR/log" >&2
+fi
+
+# 2. Determinism: --threads 4 must match --threads 1 (forced-single-thread clamp).
+"$X264" "$CLIP" "${COMMON[@]}" -o "$WORKDIR/det1.264" --paff --tff --crf 23 --threads 1 >"$WORKDIR/log" 2>&1 \
+    || die "threads=1 encode failed"
+"$X264" "$CLIP" "${COMMON[@]}" -o "$WORKDIR/det4.264" --paff --tff --crf 23 --threads 4 >"$WORKDIR/log" 2>&1 \
+    || die "threads=4 encode failed"
+if cmp -s "$WORKDIR/det1.264" "$WORKDIR/det4.264"; then ok "determinism --threads 4 == --threads 1"
+else bad "determinism --threads 4 != --threads 1"; fi
+
+# 3. HRD: --nal-hrd cbr stream must be CPB-compliant at field granularity.
+HRD="$WORKDIR/hrd.264"
+"$X264" "$CLIP" "${COMMON[@]}" -o "$HRD" --paff --tff --bframes 0 \
+    --bitrate 300 --vbv-maxrate 300 --vbv-bufsize 300 --nal-hrd cbr >"$WORKDIR/log" 2>&1 \
+    || die "nal-hrd cbr encode failed"
+if python3 "$REPO_ROOT/tools/check_hrd.py" "$HRD" >"$WORKDIR/hrd.log" 2>&1; then
+    ok "Annex C CPB check (field granularity)"; sed 's/^/    /' "$WORKDIR/hrd.log"
+else
+    bad "Annex C CPB check"; cat "$WORKDIR/hrd.log" >&2
+fi
+
+# 4. Unsupported combinations must be rejected.
+encode_fail "--paff --sliced-threads"   --paff --sliced-threads
+encode_fail "--paff --pulldown"         --paff --pulldown 1
+encode_fail "--paff --avcintra-class"   --paff --avcintra-class 50
+
+# 5. B-field matrix (14 configs from paff-b-frames/checkpoint-4.1-4.3.md):
+#    encode-only smoke -- CI has no JM/ffmpeg oracle, so this only checks that
+#    each config encodes without error and produces non-empty output.  That is
+#    enough to catch the kind of PAFF segfault the matrix was created for
+#    (--ref 1, --b-pyramid --ref 2 eviction).  The full byte-exact JM
+#    round-trip of the same configs is tools/test_paff.sh `matrix`.
+i=0
+for entry in "${PAFF_MATRIX[@]}"; do
+    name=${entry%%|*}
+    opts=${entry#*|}
+    encode_ok "matrix/$name" "$WORKDIR/mx_$((i++)).264" --paff $opts
+done
+
+echo
+echo "PAFF CI smoke: $PASS passed, $FAIL failed"
+[ "$FAIL" -eq 0 ]
