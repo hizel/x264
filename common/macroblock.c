@@ -510,8 +510,13 @@ void x264_macroblock_slice_init( x264_t *h )
     /* init with not available (for top right idx=7,15) */
     memset( h->mb.cache.ref, -2, sizeof( h->mb.cache.ref ) );
 
-    if( h->i_ref[0] > 0 )
-        for( int field = 0; field <= (SLICE_MBAFF || h->param.b_paff); field++ )
+    /* PAFF: inv_ref_poc is fdec metadata read by later pairs' jobs (TMVP,
+     * mvpred.c) -- under frame threading it must be published by the caller
+     * before dispatch, so the PAFF caller computes it from the
+     * pair-level snapshots (last pass with a non-empty past list wins,
+     * matching the per-pass sequence this loop produced at i_threads == 1). */
+    if( h->i_ref[0] > 0 && !h->param.b_paff )
+        for( int field = 0; field <= SLICE_MBAFF; field++ )
         {
             int curpoc = h->fdec->i_poc + h->fdec->i_delta_poc[field];
             int refpoc = h->fref[0][0]->i_poc + h->fref[0][0]->i_delta_poc[field];
@@ -675,12 +680,11 @@ static ALWAYS_INLINE void macroblock_load_pic_pointers( x264_t *h, int mb_x, int
             if( !i )
             {
                 if( h->sh.weight[j][0].weightfn )
-                    /* j >> mb_interlaced maps both fields of a frame to one
-                     * weighting slot (MBAFF); under PAFF (mb_interlaced=0)
-                     * j is the field-entry index and weighted[j] holds the
-                     * pair's scaled plane shared by both entries of the
-                     * pair (weighted_pred_init). */
-                    h->mb.pic.p_fref_w[j] = &h->fenc->weighted[j >> mb_interlaced][ref_pix_offset[refidx]];
+                    /* MBAFF: both fields of frame j>>1 share one weighting
+                     * slot.  PAFF: j is the field-entry index and
+                     * weighted_pred_init assigns the pair's shared scaled
+                     * plane per entry (pair_slot), so index j as-is. */
+                    h->mb.pic.p_fref_w[j] = &h->fenc->weighted[FIELD_PIC ? j : (j >> mb_interlaced)][ref_pix_offset[refidx]];
                 else
                     h->mb.pic.p_fref_w[j] = h->mb.pic.p_fref[0][j][0];
             }

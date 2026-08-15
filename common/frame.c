@@ -135,6 +135,8 @@ static x264_frame_t *frame_new( x264_t *h, int b_fdec )
     frame->i_frame = -1;
     frame->i_frame_num = -1;
     frame->i_lines_completed = -1;
+    frame->i_lines_completed_fld[0] =
+    frame->i_lines_completed_fld[1] = -1;
     frame->b_fdec = b_fdec;
     frame->i_pic_struct = PIC_STRUCT_AUTO;
     frame->i_field_cnt = -1;
@@ -695,6 +697,31 @@ int x264_frame_cond_wait( x264_frame_t *frame, int i_lines_completed )
     int completed;
     x264_pthread_mutex_lock( &frame->mutex );
     while( (completed = frame->i_lines_completed) < i_lines_completed && i_lines_completed >= 0 )
+        x264_pthread_cond_wait( &frame->cv, &frame->mutex );
+    x264_pthread_mutex_unlock( &frame->mutex );
+    return completed;
+}
+
+/* PAFF: per-parity variants, in field lines (see frame->i_lines_completed_fld).
+ * Share the frame's mutex/cv with the progressive counter. */
+void x264_frame_cond_broadcast_fld( x264_frame_t *frame, int parity, int i_lines_completed )
+{
+    x264_pthread_mutex_lock( &frame->mutex );
+    frame->i_lines_completed_fld[parity] = i_lines_completed;
+    x264_pthread_cond_broadcast( &frame->cv );
+    x264_pthread_mutex_unlock( &frame->mutex );
+}
+
+int x264_frame_cond_wait_fld( x264_frame_t *frame, int parity, int i_lines_completed )
+{
+    int completed;
+    x264_pthread_mutex_lock( &frame->mutex );
+    /* Keep the i_lines_completed >= 0 guard of the progressive variant: the
+     * first row-cadence broadcast can be negative (16 - X264_THREAD_HEIGHT
+     * at band 0), so the counter does NOT grow monotonically from -1 and a
+     * -1 peek (callers pass -1 to read without waiting) could otherwise
+     * block until the next broadcast. */
+    while( (completed = frame->i_lines_completed_fld[parity]) < i_lines_completed && i_lines_completed >= 0 )
         x264_pthread_cond_wait( &frame->cv, &frame->mutex );
     x264_pthread_mutex_unlock( &frame->mutex );
     return completed;

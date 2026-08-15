@@ -96,10 +96,26 @@ x264 --preset slower --tune psnr --crf 30
 
 
 PAFF (field pictures) and threads:
-Under --paff the encoder forces single-threaded encoding (i_threads = 1).
-Slice-based threading is rejected at validation; frame-based threading is
-forced down to 1 with a warning.  A complementary field pair is coded within
-one frame-thread slot, but the pair is only usable as a reference after BOTH
-fields are reconstructed and filtered, which does not pipeline on x264's
-per-row filter-completion model, so frame threads are deferred to future work.
-See doc/paff.txt.
+Under --paff, a complementary field pair is coded as one frame-thread job.
+Reference readiness is hybrid: the pair's first field is gated on a phase
+(the intermediate full-frame sweep between the passes), rows of the second
+field are gated at row cadence trailing the deblock, and dependent pairs
+restrict their vertical MV range to the completed field rows, exactly as
+progressive frame threads do (thresholds in field lines;
+--non-deterministic keeps the clamped range, the default deterministic mode
+uses the fixed i_mv_range_thread).  Every pass references both fields of
+the previous pair and both passes of a pair are serial inside one job, so a
+P-chain tops out at ~2x (pair time / pass time) minus MV-clamp losses; B
+hierarchies overlap more.  Output is deterministic at a fixed thread count,
+but not byte-identical to --threads 1 (the MV-range clamp applies as in
+progressive).  Slice-based threading stays rejected.  See doc/paff.txt.
+
+Measured (1920x1080 testsrc2, 200 frames, --paff --keyint 50, default
+settings, x86-64):
+
+          --bframes 3            --bframes 0
+threads:  fps      speedup       fps      speedup
+1:        31.9     1.00x        37.1     1.00x
+2:        51.7     1.62x        48.0     1.29x
+4:        64.7     2.03x        53.0     1.43x
+8:        77.2     2.42x        64.2     1.73x

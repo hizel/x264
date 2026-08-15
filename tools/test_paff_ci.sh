@@ -9,8 +9,8 @@
 #     (CRF TFF/BFF, B-frames + pyramid, CBR + VBV, CBR+B, 2-pass, weightp);
 #   - the 14-config B-field regression matrix (tools/paff_matrix.sh) encodes
 #     without error (encode-only; the byte-exact round-trip is test_paff.sh);
-#   - PAFF is deterministic across thread counts (--threads 4 == --threads 1,
-#     which also exercises the forced-single-thread clamp);
+#   - PAFF is deterministic at a fixed thread count (two --threads 4 runs
+#     are byte-identical);
 #   - an --nal-hrd cbr stream is CPB-compliant at field granularity per the
 #     independent Annex C simulator (tools/check_hrd.py);
 #   - unsupported combinations are rejected at validation (non-zero exit):
@@ -144,13 +144,16 @@ else
     bad "2-pass (pass 1 failed)"; tail -n 4 "$WORKDIR/log" >&2
 fi
 
-# 2. Determinism: --threads 4 must match --threads 1 (forced-single-thread clamp).
-"$X264" "$CLIP" "${COMMON[@]}" -o "$WORKDIR/det1.264" --paff --tff --crf 23 --threads 1 >"$WORKDIR/log" 2>&1 \
-    || die "threads=1 encode failed"
-"$X264" "$CLIP" "${COMMON[@]}" -o "$WORKDIR/det4.264" --paff --tff --crf 23 --threads 4 >"$WORKDIR/log" 2>&1 \
+# 2. Determinism: two --threads 4 runs must be byte-identical.  Threaded
+#    output intentionally differs from --threads 1 (the per-reference-row
+#    vertical MV-range clamp, same as progressive frame threading), so the
+#    check is repeatability at a fixed thread count, not cross-count equality.
+"$X264" "$CLIP" "${COMMON[@]}" -o "$WORKDIR/det4a.264" --paff --tff --crf 23 --threads 4 >"$WORKDIR/log" 2>&1 \
     || die "threads=4 encode failed"
-if cmp -s "$WORKDIR/det1.264" "$WORKDIR/det4.264"; then ok "determinism --threads 4 == --threads 1"
-else bad "determinism --threads 4 != --threads 1"; fi
+"$X264" "$CLIP" "${COMMON[@]}" -o "$WORKDIR/det4b.264" --paff --tff --crf 23 --threads 4 >"$WORKDIR/log" 2>&1 \
+    || die "threads=4 encode failed"
+if cmp -s "$WORKDIR/det4a.264" "$WORKDIR/det4b.264"; then ok "determinism: --threads 4 repeatable"
+else bad "determinism: --threads 4 not repeatable"; fi
 
 # 3. HRD: --nal-hrd cbr stream must be CPB-compliant at field granularity.
 HRD="$WORKDIR/hrd.264"
