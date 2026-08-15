@@ -39,10 +39,11 @@ one field picture (field_pic_flag = 1).  Where the encoder used to emit things
     dpb_output_delay) are expressed per field access unit under --nal-hrd.
   * dec_ref_pic_marking SEI carries the true original_field_pic_flag.
 
-A keyframe pair is currently coded as two IDR field access units (the "II"
-structure).  A refinement to the QSV/libmfx-compatible "Ip" structure (first
-field IDR, second field a P referencing the first) is tracked separately and
-will re-baseline every keyframe-containing stream when it lands.
+A keyframe pair is coded in the QSV/libmfx-compatible "Ip" structure: the
+first field is an IDR access unit, the second field is a reference P field
+(nal_ref_idc != 0, as required by 7.4.3 for two fields of opposite parity
+sharing one frame_num) predicting from the first field of the pair.  The
+buffering_period SEI sits in the IDR access unit, satisfying D.2.2.
 
 VUI/HRD streams parse cleanly in JM and ffprobe; CPB underflow/overflow is
 checked at field granularity by the independent Annex C simulator
