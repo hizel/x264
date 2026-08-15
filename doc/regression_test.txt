@@ -22,3 +22,19 @@ cd ../..
 ./x264/x264 input.yuv --dump-yuv fdec.yuv -o output.h264
 ./JM/bin/ldecod.exe -i output.h264 -o ref.yuv
 diff ref.yuv fdec.yuv
+
+=== PAFF regression matrix ===
+
+The PAFF B-field matrix pins the
+14 configs that previously segfaulted or drifted under PAFF: TFF/BFF x
+b-pyramid (none/normal/strict) x ref 1-4 x direct mode (none/spatial/temporal/
+auto) x CABAC/CAVLC x keyint 8/24 (frame_num wrap) x --no-deblock.  The config
+list lives in tools/paff_matrix.sh and is shared by both drivers below.
+
+Local byte-exact round-trip (needs the JM ldecod above and ffmpeg for the
+synthesized interlaced clip):
+    tools/test_paff.sh matrix
+
+CI encode-only smoke (no JM/ffmpeg needed; catches segfaults/crashes only,
+the byte-exact gate runs locally):
+    tools/test_paff_ci.sh

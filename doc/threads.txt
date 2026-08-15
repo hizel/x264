@@ -93,3 +93,13 @@ x264 --preset slower --tune psnr --crf 30
 10:         6.24x         +0.001
 11:         6.55x         -0.001
 12:         6.89x         -0.001
+
+
+PAFF (field pictures) and threads:
+Under --paff the encoder forces single-threaded encoding (i_threads = 1).
+Slice-based threading is rejected at validation; frame-based threading is
+forced down to 1 with a warning.  A complementary field pair is coded within
+one frame-thread slot, but the pair is only usable as a reference after BOTH
+fields are reconstructed and filtered, which does not pipeline on x264's
+per-row filter-completion model, so frame threads are deferred to future work.
+See doc/paff.txt.

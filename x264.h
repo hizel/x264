@@ -45,7 +45,7 @@ extern "C" {
 
 #include "x264_config.h"
 
-#define X264_BUILD 165
+#define X264_BUILD 166
 
 #ifdef _WIN32
 #   define X264_DLL_IMPORT __declspec(dllimport)
@@ -211,6 +211,11 @@ typedef struct x264_nal_t
 #define X264_CQM_FLAT                0
 #define X264_CQM_JVT                 1
 #define X264_CQM_CUSTOM              2
+
+/* values for b_interlaced */
+#define X264_INTERLACED_OFF          0
+#define X264_INTERLACED_MBAFF        1
+/* PAFF (field pictures) is selected separately, via b_paff. */
 #define X264_RC_CQP                  0
 #define X264_RC_CRF                  1
 #define X264_RC_ABR                  2
@@ -381,7 +386,14 @@ typedef struct x264_param_t
     int         b_cabac;
     int         i_cabac_init_idc;
 
+    /* Interlaced coding mode: X264_INTERLACED_OFF (progressive) or
+     * X264_INTERLACED_MBAFF.  Mutually exclusive with b_paff. */
     int         b_interlaced;
+    /* PAFF: code each frame as a complementary field pair (field_pic_flag=1).
+     * Field order (top/bottom first) follows b_tff.  Mutually exclusive with
+     * b_interlaced; B-frames, weighted prediction, sliced threads and frame
+     * threading are not supported in this mode. */
+    int         b_paff;
     int         b_constrained_intra;
 
     int         i_cqm_preset;

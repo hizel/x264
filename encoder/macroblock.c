@@ -671,6 +671,13 @@ static ALWAYS_INLINE void macroblock_encode_internal( x264_t *h, int plane_count
                 int v_shift = CHROMA_V_SHIFT;
                 int height = 16 >> v_shift;
 
+                /* PAFF: an opposite-parity field reference (e.g. the
+                 * complementary field of the current pair) needs the chroma
+                 * v-offset, exactly as in mb_mc_0xywh.  Applied before the
+                 * mv0 branch: mv0 with an opposite-parity ref still needs
+                 * the half-line chroma interpolation. */
+                if( v_shift & MB_INTERLACED & (FIELD_PIC ? (h->mb.pic.i_fref_parity[0] ^ h->sh.b_bottom_field) : 0) )
+                    mvy += (h->mb.i_mb_y & 1)*4 - 2;
                 /* Special case for mv0, which is (of course) very common in P-skip mode. */
                 if( mvx | mvy )
                     h->mc.mc_chroma( h->mb.pic.p_fdec[1], h->mb.pic.p_fdec[2], FDEC_STRIDE,
@@ -1040,6 +1047,13 @@ static ALWAYS_INLINE int macroblock_probe_skip_internal( x264_t *h, int b_bidir,
 
         if( !b_bidir )
         {
+            /* PAFF: an opposite-parity field reference (e.g. the
+             * complementary field of the current pair) needs the chroma
+             * v-offset, exactly as in mb_mc_0xywh.  Applied before the
+             * mv0 branch: mv0 with an opposite-parity ref still needs
+             * the half-line chroma interpolation. */
+            if( !chroma422 && FIELD_PIC && (h->mb.pic.i_fref_parity[0] ^ h->sh.b_bottom_field) )
+                mvp[1] += (h->mb.i_mb_y & 1)*4 - 2;
             /* Special case for mv0, which is (of course) very common in P-skip mode. */
             if( M32( mvp ) )
                 h->mc.mc_chroma( h->mb.pic.p_fdec[1], h->mb.pic.p_fdec[2], FDEC_STRIDE,

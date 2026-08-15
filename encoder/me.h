@@ -39,6 +39,8 @@ typedef struct
     uint16_t *p_cost_mv; /* lambda * nbits for each possible mv */
     int      i_ref_cost;
     int      i_ref;
+    int      i_list;      /* which list i_ref indexes (set by LOAD_HPELS); used
+                             under FIELD_PIC to pick the per-list parity map */
     const x264_weight_t *weight;
 
     pixel *p_fref[12];

@@ -26,6 +26,8 @@ config.log
 x264_config.h
 x264
 checkasm
+checkasm8
+checkasm10
 
 *.264
 *.h264

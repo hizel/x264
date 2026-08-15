@@ -421,8 +421,11 @@ static int macroblock_tree_rescale_init( x264_t *h, x264_ratecontrol_t *rc )
     float dstdim[2] = {    h->param.i_width / 16.f,    h->param.i_height / 16.f};
     int srcdimi[2] = {ceil(srcdim[0]), ceil(srcdim[1])};
     int dstdimi[2] = {ceil(dstdim[0]), ceil(dstdim[1])};
-    if( h->param.b_interlaced || h->param.b_fake_interlaced )
+    if( h->param.b_interlaced || h->param.b_fake_interlaced || h->param.b_paff )
     {
+        /* PAFF pads sps->i_mb_height to even like MBAFF (set.c), so the
+         * fractional-dim rounding must match or src_mb_count (qp_buffer
+         * size) comes out short and mbtree_fix8_pack overflows it. */
         srcdimi[1] = (srcdimi[1]+1)&~1;
         dstdimi[1] = (dstdimi[1]+1)&~1;
     }
@@ -1873,10 +1876,20 @@ int x264_ratecontrol_end( x264_t *h, int bits, int *filler )
         int use_old_stats = h->param.rc.b_stat_read && rc->rce->refs > 1;
         for( int i = 0; i < (use_old_stats ? rc->rce->refs : h->i_ref[0]); i++ )
         {
-            int refcount = use_old_stats         ? rc->rce->refcount[i]
-                         : PARAM_INTERLACED      ? h->stat.frame.i_mb_count_ref[0][i*2]
-                                                 + h->stat.frame.i_mb_count_ref[0][i*2+1]
-                         :                         h->stat.frame.i_mb_count_ref[0][i];
+            int refcount;
+            if( use_old_stats )
+                refcount = rc->rce->refcount[i];
+            else if( h->param.b_paff )
+                /* PAFF: the field-pair driver already folded the
+                 * per-field-entry counts into pair counts per pass (while
+                 * each pass's entry->pair map was live), so the merged
+                 * stats carry pair-level counts directly. */
+                refcount = h->stat.frame.i_mb_count_ref[0][i];
+            else if( PARAM_INTERLACED )
+                refcount = h->stat.frame.i_mb_count_ref[0][i*2]
+                         + h->stat.frame.i_mb_count_ref[0][i*2+1];
+            else
+                refcount = h->stat.frame.i_mb_count_ref[0][i];
             if( fprintf( rc->p_stat_file_out, "%d ", refcount ) < 0 )
                 goto fail;
         }
@@ -2133,20 +2146,17 @@ static void update_predictor( predictor_t *p, float q, float var, float bits )
     p->offset += new_offset;
 }
 
-// update VBV after encoding a frame
-static int update_vbv( x264_t *h, int bits )
+// step the decoder CPB model over one access unit: remove the AU's bits
+// (checking underflow), then add the bits arriving during its display
+// duration (checking overflow).  Filler is emitted only for the last AU
+// of the frame (b_last_au) -- mid-frame overflow is clamped instead.
+static int vbv_au_step( x264_t *h, int64_t bits, int64_t i_cpb_duration, int b_last_au, const char *au_prefix )
 {
     int filler = 0;
     int bitrate = h->sps->vui.hrd.i_bit_rate_unscaled;
     x264_ratecontrol_t *rcc = h->rc;
     x264_ratecontrol_t *rct = h->thread[0]->rc;
     int64_t buffer_size = (int64_t)h->sps->vui.hrd.i_cpb_size_unscaled * h->sps->vui.i_time_scale;
-
-    if( rcc->last_satd >= h->mb.i_mb_count )
-        update_predictor( &rct->pred[h->sh.i_type], qp2qscale( rcc->qpa_rc ), rcc->last_satd, bits );
-
-    if( !rcc->b_vbv )
-        return filler;
 
     uint64_t buffer_diff = (uint64_t)bits * h->sps->vui.i_time_scale;
     rct->buffer_fill_final -= buffer_diff;
@@ -2156,9 +2166,9 @@ static int update_vbv( x264_t *h, int bits )
     {
         double underflow = (double)rct->buffer_fill_final_min / h->sps->vui.i_time_scale;
         if( rcc->rate_factor_max_increment && rcc->qpm >= rcc->qp_novbv + rcc->rate_factor_max_increment )
-            x264_log( h, X264_LOG_DEBUG, "VBV underflow due to CRF-max (frame %d, %.0f bits)\n", h->i_frame, underflow );
+            x264_log( h, X264_LOG_DEBUG, "VBV underflow due to CRF-max (%sframe %d, %.0f bits)\n", au_prefix, h->i_frame, underflow );
         else
-            x264_log( h, X264_LOG_WARNING, "VBV underflow (frame %d, %.0f bits)\n", h->i_frame, underflow );
+            x264_log( h, X264_LOG_WARNING, "VBV underflow (%sframe %d, %.0f bits)\n", au_prefix, h->i_frame, underflow );
         rct->buffer_fill_final =
         rct->buffer_fill_final_min = 0;
     }
@@ -2166,20 +2176,44 @@ static int update_vbv( x264_t *h, int bits )
     if( h->param.i_avcintra_class )
         buffer_diff = buffer_size;
     else
-        buffer_diff = (uint64_t)bitrate * h->sps->vui.i_num_units_in_tick * h->fenc->i_cpb_duration;
+        buffer_diff = (uint64_t)bitrate * h->sps->vui.i_num_units_in_tick * i_cpb_duration;
     rct->buffer_fill_final += buffer_diff;
     rct->buffer_fill_final_min += buffer_diff;
 
-    if( rct->buffer_fill_final > buffer_size )
+    /* PAFF: the filler emitted at the pair's last field AU can only bound
+     * the fill at the NEXT pair's first-field removal.  The peak before
+     * the SECOND field's own removal (one tick of arrival after the first
+     * field's, with only the first field's bits removed in between) is not
+     * correctable by filler, so keep one field tick of headroom: start
+     * emitting filler when the fill exceeds cpb_size minus one tick of
+     * arrival.  Then fill_before(tr(f0)) <= size - tick and the
+     * second-field peak stays <= size - bits(f0) <= size. */
+    int64_t eff_buffer_size = buffer_size;
+#if HAVE_INTERLACED
+    if( h->param.b_paff && h->param.rc.b_filler && b_last_au )
+        eff_buffer_size = buffer_size - buffer_diff;
+#endif
+
+    if( rct->buffer_fill_final > eff_buffer_size )
     {
-        if( h->param.rc.b_filler )
+        if( h->param.rc.b_filler && b_last_au )
         {
             int64_t scale = (int64_t)h->sps->vui.i_time_scale * 8;
-            filler = (rct->buffer_fill_final - buffer_size + scale - 1) / scale;
+            filler = (rct->buffer_fill_final - eff_buffer_size + scale - 1) / scale;
             bits = h->param.i_avcintra_class ? filler * 8 : X264_MAX( (FILLER_OVERHEAD - h->param.b_annexb), filler ) * 8;
             buffer_diff = (uint64_t)bits * h->sps->vui.i_time_scale;
             rct->buffer_fill_final -= buffer_diff;
             rct->buffer_fill_final_min -= buffer_diff;
+        }
+        else if( h->param.rc.b_filler )
+        {
+            /* PAFF mid-pair AU: filler can only be written at pair end
+             * (into the last field's AU), so there is nothing to emit yet.
+             * Do NOT clamp: clamping would discard the excess from the
+             * model while the decoder's CPB still holds it, letting the
+             * true fill drift above cpb_size unnoticed (found by the
+             * Annex C simulator).  Carry the excess; the pair's
+             * last AU emits filler for it. */
         }
         else
         {
@@ -2187,6 +2221,43 @@ static int update_vbv( x264_t *h, int bits )
             rct->buffer_fill_final_min = X264_MIN( rct->buffer_fill_final_min, buffer_size );
         }
     }
+
+    return filler;
+}
+
+// update VBV after encoding a frame
+static int update_vbv( x264_t *h, int bits )
+{
+    int filler = 0;
+    x264_ratecontrol_t *rcc = h->rc;
+    x264_ratecontrol_t *rct = h->thread[0]->rc;
+
+    if( rcc->last_satd >= h->mb.i_mb_count )
+        update_predictor( &rct->pred[h->sh.i_type], qp2qscale( rcc->qpa_rc ), rcc->last_satd, bits );
+
+    if( !rcc->b_vbv )
+        return filler;
+
+#if HAVE_INTERLACED
+    if( h->param.b_paff )
+    {
+        /* Annex C: each field is its own access unit, removed one field
+         * tick after the previous AU (C.1.2); a pair's i_cpb_duration is 2
+         * ticks, so each step adds one tick of arrival.  A pair-level step
+         * provably misses CPB underflow when the first field is large (its
+         * AU is removed one tick before the pair's bits finish arriving).
+         * Per-AU sizes are the actual NAL payload sums split at the
+         * boundary recorded by the pair driver; their total equals the
+         * frame size passed in.  Filler goes to the pair's last AU. */
+        int64_t au_bits[2] = { 0, 0 };
+        for( int i = 0; i < h->out.i_nal; i++ )
+            au_bits[i >= h->out.i_paff_au_boundary] += (int64_t)h->out.nal[i].i_payload * 8;
+        vbv_au_step( h, au_bits[0], h->fenc->i_cpb_duration/2, 0, "field 0 of " );
+        filler = vbv_au_step( h, au_bits[1], h->fenc->i_cpb_duration - h->fenc->i_cpb_duration/2, 1, "field 1 of " );
+    }
+    else
+#endif
+        filler = vbv_au_step( h, bits, h->fenc->i_cpb_duration, 1, "" );
 
     return filler;
 }
