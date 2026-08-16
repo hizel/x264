@@ -486,13 +486,19 @@ static int validate_parameters( x264_t *h, int b_open )
         /* Weighted prediction (weightp) on P fields: pair-level estimated
          * weights are mapped onto field-entry references in
          * weighted_pred_init.  Weighted biprediction (weightb):
-         * the bipred weight tables (bipred_weight_buf[1][parity]) are
-         * filled per PAFF pass with field POCs (implicit weights) but do not honour explicit weights, so enabling weightb
-         * would mis-weight B-field bipred.  Warn and disable (implicit
-         * 32/32 weighting stays correct). */
+         * measured and rejected (numbers in doc/paff.txt).
+         * The evaluation showed the implicit-weight tables are
+         * field-correct (28/28 JM round-trip with weightb on; two latent
+         * bugs had to be fixed first: the int8_t bipred_weight_buf could
+         * not hold the boundary weight 128, and the signed-byte-multiply
+         * pixel_avg asm cannot represent the -64/128 extrema -- both
+         * reachable only by field pictures; the fixes were reverted with
+         * the enable, as the force-off makes them unreachable) but the
+         * quality gain on dissolve content is ~0.3% BD-rate, below the
+         * 0.5% acceptance floor, so the disable is permanent. */
         if( h->param.analyse.b_weighted_bipred )
         {
-            x264_log( h, X264_LOG_WARNING, "PAFF does not support weighted biprediction yet: disabling\n" );
+            x264_log( h, X264_LOG_WARNING, "PAFF does not support weighted biprediction (measured: no gain): disabling\n" );
             h->param.analyse.b_weighted_bipred = 0;
         }
         if( h->param.b_sliced_threads )

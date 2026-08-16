@@ -760,6 +760,11 @@ struct x264_t
         /* B_direct and weighted prediction */
         int16_t dist_scale_factor_buf[2][2][X264_REF_MAX*2][4];
         int16_t (*dist_scale_factor)[4];
+        /* int8_t cannot hold the boundary weight 128 (nor can the
+         * signed-byte-multiply pixel_avg asm represent the -64/128 extrema);
+         * reachable only by field pictures, and PAFF force-disables weightb,
+         * so the store sites only assert the range.  Widen this if weightb
+         * is ever enabled for field pictures (see doc/paff.txt). */
         int8_t bipred_weight_buf[2][2][X264_REF_MAX*2][4];
         int8_t (*bipred_weight)[4];
         /* maps fref1[0]'s ref indices into the current list0 */
