@@ -132,6 +132,18 @@ REALIGN_STACK static void *lookahead_thread( x264_t *h )
 int x264_lookahead_init( x264_t *h, int i_slicetype_length )
 {
     x264_lookahead_t *look;
+
+    /* Log the lookahead's lowres MV range once here, single-threaded at
+     * encoder open, before any analysis thread exists.  The value itself
+     * is computed per-MB in slicetype_mb_cost (slicetype.c); keep the two
+     * formulas in sync.  PAFF un-halves the coding-pass range there, so
+     * under --paff this matches the progressive value for the same clip
+     * (observable only via this log, not in the bitstream). */
+    {
+        int lowres_mv_range = 2 * (h->param.analyse.i_mv_range << h->param.b_paff);
+        x264_log( h, X264_LOG_DEBUG, "lookahead lowres mv_range = %d\n", lowres_mv_range );
+    }
+
     CHECKED_MALLOCZERO( look, sizeof(x264_lookahead_t) );
     for( int i = 0; i < h->param.i_threads; i++ )
         h->thread[i]->lookahead = look;

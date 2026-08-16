@@ -118,12 +118,81 @@ the MV-range clamp of frame threading applies as in progressive encoding.
 --threads 1 output never broadcasts or waits and stays identical to the
 pre-threading implementation.
 
-Known pre-existing issue (future work): the vertical MV-limit geometry is
-frame-based (sized by the full frame height, about 2x wider than a field
-needs), so motion search can over-search into the padding; only the
-thread clamp is in field units.  Row-granular readiness for the FIRST
-field (dropping the intermediate sweep) and low-latency slicing are
-likewise future work.
+Motion-vector limits
+--------------------
+
+Every PAFF coding pass is a field picture, so the vertical MV limits of
+the analysis pass are derived from the field MB grid (field row
+i_mb_y>>1 of i_mb_height>>1 rows; the SPS pads i_mb_height to even),
+not the frame grid.  The +/-24-field-line (96 qpel) margin of those
+limits stays inside the per-parity emulated edge (32 field lines;
+i_padv is doubled for field coding).  This covers the search limits AND
+the unclamped
+mv_min/mv_max that bound derived MVs (P skip, temporal B direct), so no
+motion decision can point outside the referenced field plus its edge.
+Before the fix the frame-grid limits were about 2x wider than a field
+needs: motion search could walk into the reference padding whenever the
+level-derived range exceeded the field border (high levels, large
+--mvrange, HD+ material), and derived MVs could be clipped into padding
+at default levels.  An explicit --mvrange is in FIELD LINES under PAFF,
+while the level-derived default is the halved level-table value (Annex A
+bounds the vertical MV component in frame samples, so a field-line
+limit is half the table value; one field line spans two frame lines).
+The horizontal range clamp shares the halved value (a field sample is a
+frame sample horizontally, so this is over-strict, but it matches the
+VUI max-MV signal and the MV cost-table sizing; left unchanged).
+
+The lookahead analyzes whole frames (lowres planes are full frames, one
+entry per input frame), so its lowres search range is in FRAME units:
+slicetype.c undoes the halving there, giving scenecut/mbtree the same
+vertical range progressive encoding gets.  The value is observable only
+via the debug-level log ("lookahead lowres mv_range = N"); the PAFF
+test script compares it between a --paff and a progressive run
+(test_paff.sh la_range).
+
+Measured impact (25-frame clips, 8-bit, pre-change vs MV-limits-only vs
+MV-limits+lookahead attribution builds):
+
+  * Non-PAFF output (progressive, MBAFF) is bit-identical at every
+    tested config, resolution and thread count.
+  * Wide range (1080 lines, --mvrange 1024 --ref 4, where the field
+    border geometry limit is 552 field lines): bitrate -0.005%, PSNR-Y
+    +0.015 dB -- small but in the intended direction (search stops
+    feeding on padding).  With --me umh --merange 64 the pre-change
+    build segfaulted once (unreproducible; the old limits permit reads
+    far past the field planes), the fixed builds are stable.
+  * MV-limits-only vs pre-change at default range: bit-identical on P-only
+    configs; small stream changes where derived MVs previously clipped
+    to the frame grid (temporal-direct B configs, HD clips), quality
+    effect <= 0.009 dB PSNR-Y (neutral).
+  * MV-limits+lookahead vs pre-change: the un-halved lookahead range retrains
+    scenecut and mbtree decisions; on 25-frame 176x144 matrix clips
+    this moves bitrate by -7.4%..+4.1% and PSNR-Y by -0.28..+0.20 dB
+    (one I-field/P-field flip dominates a 25-frame clip; present in
+    MV-limits+lookahead, absent in MV-limits-only -- accepted as lookahead-retraining
+    sensitivity).  At 1080 scale the
+    same comparison is within +/-0.04% bitrate and +/-0.02 dB PSNR-Y.
+    Every stream in the full matrix (39/39 incl. wide-range and
+    vertical-motion round-trips) is still JM bit-exact vs --dump-yuv,
+    and fixed-N determinism holds at N=1, 4 and 8.
+
+Future work
+-----------
+
+  * Row-granular readiness for the FIRST field of a pair (dropping the
+    intermediate sweep): the first field becomes usable as a reference only
+    after the sweep completes.  Row-granular readiness like the second
+    field's would lift the ~2x P-chain threading ceiling (doc/threads.txt).
+  * Low-latency slicing / sliced threads under PAFF (rejected at
+    validation, see Unsupported combinations).
+  * Weighted biprediction (--weightb) explicit weights for field bipred:
+    currently forced off with a warning (implicit 32/32 stays correct).
+  * Full II-pair AVC-Intra support (rejected at validation).
+  * Per-field mbtree propagation: lookahead/mbtree analyze whole frames, so
+    per-field propagate weights are ~2x off (quality-only).  Gated on a
+    PSNR/SSIM bound the PAFF series verified as passing -- do NOT touch
+    unless that bound fails (see macroblock_tree_propagate in
+    encoder/slicetype.c).
 
 
 Unsupported combinations (rejected at validation)

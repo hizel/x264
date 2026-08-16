@@ -547,7 +547,17 @@ static void slicetype_mb_cost( x264_t *h, x264_mb_analysis_t *a,
     if( p0 == p1 )
         goto lowres_intra_mb;
 
-    int mv_range = 2 * h->param.analyse.i_mv_range;
+    /* PAFF: the lookahead analyzes whole frames -- lowres planes are
+     * full frames and consecutive entries are one input-frame period apart,
+     * exactly progressive's geometry and temporal distance -- so the lowres
+     * search range must be in frame units.  Undo here the PARAM_FIELDCODE
+     * halving that sizes the field coding passes (encoder.c).  MBAFF keeps
+     * the halved range: its lookahead quirk is upstream behavior and
+     * non-PAFF output must stay bit-identical.  The value is observable
+     * only here (not in the bitstream); it is logged once at encoder open
+     * in x264_lookahead_init so the PAFF test script can compare it
+     * against a progressive run of the same clip. */
+    int mv_range = 2 * (h->param.analyse.i_mv_range << h->param.b_paff);
     // no need for h->mb.mv_min[]
     h->mb.mv_min_spel[0] = X264_MAX( 4*(-8*h->mb.i_mb_x - 12), -mv_range );
     h->mb.mv_max_spel[0] = X264_MIN( 4*(8*(h->mb.i_mb_width - h->mb.i_mb_x - 1) + 12), mv_range-1 );

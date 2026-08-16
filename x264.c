@@ -804,7 +804,7 @@ static void help( x264_param_t *defaults, int longhelp )
         "                                  - tesa: hadamard exhaustive search (slow)\n" );
     else H1( "                                  - dia, hex, umh\n" );
     H2( "      --merange <integer>     Maximum motion vector search range [%d]\n", defaults->analyse.i_me_range );
-    H2( "      --mvrange <integer>     Maximum motion vector length [-1 (auto)]\n" );
+    H2( "      --mvrange <integer>     Maximum motion vector length [-1 (auto)]; in field lines under --paff, where auto is the halved level limit\n" );
     H2( "      --mvrange-thread <int>  Minimum buffer between threads [-1 (auto)]\n" );
     H1( "  -m, --subme <integer>       Subpixel motion estimation and mode decision [%d]\n", defaults->analyse.i_subpel_refine );
     H2( "                                  - 0: fullpel only (not recommended)\n"
