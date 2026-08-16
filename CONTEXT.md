@@ -18,6 +18,25 @@ _Avoid_: half-frame
 The top and bottom fields of one frame, coded as two separate pictures.
 _Avoid_: field couple
 
+**Field line**:
+A single row of samples within one field. Vertical distances inside a
+field (MV components, search ranges, thread wait thresholds under PAFF)
+are measured in field lines; one field line spans two frame lines.
+_Avoid_: half-line
+
+**Field units (MV)**:
+Expressing a vertical quantity in field lines (or quarter-field-lines
+for MV components) rather than frame lines. Under PAFF `i_mv_range`,
+the coding-pass MV limits and the VUI max-MV signal are in field units;
+the level table and the lookahead lowres range are in frame units.
+
+**Emulated edge**:
+The margin around a reference plane made by replicating edge samples,
+letting motion compensation read slightly outside the picture. Reading
+there is memory-safe but finds only smeared edge, not real content.
+Under PAFF each parity gets its own vertical edge (32 field lines),
+expanded separately.
+
 **PAFF**:
 A coding mode where every field is its own coded picture with its own
 slice header. What this project adds.

@@ -430,8 +430,21 @@ static void mb_analyse_init( x264_t *h, x264_mb_analysis_t *a, int qp )
             }
             else
             {
+                /* PAFF: this pass codes one field and references are field
+                 * stores (interleaved layout, read at doubled stride) with
+                 * per-field emulated edges, so the vertical search window
+                 * must come from the field MB grid: field row i_mb_y>>1 of
+                 * i_mb_height>>1 rows.  Both parities map the same way (a
+                 * pass codes every other frame MB row; the SPS rounds
+                 * i_mb_height up to even for field coding, so each field has
+                 * exactly i_mb_height/2 MB rows), and the +/-24-field-line
+                 * (96 qpel) margin stays inside the 32-field-line emulated
+                 * edge (i_padv=64 rows, halved by the doubled field stride).
+                 * The shifts are identity for progressive. */
+                int mb_height = h->mb.i_mb_height >> h->param.b_paff;
+                mb_y >>= h->param.b_paff;
                 h->mb.mv_min[1] = 4*( -16*mb_y - 24 );
-                h->mb.mv_max[1] = 4*( 16*( h->mb.i_mb_height - mb_y - 1 ) + 24 );
+                h->mb.mv_max[1] = 4*( 16*( mb_height - mb_y - 1 ) + 24 );
                 h->mb.mv_min_spel[1] = X264_MAX( h->mb.mv_min[1], -i_fmv_range );
                 h->mb.mv_max_spel[1] = X264_MIN3( h->mb.mv_max[1], i_fmv_range-1, 4*thread_mvy_range );
                 h->mb.mv_limit_fpel[0][1] = (h->mb.mv_min_spel[1]>>2) + i_fpel_border;

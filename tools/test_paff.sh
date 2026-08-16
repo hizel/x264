@@ -20,13 +20,23 @@
 #                   x keyint 8/24 x --no-deblock
 #   rc              rate-control round-trips vs JM: CBR+VBV and 2-pass ABR,
 #                   TFF and BFF
-#   all             baseline-check + paff + matrix + rc (default)
+#   la_range        lookahead-range parity: the debug-logged lowres
+#                   mv_range must match between --paff and progressive
+#   wide_range      wide-search PAFF round-trips (1080 @ --mvrange 1024,
+#                   720 @ --mvrange 512, TFF/BFF) where the field-geometry
+#                   MV limits actually bind (D1)
+#   motion          synthetic vertical-motion clip (large motion in both
+#                   directions), default + wide range, TFF/BFF, vs JM
+#   all             baseline-check + paff + matrix + rc + la_range
+#                   + wide_range + motion (default)
 #
 # Environment:
 #   X264      path to the x264 CLI binary      (default: ./x264)
 #   LDECOD    path to the JM ldecod binary     (default: $JM_HOME/bin/ldecod.exe,
 #                                                else ../JM/bin/ldecod.exe)
 #   WORKDIR   scratch dir for clips/outputs    (default: /tmp/paff_test)
+#   CLIP      override the input clip used by roundtrip()/roundtrip_2pass()
+#             (default: $WORKDIR/clip_${WIDTH}x${HEIGHT}.yuv; used by cmd_motion)
 
 set -u
 
@@ -80,6 +90,58 @@ make_clip() {
             -vf tinterlace -frames:v $FRAMES -pix_fmt yuv420p "$clip" \
             || die "failed to synthesize $clip"
     fi
+}
+
+# Synthesize a deterministic vertical-motion clip: a $2x$3 window crops a
+# double-height test pattern, the window's y position oscillates over the
+# full crop range (sin, 1 Hz), giving large vertical motion in BOTH
+# directions between consecutive fields, then the usual tinterlace merge.
+# (As with make_clip, the merge doubles the height; encodes read the top
+# half via --input-res.)
+make_motion_clip() {
+    local clip=$1 w=$2 h=$3
+    if [ ! -f "$clip" ]; then
+        ffmpeg -y -loglevel error \
+            -f lavfi -i "testsrc2=size=${w}x$((h*2)):rate=50:duration=1" \
+            -vf "crop=${w}:${h}:0:'(ih-${h})/2+(ih-${h})/2*sin(2*PI*t)',tinterlace" \
+            -frames:v $FRAMES -pix_fmt yuv420p "$clip" \
+            || die "failed to synthesize $clip"
+    fi
+}
+
+# Wide-range PAFF round-trips (field-geometry MV limits, D1): the geometry
+# term binds only when the vertical search range exceeds the field border
+# (552 field lines at 1080 rows incl. SPS padding, ~376 at 720 rows), so
+# push --mvrange past it (level auto-selects 6.x for --mvrange 1024; a
+# pinned lower level fails level validation).  roundtrip()'s fixed
+# --threads 1 keeps i_mv_range_thread from masking the geometry term.
+cmd_wide_range() {
+    local save_w=$WIDTH save_h=$HEIGHT
+    WIDTH=1920 HEIGHT=1080
+    make_clip "$WORKDIR/clip_${WIDTH}x${HEIGHT}.yuv"
+    roundtrip wide1080_tff_mv1024 --paff --tff --qp 24 --bframes 0 --ref 4 --mvrange 1024
+    roundtrip wide1080_bff_mv1024 --paff --bff --qp 24 --bframes 0 --ref 4 --mvrange 1024
+    WIDTH=1280 HEIGHT=720
+    make_clip "$WORKDIR/clip_${WIDTH}x${HEIGHT}.yuv"
+    roundtrip wide720_tff_mv512 --paff --tff --qp 24 --bframes 0 --ref 4 --mvrange 512
+    roundtrip wide720_bff_mv512 --paff --bff --qp 24 --bframes 0 --ref 4 --mvrange 512
+    WIDTH=$save_w HEIGHT=$save_h
+}
+
+# Synthetic vertical-motion clip (D1 sign/parity coverage): large motion in
+# both directions stressing the top/bottom border directions of both field
+# parities; encoded at default and wide search range, TFF and BFF.
+cmd_motion() {
+    local save_w=$WIDTH save_h=$HEIGHT save_clip=${CLIP:-}
+    WIDTH=1920 HEIGHT=1080
+    make_motion_clip "$WORKDIR/motion_${WIDTH}x${HEIGHT}.yuv" $WIDTH $HEIGHT
+    CLIP=$WORKDIR/motion_${WIDTH}x${HEIGHT}.yuv
+    roundtrip motion_tff          --paff --tff --qp 24 --bframes 0 --ref 4
+    roundtrip motion_bff          --paff --bff --qp 24 --bframes 0 --ref 4
+    roundtrip motion_tff_mv1024   --paff --tff --qp 24 --bframes 0 --ref 4 --mvrange 1024
+    roundtrip motion_bff_mv1024   --paff --bff --qp 24 --bframes 0 --ref 4 --mvrange 1024
+    CLIP=$save_clip
+    WIDTH=$save_w HEIGHT=$save_h
 }
 
 # Compare encoder reconstruction with JM output for a PAFF stream.
@@ -141,7 +203,7 @@ EOF
 # $1 = test name, $2... = extra x264 options
 roundtrip() {
     local name=$1; shift
-    local clip=$WORKDIR/clip_${WIDTH}x${HEIGHT}.yuv
+    local clip=${CLIP:-$WORKDIR/clip_${WIDTH}x${HEIGHT}.yuv}
     local out=$WORKDIR/$name.264
     local fdec=$WORKDIR/$name.fdec.yuv
     local ref=$WORKDIR/$name.jm.yuv
@@ -326,6 +388,38 @@ cmd_rc() {
     roundtrip_2pass rc_2p_bff  --paff --bff --bframes 0 --bitrate 300
 }
 
+# Lookahead-range parity with progressive (spec scenario, observable only
+# via the debug log, not the bitstream): the lookahead analyzes whole frames
+# under PAFF, so its lowres search range must equal the progressive run's.
+# slicetype.c logs "lookahead lowres mv_range = N" once per encode at debug
+# level; a PAFF run whose range is still halved logs half the value.
+cmd_la_range() {
+    local clip=$WORKDIR/clip_${WIDTH}x${HEIGHT}.yuv
+    local v_paff v_prog
+    make_clip "$clip"
+
+    "$X264" "$clip" --input-res ${WIDTH}x${HEIGHT} --frames $FRAMES \
+        --threads 1 --log-level debug --paff --tff --qp 20 --bframes 0 \
+        -o /dev/null 2>"$WORKDIR/la_range.paff.log" \
+        || { bad "la_range: PAFF encode failed"; return; }
+    "$X264" "$clip" --input-res ${WIDTH}x${HEIGHT} --frames $FRAMES \
+        --threads 1 --log-level debug --qp 20 --bframes 0 \
+        -o /dev/null 2>"$WORKDIR/la_range.prog.log" \
+        || { bad "la_range: progressive encode failed"; return; }
+
+    v_paff=$(sed -n 's/.*lookahead lowres mv_range = \([0-9]*\).*/\1/p' \
+        "$WORKDIR/la_range.paff.log" | head -1)
+    v_prog=$(sed -n 's/.*lookahead lowres mv_range = \([0-9]*\).*/\1/p' \
+        "$WORKDIR/la_range.prog.log" | head -1)
+    if [ -z "$v_paff" ] || [ -z "$v_prog" ]; then
+        bad "la_range: mv_range log line missing (paff='$v_paff' prog='$v_prog')"
+    elif [ "$v_paff" = "$v_prog" ]; then
+        ok "la_range: lookahead lowres mv_range matches progressive ($v_paff)"
+    else
+        bad "la_range: lookahead lowres mv_range differs: paff=$v_paff prog=$v_prog"
+    fi
+}
+
 check_tools
 mkdir -p "$WORKDIR"
 
@@ -337,7 +431,10 @@ for cmd in $cmds; do
         paff)           cmd_paff ;;
         matrix)         cmd_matrix ;;
         rc)             cmd_rc ;;
-        all)            cmd_baseline_check; cmd_paff; cmd_matrix; cmd_rc ;;
+        la_range)       cmd_la_range ;;
+        wide_range)     cmd_wide_range ;;
+        motion)         cmd_motion ;;
+        all)            cmd_baseline_check; cmd_paff; cmd_matrix; cmd_rc; cmd_la_range; cmd_wide_range; cmd_motion ;;
         *)              die "unknown command: $cmd" ;;
     esac
 done
