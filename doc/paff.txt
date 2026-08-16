@@ -76,10 +76,26 @@ Practical RC notes:
     rate over short windows.
 
 Weighted prediction (--weightp) is supported for P fields (it reuses the MBAFF
-weight path on the field-layout planes).  Weighted biprediction (--weightb,
-B-field bipred) is disabled: the implicit 32/32 weighting stays correct, but
-explicit weights are not honoured for field biprediction, so weightb is turned
-off with a warning.
+weight path on the field-layout planes).  Weighted biprediction (--weightb) is
+force-disabled with a warning: measured and rejected.  x264 only ever signals
+weighted_bipred_idc = 2 (implicit -- the decoder derives bipred weights from
+POC distances per 8.4.3; there are no explicit weights in the bitstream), and
+the per-pass bipred tables mirror that derivation with field POCs.  During
+evaluation the implicit derivation proved conformance-correct (full B-field
+matrix with weightb forced on, 28/28 bit-exact against JM, plus ffmpeg, NVDEC
+and VAAPI pixel-exact) once two latent bugs were fixed: bipred_weight_buf was
+int8_t and could not hold the boundary weight 128, and the signed-byte-multiply
+pixel_avg asm (8-bit x86 SSSE3/AVX2/AVX-512, LoongArch LSX/LASX) cannot
+represent the -64/128 extrema -- both reachable only by field pictures, whose
+expanded reference lists can put both bipred references on the same POC side
+of the current field.  But a CRF 18/23/28/33 sweep on a synthetic dissolve
+clip (the content implicit weights exist for) gained only 0.272% BD-rate
+(PSNR-Y) -- below the 0.5% acceptance floor fixed before measuring -- and a
+progressive encode of the same clip showed the same ~0% gain, so the feature
+is not worth its RD churn.  The measurement setup is kept in
+"tools/test_paff.sh weightb"; with the force-off in place its on-rows warn
+and encode weightb-off, so reproducing the numbers requires locally
+reverting the validation block in x264_encoder_open first.
 
 
 Threading
@@ -179,14 +195,16 @@ D1+D2 attribution builds):
 Future work
 -----------
 
-  * Row-granular readiness for the FIRST field of a pair (dropping the
-    intermediate sweep): the first field becomes usable as a reference only
-    after the sweep completes.  Row-granular readiness like the second
-    field's would lift the ~2x P-chain threading ceiling (doc/threads.txt).
+  * Row-granular readiness for the FIRST field of a pair: measured and
+    rejected.  The intermediate sweep costs ~1-2% of pair job time (1080i,
+    --threads 1: 0.12s sweep vs 5.9s pair at --bframes 0, 14.0s at
+    --bframes 3), so dropping it would move the P-chain ceiling by single
+    percent.  Lifting the ~2x ceiling structurally would require splitting
+    the pair into two dispatches (re-opening the paff-frame-threads D3/D20
+    job-boundary decisions) -- not worth it at the measured speedups
+    (doc/threads.txt).
   * Low-latency slicing / sliced threads under PAFF (rejected at
     validation, see Unsupported combinations).
-  * Weighted biprediction (--weightb) explicit weights for field bipred:
-    currently forced off with a warning (implicit 32/32 stays correct).
   * Full II-pair AVC-Intra support (rejected at validation).
   * Per-field mbtree propagation: lookahead/mbtree analyze whole frames, so
     per-field propagate weights are ~2x off (quality-only).  Gated on a
@@ -202,6 +220,8 @@ Unsupported combinations (rejected at validation)
   * --paff with an AVC-Intra class (i_avcintra_class).  Full II-pair AVC-Intra
     support is future work.
   * --paff with --sliced-threads (see Threading).
+  * --paff with --weightb: force-disabled with a warning (measured and
+    rejected: no quality gain, see Rate control and VBV).
   * --paff with --pulldown: pulldown patterns have no coded frame picture to
     attach to (every frame is a field pair).  Timebase-only pulldown
     (param.b_pulldown without a CLI pattern) is harmless and stays allowed.
@@ -269,6 +289,9 @@ Testing
     NVDEC/cuvid, NVDEC/nvdec, QSV, VAAPI backends) with a pixel-exact
     cross-check against ffmpeg's software decoder.
   * tools/check_hrd.py: Annex C CPB simulator for --nal-hrd cbr streams.
+  * tools/test_paff.sh opengop: open-GOP round-trips vs JM -- keyint-driven
+    non-IDR Ip keyframe pairs plus a hard-scene-cut clip whose GOP-tail B
+    pairs must reference across the I pair to decode correctly.
   * make checkasm: unchanged; the PAFF deblock/strength fixes are gated on
     field-picture B-slices and do not touch the shared DSP functions.
 

@@ -148,6 +148,16 @@ Arrays of `[…][4]` (the last dimension is the L1 index, capped at 4).
 They overflow when L1 is field-doubled (≥6 entries); under PAFF the
 `[1][parity]` slots are written with field POCs and always read.
 
+**weightb (weighted biprediction)**:
+Bipred weighting for B slices (`--weightb`, PPS `weighted_bipred_idc`).
+x264 only signals idc = 2 (implicit): no weights in the bitstream, the
+decoder derives them from POC distances (§8.4.3). Under PAFF it is
+force-disabled with a warning -- measured and rejected: conformance-correct
+but ~0.3% BD-rate gain on dissolve content, below the 0.5% floor
+(doc/paff.txt). Not to be confused with weightp (P slices, explicit
+weights in the slice header).
+_Avoid_: explicit bipred weights
+
 **SEI**:
 Service messages in the stream next to pictures: timing, field order,
 etc. They do not affect pixel decoding but are needed for presentation.

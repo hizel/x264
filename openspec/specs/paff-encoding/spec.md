@@ -343,7 +343,13 @@ Combinations of PAFF with features that have no defined field-picture
 semantics SHALL be rejected at validation time with a clear error naming the
 unsupported combination, rather than silently ignored or mis-encoded. Weighted
 prediction (`--weightp`) SHALL either produce conformant output under PAFF or
-be rejected the same way.
+be rejected the same way. Weighted biprediction (`--weightb`) SHALL be
+force-disabled under PAFF with a one-shot warning: the implicit-weight
+derivation was verified conformance-correct for B field pictures, but the
+measured quality gain on dissolve content (the content implicit bipred
+weights exist for) is below the acceptance floor fixed before measuring, and
+the rejection rationale with the measurement numbers SHALL be recorded in
+`doc/paff.txt`.
 
 #### Scenario: CLI pulldown rejected
 - **WHEN** the user requests `--pulldown` together with `--paff`
@@ -371,6 +377,17 @@ be rejected the same way.
 - **WHEN** `--weightp` under PAFF fails the JM conformance round-trip
 - **THEN** the combination is rejected at validation with a clear error and
   the limitation is documented in `doc/paff.txt`
+
+#### Scenario: Weighted biprediction force-disabled with recorded measurement
+- **WHEN** weighted biprediction (`--weightb`, on by default in most
+  presets) is in effect together with `--paff`
+- **THEN** validation disables `analyse.b_weighted_bipred` with a one-shot
+  warning and encoding continues weightb-off, and `doc/paff.txt` records
+  the rationale: implicit weights proved conformance-correct (28/28 B-field
+  JM round-trip with weightb forced on, ffmpeg/NVDEC/VAAPI pixel-exact)
+  but a CRF 18/23/28/33 sweep on a synthetic dissolve clip gained only
+  0.272% BD-rate (PSNR-Y), below the 0.5% acceptance floor fixed before
+  measuring
 
 ### Requirement: Full-matrix conformance
 
