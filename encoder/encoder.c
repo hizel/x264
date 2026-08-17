@@ -4802,7 +4802,8 @@ int     x264_encoder_encode( x264_t *h,
         job->pair_count[0][1] = h->i_ref[1];
         memcpy( job->pair_fref[0][0], h->fref[0], h->i_ref[0] * sizeof(x264_frame_t *) );
         memcpy( job->pair_fref[0][1], h->fref[1], h->i_ref[1] * sizeof(x264_frame_t *) );
-        if( h->sh.i_type == SLICE_TYPE_P )
+        if( h->sh.i_type == SLICE_TYPE_P ||
+            ( h->sh.i_type == SLICE_TYPE_I && i_nal_type != NAL_SLICE_IDR ) )
         {
             /* 8.2.4.2.2: a P FIELD's refFrameList0ShortTerm spans the FULL
              * DPB ordered by FrameNumWrap DESCENDING -- not the POC-distance
@@ -4816,7 +4817,16 @@ int     x264_encoder_encode( x264_t *h,
              * signalled (DEC-C).  The expansion's 2*i_frame_reference field
              * cap still bounds the ACTIVE window, mirroring the decoder's
              * truncation to num_ref_idx_l0_active.  B pairs keep the POC
-             * order (8.2.4.2.4), which already matches. */
+             * order (8.2.4.2.4), which already matches.
+             *
+             * The I-pair arm covers open-GOP recovery pairs: their second
+             * field is coded as a P referencing the DPB (the Ip structure),
+             * but reference_build_list leaves an I pair's list EMPTY, which
+             * would put the complementary field at L0[0] while the decoder's
+             * default L0[0] is the newest past pair's same-parity field
+             * (8.2.4.2.5 skips the current pair's not-yet-coded parity).
+             * IDR pairs are excluded: their DPB is empty, so the pair's
+             * second field correctly sees only the complementary field. */
             job->pair_count[0][0] = 0;
             for( int i = 0; h->frames.reference[i]; i++ )
             {
