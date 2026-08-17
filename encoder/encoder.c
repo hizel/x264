@@ -3999,10 +3999,12 @@ static void *paff_pair_write( x264_t *h )
     {
         int parity = h->param.b_tff ? pass : !pass;
         /* PAFF: a keyframe complementary field pair is coded Ip --
-         * the first field is the IDR access unit, the second field is a
-         * NON-IDR P field referencing the pair's first field. */
+         * the first field is the I/IDR access unit, the second field is a
+         * NON-IDR P field referencing the pair's first field.  This applies
+         * to open-GOP recovery pairs (non-IDR I) as much as to IDR pairs:
+         * I+P is what QSV and broadcast PAFF encoders emit. */
         int pass_nal_type = job->i_nal_type;
-        if( pass && job->i_nal_type == NAL_SLICE_IDR )
+        if( pass && job->pair_slice_type == SLICE_TYPE_I )
         {
             pass_nal_type = NAL_SLICE;
             h->sh.i_type = SLICE_TYPE_P;
