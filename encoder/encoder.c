@@ -3617,7 +3617,23 @@ cont:
             h->mb.b_reencode_mb = 1;
             i_mb_x = 0;
             i_mb_y = i_mb_y - SLICE_MBAFF;
-            h->mb.i_mb_prev_xy = i_mb_y * h->mb.i_mb_stride - 1;
+            if( FIELD_PIC )
+            {
+                /* PAFF: MBs are coded in field-raster order (rows step by 2),
+                 * so the MB preceding (0,y) in coding order is the last MB of
+                 * row y-2 -- not of row y-1, which belongs to the opposite
+                 * parity and is not part of this slice.  A re-encode of the
+                 * slice's first field row has no predecessor at all (mirror
+                 * the slice-init value -1; safe because i_last_dqp is 0
+                 * there).  The generic formula below points one row off,
+                 * reading stale/opposite-parity type/cbp for the mb_qp_delta
+                 * CABAC context (cabac.c) and desyncing the slice. */
+                int first_row = h->sh.i_first_mb / h->mb.i_mb_width;
+                h->mb.i_mb_prev_xy = i_mb_y - 2 >= first_row
+                    ? (i_mb_y - 1) * h->mb.i_mb_stride - 1 : -1;
+            }
+            else
+                h->mb.i_mb_prev_xy = i_mb_y * h->mb.i_mb_stride - 1;
             h->sh.i_last_mb = orig_last_mb;
             continue;
         }
