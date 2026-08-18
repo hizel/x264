@@ -1,6 +1,10 @@
 # PAFF frame threads: hybrid readiness, not phase-granular
 
-**Status: proposed (design of `openspec/changes/paff-frame-threads`)**
+**Status: SUPERSEDED in part by ADR-0007** (`0007-paff-pass-granular-threading.md`):
+the hybrid-readiness model and the ~2x P-chain ceiling are replaced by
+pass-granular jobs with row-cadence readiness for both fields.  The
+rejection of phase-granular readiness below still stands — ADR-0007
+builds on exactly that dependency analysis.
 
 Enabling frame threads under PAFF, the tempting small change is phase-
 granular readiness: broadcast after the intermediate `paff_sync_references`

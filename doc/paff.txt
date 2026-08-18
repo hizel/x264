@@ -104,35 +104,43 @@ Threading
 PAFF supports frame-based threading.  Slice-based threading
 (--sliced-threads) is rejected at validation with an explicit error.
 
-A complementary field pair is coded as one frame-thread job (both field
-passes synchronously on one slot).  Reference readiness is hybrid:
+The two field passes of a complementary pair are coded as TWO separate
+frame-thread jobs: the caller dispatches pass 0 and pass 1 from the same
+prologue on two consecutive slots of the round-robin (the slot phase
+advances by two per PAFF encode call) and collects them together at the
+oldest pair's harvest (a rendezvous: both jobs must finish before the
+pair-level frame end runs).  N frame-thread slots therefore keep N/2
+PAIRS in flight, not N; the pipeline depth is passes, not pairs.  Pair
+jobs consume an even slot count (N & ~1): at an odd --threads value the
+last slot idles.
 
-  * the pair's FIRST field becomes usable as a reference at a phase
-    boundary: after the intermediate full-frame sweep between the two passes
-    (reconstruction, field-layout copy, borders and hpel complete for that
-    parity);
-  * rows of the pair's SECOND field become usable at row cadence during the
-    second pass, trailing the deblock by one field row, exactly like the
-    progressive per-row filter-completion model.
+Reference readiness is row-granular for BOTH fields of a pair: during
+its pass, each field row's reference band (field-layout copy, hpel,
+borders) is produced at row cadence, trailing the deblock by one field
+row -- the same per-row filter-completion model as progressive encoding.
+The intermediate full-frame sweep that older revisions ran between the
+two passes is gone.
 
-Dependent pairs gate through the standard frame-thread machinery: at each MB
-row start the encoder waits per reference field until its completed row
-count covers the search window (thresholds in field lines), then restricts
-the vertical MV range accordingly.  The pair's own first field (referenced
-by its second field) is produced by the same job and is never waited on.
-Because every pass references BOTH fields of the previous pair while both
-passes of a pair are serial inside one job, a P-chain tops out at roughly
-2x (pair time / pass time) minus MV-clamp losses no matter the thread
-count; B-pyramid siblings gate on the same anchor and overlap more.  See
-doc/threads.txt for measured numbers.
+Dependent pairs gate through the standard frame-thread machinery: at
+each MB row start the encoder waits per reference field until its
+completed row count covers the search window (thresholds in field
+lines), then restricts the vertical MV range accordingly.  The pair's
+own first field (referenced by its second field) waits by the same
+rule, bounded to the pair's own rows.  With both passes of a pair
+overlapping this way, a P-chain scales like progressive frame threading
+(a per-pass diagonal staircase) instead of topping out at the old ~2x
+pair-ceiling.  See doc/threads.txt for measured numbers.
 
 Determinism contract: output is deterministic at a fixed thread count
-(two runs with identical parameters and N produce byte-identical output,
-including --non-deterministic semantics), matching progressive frame
-threading.  Output at N > 1 threads is NOT byte-identical to --threads 1:
-the MV-range clamp of frame threading applies as in progressive encoding.
---threads 1 output never broadcasts or waits and stays identical to the
-pre-threading implementation.
+(two runs with identical parameters and N produce byte-identical
+output), matching progressive frame threading.  Output at N > 1 threads
+is NOT byte-identical to --threads 1: the MV-range clamp of frame
+threading applies as in progressive encoding.  --threads 1 output never
+broadcasts or waits and stays identical to the pre-threading
+implementation.  One inherited caveat: with VBV enabled, threaded
+output is not byte-deterministic even on pre-PAFF upstream
+(ratecontrol reads in-flight threads' state), so byte-repeat gates run
+on non-VBV configs.
 
 Motion-vector limits
 --------------------
@@ -195,14 +203,6 @@ D1+D2 attribution builds):
 Future work
 -----------
 
-  * Row-granular readiness for the FIRST field of a pair: measured and
-    rejected.  The intermediate sweep costs ~1-2% of pair job time (1080i,
-    --threads 1: 0.12s sweep vs 5.9s pair at --bframes 0, 14.0s at
-    --bframes 3), so dropping it would move the P-chain ceiling by single
-    percent.  Lifting the ~2x ceiling structurally would require splitting
-    the pair into two dispatches (re-opening the paff-frame-threads D3/D20
-    job-boundary decisions) -- not worth it at the measured speedups
-    (doc/threads.txt).
   * Low-latency slicing / sliced threads under PAFF (rejected at
     validation, see Unsupported combinations).
   * Full II-pair AVC-Intra support (rejected at validation).

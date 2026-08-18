@@ -96,22 +96,78 @@ x264 --preset slower --tune psnr --crf 30
 
 
 PAFF (field pictures) and threads:
-Under --paff, a complementary field pair is coded as one frame-thread job.
-Reference readiness is hybrid: the pair's first field is gated on a phase
-(the intermediate full-frame sweep between the passes), rows of the second
-field are gated at row cadence trailing the deblock, and dependent pairs
-restrict their vertical MV range to the completed field rows, exactly as
-progressive frame threads do (thresholds in field lines;
---non-deterministic keeps the clamped range, the default deterministic mode
-uses the fixed i_mv_range_thread).  Every pass references both fields of
-the previous pair and both passes of a pair are serial inside one job, so a
-P-chain tops out at ~2x (pair time / pass time) minus MV-clamp losses; B
-hierarchies overlap more.  Output is deterministic at a fixed thread count,
-but not byte-identical to --threads 1 (the MV-range clamp applies as in
-progressive).  Slice-based threading stays rejected.  See doc/paff.txt.
+Under --paff, the two field passes of a complementary pair are coded as
+two separate frame-thread jobs on consecutive slots (the slot rotation
+advances by two per pair); the caller collects both jobs of the oldest
+pair together (a rendezvous) before running the pair-level frame end.
+Reference readiness is row-granular for BOTH fields: each pass produces
+its parity's reference band (field-layout copy, hpel, borders) at row
+cadence trailing the deblock, and dependent passes restrict their
+vertical MV range to the completed field rows, exactly as progressive
+frame threads do (thresholds in field lines; --non-deterministic keeps
+the clamped range, the default deterministic mode uses the fixed
+i_mv_range_thread).  A pair's second field waits on its own first field
+by the same row rule.  The chain is therefore the per-pass diagonal
+staircase of progressive threading; the old pair-job model (one job per
+pair, first field gated on an intermediate-sweep phase) topped out at
+~2x on P-chains.  N slots keep N/2 PAIRS in flight; pair jobs consume an
+even slot count, so at an odd thread count the last slot idles.  Output
+is deterministic at a fixed thread count, but not byte-identical to
+--threads 1 (the MV-range clamp applies as in progressive).  Caveat:
+with VBV enabled, threaded output is not byte-deterministic even on
+pre-PAFF upstream (ratecontrol reads in-flight threads' state), so
+byte-repeat gates run on non-VBV configs.  Slice-based threading stays
+rejected.  See doc/paff.txt.
 
-Measured (1920x1080 testsrc2, 200 frames, --paff --keyint 50, default
-settings, x86-64):
+Measured (AMD Ryzen 7 9800X3D, 8C/16T; best of 3 runs; --paff --tff,
+CBR+VBV, --aud for the drift metrics; "pair-job" is the pre-split
+implementation at commit 5fe86884):
+
+hall.ts 720x576i25, 400 frames, --bitrate 4000 --vbv-maxrate 4000
+--vbv-bufsize 4000 (VBV buffer = 4.0 Mbit):
+
+            pass-jobs              pair-job     VBV drift vs t1
+threads:  fps     speedup        fps     ratio  filler  max dev  rms dev
+1:        21.3    1.00x          -       -     0       -        -
+2:        33.2    1.56x          36.0    0.92x 0       42 kbit   13 kbit
+4:        61.1    2.87x          54.3    1.13x 0      511 kbit  273 kbit
+6:        88.3    4.15x          56.5    1.56x 0      805 kbit  455 kbit
+8:        99.1    4.65x          -       -     0     1118 kbit  521 kbit
+16:       133.6   6.27x          60.7    2.20x 0     2407 kbit 1246 kbit
+
+(pair-job's own drift vs its t1: 1099 kbit max at t6, 3319 kbit at t16
+-- the split does not add VBV drift; it slightly reduces it here.)
+
+1920x1080i25 testsrc2 (tinterlaced), 100 frames, --bitrate 8000
+--vbv-maxrate 8000 --vbv-bufsize 8000 (VBV buffer = 8.0 Mbit):
+
+            pass-jobs              VBV drift vs t1
+threads:  fps     speedup        filler  max dev  rms dev
+1:        13.0    1.00x          0       -        -
+2:        19.5    1.50x          0       26 kbit    6 kbit
+4:        37.4    2.88x          0      257 kbit  164 kbit
+6:        55.5    4.28x          0      439 kbit  227 kbit
+8:        63.3    4.87x          0      609 kbit  394 kbit
+16:       64.8    5.00x          0     1332 kbit 1092 kbit
+
+Notes on the drift columns: pass 1's row VBV runs on predicted pass-0
+bits (progressive-threading semantics), so the threaded VBV trajectory
+diverges from the t1 run.  "filler" is total filler-NAL bytes (zero
+everywhere: no run ever approached underflow, and no VBV warnings were
+logged).  "max/rms dev" is the cumulative per-access-unit size
+difference vs the t1 run, i.e. how far the effective buffer trajectory
+wanders, in bits of the buffer (hall t16: 2407 kbit = 60% of the 4.0
+Mbit buffer, within bounds; the pair-job build reached 83%).  There is
+no numeric deviation bound: threaded ratecontrol is approximate by
+design, as in progressive.
+
+Acceptance (paff-pass-threads, three zones fixed before measuring):
+>=4x at t6 and >=5x at t16 required -- measured 4.15x and 6.27x on the
+reference clip: PASS.  Low-N: t2 sits 8% below the pair-job build
+(pairs in flight halve; accepted bound ~10%), t4 is 13% ahead.
+
+Older pair-job numbers (1920x1080 testsrc2, 200 frames, --paff --keyint 50,
+default settings, x86-64, pre-split implementation):
 
           --bframes 3            --bframes 0
 threads:  fps      speedup       fps      speedup

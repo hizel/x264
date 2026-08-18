@@ -282,6 +282,12 @@ typedef struct
  * Kept outside the thread_sync_context memcpy region. */
 typedef struct
 {
+    /* which field pass of the pair THIS slot's job codes (0 = first in
+     * coding order, 1 = second).  The prologue fills both [pass] halves
+     * identically into both slots and then sets this per slot; the job
+     * reads only its own pass's half (paff-pass-threads D3).  Unused by
+     * the monolithic --threads 1 driver. */
+    int          pass;
     /* pair-level reference lists, per pass: [0] = pre-marking (pass 0),
      * [1] = post-marking (pass 1, with the first field's DPB marking
      * applied).  The job presents these to slice_init and restores the
@@ -360,6 +366,25 @@ struct x264_t
      * reference them; NULL-terminated). */
     x264_paff_job_t paff_job;
     x264_frame_t   *paff_evicted[X264_REF_MAX+3];
+    /* PAFF pass threading: per-slot shadow of fenc->weighted[] and
+     * fenc->i_lines_weighted.  The weighted-reference machinery
+     * (weighted_pred_init, x264_analyse_weight_frame, p_fref_w) is per-pass
+     * state; kept on the shared pair fenc, the pair's two pass jobs would
+     * race the pointer array and the row-progress counter (the
+     * paff-pass-threads weightp determinism fix).  The monolithic --threads
+     * 1 driver uses the same shadow: its two passes run sequentially on one
+     * context, so the shadowed values are identical. */
+    pixel          *paff_weighted[X264_REF_MAX];
+    int             paff_i_lines_weighted;
+    /* PAFF pass threading (master slot only): harvested fencs awaiting
+     * deferred recycle.  The pair pipeline is shallower than the slot
+     * count (pairs in flight = slots/2), so a fenc pushed unused at the
+     * pair's harvest re-enters the pool N - slots/2 calls EARLIER than in
+     * the pair-granular scheme -- while the lookahead can still reference
+     * its lowres in cost analysis (races frame_init_lowres, corrupts
+     * lowres_mvs).  The FIFO restores the upstream recycle margin. */
+    x264_frame_t   *paff_fenc_defer[X264_THREAD_MAX];
+    int             i_paff_fenc_defer;
 
     /**** thread synchronization starts here ****/
 

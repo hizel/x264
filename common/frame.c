@@ -555,7 +555,7 @@ static ALWAYS_INLINE void plane_expand_border( pixel *pix, int i_stride, int i_w
 #undef PPIXEL
 }
 
-void x264_frame_expand_border( x264_t *h, x264_frame_t *frame, int mb_y )
+void x264_frame_expand_border( x264_t *h, x264_frame_t *frame, int mb_y, int i_parity )
 {
     int b_fld = SLICE_MBAFF || FIELD_PIC;
     int pad_top = mb_y == 0;
@@ -580,14 +580,30 @@ void x264_frame_expand_border( x264_t *h, x264_frame_t *frame, int mb_y )
         int starty = 16*mb_y - 4*!b_start;
         if( b_fld )
         {
-            // border samples for each field are extended separately
+            // border samples for each field are extended separately;
+            // a parity-scoped call (PAFF reference bands) extends only its
+            // own parity's field-layout borders.
             pix = frame->plane_fld[i] + (starty*stride >> v_shift);
-            plane_expand_border( pix, stride*2, width, height, padh, padv, pad_top, pad_bot, h_shift );
-            plane_expand_border( pix+stride, stride*2, width, height, padh, padv, pad_top, pad_bot, h_shift );
+            if( i_parity < 0 )
+            {
+                plane_expand_border( pix, stride*2, width, height, padh, padv, pad_top, pad_bot, h_shift );
+                plane_expand_border( pix+stride, stride*2, width, height, padh, padv, pad_top, pad_bot, h_shift );
+            }
+            else
+                plane_expand_border( pix+i_parity*stride, stride*2, width, height, padh, padv, pad_top, pad_bot, h_shift );
 
             height = (pad_bot ? 16*(h->mb.i_mb_height - mb_y) : 32) >> v_shift;
             if( b_end && !b_start )
                 height += 4 >> v_shift;
+            /* PAFF: the frame-layout border expansion stays both-parity even
+             * for parity-scoped band calls.  A field row's plane[] border
+             * is consumed (intra cache loads of column-0 MBs) only as the
+             * value expanded from pool-stale edge pixels before the row is
+             * coded -- deterministic at a fixed thread count and identical
+             * to --threads 1 (verified: scoping it changes t1 bytes).  The
+             * wait order guarantees the consumed read happens after the
+             * producing band completed, so the write side never races the
+             * consumed value. */
             pix = frame->plane[i] + (starty*stride >> v_shift);
             plane_expand_border( pix, stride, width, height, padh, padv, pad_top, pad_bot, h_shift );
         }
@@ -599,7 +615,7 @@ void x264_frame_expand_border( x264_t *h, x264_frame_t *frame, int mb_y )
     }
 }
 
-void x264_frame_expand_border_filtered( x264_t *h, x264_frame_t *frame, int mb_y, int b_end )
+void x264_frame_expand_border_filtered( x264_t *h, x264_frame_t *frame, int mb_y, int b_end, int i_parity )
 {
     /* during filtering, 8 extra pixels were filtered on each edge,
      * but up to 3 of the horizontal ones may be wrong.
@@ -619,8 +635,13 @@ void x264_frame_expand_border_filtered( x264_t *h, x264_frame_t *frame, int mb_y
             if( b_fld )
             {
                 pix = frame->filtered_fld[p][i] + (16*mb_y - 16) * stride - 4;
-                plane_expand_border( pix, stride*2, width, height, padh, padv, b_start, b_end, 0 );
-                plane_expand_border( pix+stride, stride*2, width, height, padh, padv, b_start, b_end, 0 );
+                if( i_parity < 0 )
+                {
+                    plane_expand_border( pix, stride*2, width, height, padh, padv, b_start, b_end, 0 );
+                    plane_expand_border( pix+stride, stride*2, width, height, padh, padv, b_start, b_end, 0 );
+                }
+                else
+                    plane_expand_border( pix+i_parity*stride, stride*2, width, height, padh, padv, b_start, b_end, 0 );
             }
 
             pix = frame->filtered[p][i] + (16*mb_y - 8) * stride - 4;

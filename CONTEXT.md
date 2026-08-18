@@ -62,26 +62,43 @@ Which field is displayed first: top (TFF) or bottom (BFF).
 
 **Frame-thread slot**:
 One of the `i_thread_frames` encoder contexts. Each slot codes one unit at
-a time (progressive: a frame; PAFF: a complementary field pair) and slots
-rotate round-robin per coded unit; the output of a slot is returned to the
-caller several units later.
+a time (progressive: a frame; PAFF: one field pass of a complementary
+pair) and slots rotate round-robin per coded unit (PAFF advances the
+rotation by two per pair, one slot per pass); the output of a slot is
+returned to the caller several units later.
 _Avoid_: frame thread (that is the thread, not the slot)
+
+**Field pass**:
+One coding pass of a PAFF pair; codes one field as its own coded picture.
+Pass 0/1 is coding order; the pass's parity is set by TFF/BFF
+(`parity = b_tff ? pass : !pass`) -- pass != parity.  Never shortened to
+"pass" alone where 2-pass rate control is in scope.
+_Avoid_: field encode
+
+**Reference band**:
+One field row's worth of reference data produced at row cadence during a
+field pass: the plane-to-field-layout copy plus that row's half-pixel and
+border data.  The band trails the deblock by one field row, the same
+per-row filter-completion model as progressive encoding.
+_Avoid_: filtered rows
 
 **Readiness**:
 How much of an in-flight reference picture is final and safe to read from
-another slot's motion search. **Phase-granular**: fixed points only (after
-the intermediate sweep, after the pair finishes). **Row-granular**: rows of
-the picture become readable as the coding pass progresses. Row-granular
-readiness forces a motion-vector range clamp, exactly as progressive frame
-threads do. **Hybrid**: the PAFF model — the first field of a pair is
-phase-granular, the second is row-granular.
+another slot's motion search. **Row-granular**: rows of the picture become
+readable as the coding pass progresses. Row-granular readiness forces a
+motion-vector range clamp, exactly as progressive frame threads do.  Under
+PAFF both fields of a pair are row-granular (the reference band advances
+the per-parity completed-row counter).  Historical: the pre-2026-08 model
+was **hybrid** -- the first field became readable at a phase boundary
+(after the intermediate sweep), only the second field was row-granular.
 _Avoid_: progress (of a reference)
 
 **Intermediate sweep**:
-The reference-data generation run between the two field passes
-(`paff_sync_references`): copies the reconstructed rows into the field
-layout and builds field borders + half-pixel data, making the first field
-usable as a reference before the second pass starts.
+Historical term.  The reference-data generation run that older revisions
+performed between the two field passes (`paff_sync_references`, deleted):
+it copied the whole reconstructed first field into the field layout and
+built borders + half-pixel data in one go.  Replaced by per-row reference
+bands produced during each pass itself.
 _Avoid_: sync pass
 
 ## Bitstream

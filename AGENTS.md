@@ -76,18 +76,26 @@ before reconfiguring.
   clamp.
 - **Interlacing / PAFF**: two interlaced modes. MBAFF (`--interlaced`) codes a
   whole frame with optional field macroblock pairs. PAFF (`--paff`) codes each
-  field as its own coded picture — a complementary field pair per input frame,
-  driven by the pool job in `paff_pair_write` (`encoder/encoder.c`); the
-  caller performs pair-list snapshots, the first field's DPB marking,
+  field as its own coded picture — a complementary field pair per input frame.
+  With frame threads, the pair's two field passes run as TWO pool jobs on
+  consecutive slots (per-pass entry points, `encoder/encoder.c`); the caller
+  performs pair-list snapshots, the first field's DPB marking,
   `i_frame_num`/`i_idr_pic_id` advancement and both passes' field-list
-  expansions serially before dispatch.  PAFF keeps frame-level RC decisions
-  but accounts bits per field and steps VBV per field access unit; per-field
-  SEI (`pic_timing` pic_struct 1/2, `buffering_period`).  Frame threading is
-  supported: readiness is hybrid (first field gated on the intermediate-sweep
-  phase, second-field rows gated at row cadence), dependent pairs wait per
+  expansions serially in one prologue, then harvests both jobs of the oldest
+  pair together (rendezvous; pair-level frame end runs on the pass-0 slot).
+  `--threads 1` keeps the monolithic pair driver (`paff_pair_write`).  PAFF
+  keeps frame-level RC decisions but accounts bits per field and steps VBV
+  per field access unit; per-field SEI (`pic_timing` pic_struct 1/2,
+  `buffering_period`).  Frame threading: N slots keep N/2 PAIRS in flight
+  (pair jobs use an even slot count, an odd slot idles).  Reference
+  readiness is row-granular for BOTH fields (each pass produces its parity's
+  reference band — field-layout copy, hpel, borders — at row cadence,
+  trailing the deblock by one field row; the old intermediate sweep is
+  gone); dependent pairs, and pass 1 for its own first field, wait per
   reference field and clamp their vertical MV range in field lines; output
   is deterministic at a fixed thread count but not byte-identical to
-  `--threads 1`.  Sliced threads are rejected; PAFF and MBAFF are mutually
+  `--threads 1` (VBV configs excepted — threaded VBV is byte-nondeterministic
+  even upstream).  Sliced threads are rejected; PAFF and MBAFF are mutually
   exclusive.  See `doc/paff.txt`.  Non-PAFF output must stay bit-identical:
   all PAFF paths are gated on `param.b_paff`.
 - **API versioning**: `version.sh` derives `X264_VERSION`/`X264_POINTVER`

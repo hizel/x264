@@ -255,9 +255,11 @@ void          x264_frame_delete( x264_frame_t *frame );
 int           x264_frame_copy_picture( x264_t *h, x264_frame_t *dst, x264_picture_t *src );
 
 #define x264_frame_expand_border x264_template(frame_expand_border)
-void          x264_frame_expand_border( x264_t *h, x264_frame_t *frame, int mb_y );
+/* i_parity: field parity to process (0/1) for the field-layout planes under
+ * field pictures; -1 = both parities (progressive, MBAFF, full sweeps). */
+void          x264_frame_expand_border( x264_t *h, x264_frame_t *frame, int mb_y, int i_parity );
 #define x264_frame_expand_border_filtered x264_template(frame_expand_border_filtered)
-void          x264_frame_expand_border_filtered( x264_t *h, x264_frame_t *frame, int mb_y, int b_end );
+void          x264_frame_expand_border_filtered( x264_t *h, x264_frame_t *frame, int mb_y, int b_end, int i_parity );
 #define x264_frame_expand_border_lowres x264_template(frame_expand_border_lowres)
 void          x264_frame_expand_border_lowres( x264_frame_t *frame );
 #define x264_frame_expand_border_chroma x264_template(frame_expand_border_chroma)
@@ -273,7 +275,7 @@ void          x264_frame_deblock_row( x264_t *h, int mb_y );
 void          x264_macroblock_deblock( x264_t *h );
 
 #define x264_frame_filter x264_template(frame_filter)
-void          x264_frame_filter( x264_t *h, x264_frame_t *frame, int mb_y, int b_end );
+void          x264_frame_filter( x264_t *h, x264_frame_t *frame, int mb_y, int b_end, int i_parity );
 #define x264_frame_init_lowres x264_template(frame_init_lowres)
 void          x264_frame_init_lowres( x264_t *h, x264_frame_t *frame );
 
