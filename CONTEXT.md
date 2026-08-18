@@ -82,6 +82,29 @@ border data.  The band trails the deblock by one field row, the same
 per-row filter-completion model as progressive encoding.
 _Avoid_: filtered rows
 
+**Row-wait guarantee**:
+The frame-thread invariant from `mb_analyse_init`: before a slot codes
+row y, every reference picture's completed-line counter has reached
+`pix_y(y) + i_mv_range_thread` (progressive frame lines; MBAFF pair rows;
+PAFF per-parity field lines).  The wait runs in both deterministic and
+`--non-deterministic` modes, so "reference row i is readable while row y
+is coded" is a deterministic function of `(i, y, i_mv_range_thread,
+coding mode)`.
+
+**Lines final**:
+Lines of a reference picture whose pixels, half-pixel planes and borders
+are fully written and usable for motion compensation; tracked by the
+completed-line counter, which trails the deblock.  See **Readiness**.
+
+**Row stats committed**:
+A coded row's ratecontrol statistics (`f_row_qp`, `f_row_qscale`,
+`i_row_bits`, `i_row_satd`) are written and will not be rewritten (a
+possible row reencode has finished).  Happens during the row's coding,
+BEFORE its lines are final -- a weaker, earlier condition.  Threaded VBV
+decisions may read a reference's row stats only for committed rows.
+_Avoid_: provably final / provably complete (both collide with
+"lines final" and the completed-line counter)
+
 **Readiness**:
 How much of an in-flight reference picture is final and safe to read from
 another slot's motion search. **Row-granular**: rows of the picture become

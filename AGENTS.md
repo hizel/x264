@@ -94,8 +94,8 @@ before reconfiguring.
   gone); dependent pairs, and pass 1 for its own first field, wait per
   reference field and clamp their vertical MV range in field lines; output
   is deterministic at a fixed thread count but not byte-identical to
-  `--threads 1` (VBV configs excepted — threaded VBV is byte-nondeterministic
-  even upstream).  Sliced threads are rejected; PAFF and MBAFF are mutually
+  `--threads 1` (the MV-range clamp differs).  Sliced threads are rejected;
+  PAFF and MBAFF are mutually
   exclusive.  See `doc/paff.txt`.  Non-PAFF output must stay bit-identical:
   all PAFF paths are gated on `param.b_paff`.
 - **API versioning**: `version.sh` derives `X264_VERSION`/`X264_POINTVER`
@@ -110,6 +110,14 @@ before reconfiguring.
   armv7, ppc64le and more (see `.gitlab-ci.yml`).
 - Round-trip regression: encode with `--dump-yuv` and compare against the JM
   reference decoder output — procedure in `doc/regression_test.txt`.
+- `tools/test_vbv_determinism.sh` — threaded-VBV determinism harness:
+  byte-repeat checks (CBR+VBV, N ∈ {2,4,8,16}, ±B-frames, PAFF, 720p) plus
+  pre/post byte-identity for t1 and non-VBV modes, against a baseline
+  binary it builds itself from a git worktree.  `--quality` runs the
+  CBR+VBV quality/compliance matrix (bitrate/PSNR/SSIM/filler vs the
+  baseline median, `tools/check_hrd.py` on `--nal-hrd cbr` outputs).
+  Clips are external paths via env vars; missing clip = cell skipped.
+  Run it after touching `encoder/ratecontrol.c`.
 - **Decoder-interop debugging**: a recent ffmpeg source tree is kept locally
   at `~/src/ffmpeg-trunk/` (trunk, ~7.x). Use it to read decoder internals
   when chasing warnings/errors ffmpeg's libavcodec raises on x264 output
