@@ -45,6 +45,10 @@
 #   WORKDIR   scratch dir for clips/outputs    (default: /tmp/paff_test)
 #   CLIP      override the input clip used by roundtrip()/roundtrip_2pass()
 #             (default: $WORKDIR/clip_${WIDTH}x${HEIGHT}.yuv; used by cmd_motion)
+#   THREADS   encoder --threads for roundtrip()/roundtrip_2pass()
+#             (default: 1; set to 4/8 for threaded JM round-trips.
+#             la_range and wide_range ignore it -- they pin --threads 1
+#             deliberately)
 
 set -u
 
@@ -352,7 +356,7 @@ roundtrip() {
     done
 
     "$X264" "$clip" --input-res ${WIDTH}x${HEIGHT} --frames $FRAMES \
-        --threads 1 --dump-yuv "$fdec" -o "$out" "$@" >/dev/null 2>&1 \
+        --threads ${THREADS:-1} --dump-yuv "$fdec" -o "$out" "$@" >/dev/null 2>&1 \
         || { bad "$name: x264 encode failed"; return; }
 
     ( cd "$WORKDIR" && "$LDECOD" -i "$out" -o "$ref" >/dev/null 2>&1 ) \
@@ -384,11 +388,11 @@ roundtrip_2pass() {
     done
 
     "$X264" "$clip" --input-res ${WIDTH}x${HEIGHT} --frames $FRAMES \
-        --threads 1 --pass 1 --slow-firstpass --stats "$stats" \
+        --threads ${THREADS:-1} --pass 1 --slow-firstpass --stats "$stats" \
         -o /dev/null "$@" >/dev/null 2>&1 \
         || { bad "$name: pass 1 failed"; return; }
     "$X264" "$clip" --input-res ${WIDTH}x${HEIGHT} --frames $FRAMES \
-        --threads 1 --pass 2 --slow-firstpass --stats "$stats" \
+        --threads ${THREADS:-1} --pass 2 --slow-firstpass --stats "$stats" \
         --dump-yuv "$fdec" -o "$out" "$@" >/dev/null 2>&1 \
         || { bad "$name: pass 2 failed"; return; }
 
@@ -495,6 +499,13 @@ cmd_paff() {
     # resolution; --ref 8 hits the X264_REF_MAX expansion cap exactly.)
     roundtrip paff_tff_ref8_16fld --paff --tff --qp 20 --bframes 0 --weightp 0 --ref 8
     roundtrip paff_bff_ref8_16fld --paff --bff --qp 20 --bframes 0 --weightp 0 --ref 8
+    # weightp: the per-slot weighted-reference shadow is live code under PAFF; exercise it in the
+    # round-trip gate (THREADS env covers the threaded jobs).  weightp 2
+    # degrades to weightp 1 semantics under PAFF (no reference dupes), so
+    # weightp 1 is the meaningful configuration.  B frames included to also
+    # hit the weighted-pred path with a populated L1.
+    roundtrip paff_tff_weightp --paff --tff --qp 20 --ref 3 --weightp 1
+    roundtrip paff_bff_weightp_b --paff --bff --qp 20 --ref 3 --bframes 3 --weightp 1
     # Default-CRF smoke run: no crash, JM decodes to the end, sane PSNR.
     smoke paff_tff_crf --paff --tff
 }

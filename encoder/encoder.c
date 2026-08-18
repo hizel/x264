@@ -44,7 +44,7 @@
 void x264_nal_encode( x264_t *h, uint8_t *dst, x264_nal_t *nal );
 void x264_macroblock_cache_load_progressive( x264_t *h, int i_mb_x, int i_mb_y );
 
-static int encoder_frame_end( x264_t *h, x264_t *thread_current,
+static int encoder_frame_end( x264_t *h, x264_t *thread_current, x264_t *thread_oldest1,
                               x264_nal_t **pp_nal, int *pi_nal,
                               x264_picture_t *pic_out );
 
@@ -1670,7 +1670,13 @@ x264_t *x264_encoder_open( x264_param_t *param, void *api )
     if( h->param.rc.b_mb_tree || h->param.rc.i_vbv_buffer_size )
         h->frames.i_delay = X264_MAX( h->frames.i_delay, h->param.rc.i_lookahead );
     i_slicetype_length = h->frames.i_delay;
-    h->frames.i_delay += h->i_thread_frames - 1;
+    /* PAFF pass threading: a pair consumes two
+     * frame-thread slots, so only half as many PAIRS (the output unit) are
+     * in flight; frame-pool sizing follows. */
+    if( h->param.b_paff && h->i_thread_frames > 1 )
+        h->frames.i_delay += (h->i_thread_frames & ~1)/2 - 1;
+    else
+        h->frames.i_delay += h->i_thread_frames - 1;
     h->frames.i_delay += h->param.i_sync_lookahead;
     h->frames.i_delay += h->param.b_vfr_input;
     h->frames.i_bframe_delay = h->param.i_bframe ? (h->param.i_bframe_pyramid ? 2 : 1) : 0;
@@ -1695,7 +1701,12 @@ x264_t *x264_encoder_open( x264_param_t *param, void *api )
     h->frames.i_poc_last_open_gop = -1;
 
     CHECKED_MALLOCZERO( h->cost_table, sizeof(*h->cost_table) );
-    CHECKED_MALLOCZERO( h->frames.unused[0], (h->frames.i_delay + 3) * sizeof(x264_frame_t *) );
+    /* PAFF pass threading: the fenc pool must additionally hold the
+     * deferred-recycle backlog (N - slots/2 frames, see paff_fenc_defer),
+     * which the shrunken pair-granular i_delay does not account for. */
+    int i_fenc_pool_margin = h->param.b_paff && h->i_thread_frames > 1
+                           ? h->i_thread_frames - (h->i_thread_frames & ~1)/2 : 0;
+    CHECKED_MALLOCZERO( h->frames.unused[0], (h->frames.i_delay + 3 + i_fenc_pool_margin) * sizeof(x264_frame_t *) );
     /* Allocate room for max refs plus a few extra just in case. */
     CHECKED_MALLOCZERO( h->frames.unused[1], (h->i_thread_frames + X264_REF_MAX + 4) * sizeof(x264_frame_t *) );
     CHECKED_MALLOCZERO( h->frames.current, (h->param.i_sync_lookahead + h->param.i_bframe
@@ -1871,6 +1882,20 @@ x264_t *x264_encoder_open( x264_param_t *param, void *api )
 
     if( x264_ratecontrol_new( h ) < 0 )
         goto fail;
+
+    /* PAFF pass threading: the pass-granular sync chain can start from ANY
+     * slot, so every slot's embedded SPS/PPS must hold the final open-time
+     * state (the pair-granular chain seeded from thread[0] naturally).
+     * ratecontrol_new writes the VBV/HRD fields into the master's embedded
+     * SPS only, after the slot struct copies were made -- replicate.
+     * PAFF-only: the progressive chain always seeds from thread[0], where
+     * the values are already final. */
+    if( h->param.b_paff )
+        for( int i = 1; i < h->param.i_threads; i++ )
+        {
+            h->thread[i]->sps[0] = h->sps[0];
+            h->thread[i]->pps[0] = h->pps[0];
+        }
 
     if( h->param.i_nal_hrd )
     {
@@ -2273,13 +2298,20 @@ static int weighted_reference_duplicate( x264_t *h, int i_ref, const x264_weight
 
 static void weighted_pred_init( x264_t *h )
 {
+    /* PAFF: the weighted-reference state (pointer array, row-progress
+     * counter) is per-pass; the pair's two pass jobs must not race it on
+     * the shared fenc, so PAFF uses the slot's shadow.
+     * Buffer assignment is unchanged: h->mb.p_weight_buf is per-slot, and
+     * the pair_slot sharing is between entries of the SAME pass's list. */
+    pixel **weighted = h->param.b_paff ? h->paff_weighted : h->fenc->weighted;
+    int *i_lines_weighted = h->param.b_paff ? &h->paff_i_lines_weighted : &h->fenc->i_lines_weighted;
     /* for now no analysis and set all weights to nothing */
     for( int i_ref = 0; i_ref < h->i_ref[0]; i_ref++ )
-        h->fenc->weighted[i_ref] = h->fref[0][i_ref]->filtered[0][0];
+        weighted[i_ref] = h->fref[0][i_ref]->filtered[0][0];
 
     // FIXME: This only supports weighting of one reference frame
     // and duplicates of that frame.
-    h->fenc->i_lines_weighted = 0;
+    *i_lines_weighted = 0;
 
     for( int i_ref = 0; i_ref < (h->i_ref[0] << SLICE_MBAFF); i_ref++ )
         for( int i = 0; i < 3; i++ )
@@ -2339,21 +2371,21 @@ static void weighted_pred_init( x264_t *h )
 #if HAVE_INTERLACED
                         if( h->param.b_paff && pair_slot[pair] >= 0 )
                         {
-                            h->fenc->weighted[j] = h->fenc->weighted[pair_slot[pair]];
+                            weighted[j] = weighted[pair_slot[pair]];
                             continue;
                         }
 #endif
-                        h->fenc->weighted[j] = h->mb.p_weight_buf[buffer_next++] + h->fenc->i_stride[0] * i_padv + PADH_ALIGN;
+                        weighted[j] = h->mb.p_weight_buf[buffer_next++] + h->fenc->i_stride[0] * i_padv + PADH_ALIGN;
                         //scale full resolution frame
                         if( h->param.i_threads == 1 )
                         {
                             pixel *src = h->fref[0][j]->filtered[0][0] - h->fref[0][j]->i_stride[0]*i_padv - PADH_ALIGN;
-                            pixel *dst = h->fenc->weighted[j] - h->fenc->i_stride[0]*i_padv - PADH_ALIGN;
+                            pixel *dst = weighted[j] - h->fenc->i_stride[0]*i_padv - PADH_ALIGN;
                             int stride = h->fenc->i_stride[0];
                             int width = h->fenc->i_width[0] + PADH2;
                             int height = h->fenc->i_lines[0] + i_padv*2;
                             x264_weight_scale_plane( h, dst, stride, src, stride, width, height, &h->sh.weight[j][0] );
-                            h->fenc->i_lines_weighted = height;
+                            *i_lines_weighted = height;
                         }
 #if HAVE_INTERLACED
                         if( h->param.b_paff )
@@ -2689,15 +2721,15 @@ static void fdec_filter_row( x264_t *h, int mb_y, int pass )
                         h->mb.i_mb_width*16*SIZEOF_PIXEL );
 
     if( h->fdec->b_kept_as_ref && (!h->param.b_sliced_threads || pass == 1) )
-        x264_frame_expand_border( h, h->fdec, min_y );
+        x264_frame_expand_border( h, h->fdec, min_y, -1 );
     if( b_hpel )
     {
         int end = mb_y == h->mb.i_mb_height;
         /* Can't do hpel until the previous slice is done encoding. */
         if( h->param.analyse.i_subpel_refine )
         {
-            x264_frame_filter( h, h->fdec, min_y, end );
-            x264_frame_expand_border_filtered( h, h->fdec, min_y, end );
+            x264_frame_filter( h, h->fdec, min_y, end, -1 );
+            x264_frame_expand_border_filtered( h, h->fdec, min_y, end, -1 );
         }
     }
 
@@ -3063,22 +3095,28 @@ static ALWAYS_INLINE void bitstream_restore( x264_t *h, x264_bs_bak_t *bak, int 
     }
 }
 
-/* PAFF: reference-data work for one even-aligned band (frame MB rows e, e+1):
- * plane -> plane_fld copy, borders, hpel.  Byte-identical to the matching
+/* PAFF: reference-data work for one even-aligned band (frame MB rows e, e+1),
+ * scoped to ONE field parity: plane -> plane_fld copy,
+ * borders, hpel touch only that parity's rows.  Byte-identical to the matching
  * slice of the pre-threading full-frame sweep: the band operations are
- * row-local and the first field's rows are byte-stable during the second
- * pass, so re-filtering them is idempotent. */
-static void paff_reference_band( x264_t *h, int e, int b_end )
+ * row-local and the band's rows are final when the call runs (the cadence
+ * trails the deblock; VBV row re-encode settles within its own row, long
+ * before the band covering it), so the other parity's rows neither need nor
+ * tolerate a concurrent re-filter. */
+static void paff_reference_band( x264_t *h, int e, int b_end, int parity )
 {
     int b_hpel = h->fdec->b_kept_as_ref && h->param.analyse.i_subpel_refine;
     int saved_start = h->i_threadslice_start;
     int saved_end = h->i_threadslice_end;
 
+    /* plane_fld uses the same interleaved frame layout as plane; a field
+     * parity's rows are the (i & 1) == parity lines. */
     for( int p = 0; p < h->fdec->i_plane; p++ )
         for( int i = (16*e)>>(CHROMA_V_SHIFT && p); i < (16*(e+2))>>(CHROMA_V_SHIFT && p); i++ )
-            memcpy( h->fdec->plane_fld[p] + i*h->fdec->i_stride[p],
-                    h->fdec->plane[p]     + i*h->fdec->i_stride[p],
-                    h->mb.i_mb_width*16*SIZEOF_PIXEL );
+            if( (i & 1) == parity )
+                memcpy( h->fdec->plane_fld[p] + i*h->fdec->i_stride[p],
+                        h->fdec->plane[p]     + i*h->fdec->i_stride[p],
+                        h->mb.i_mb_width*16*SIZEOF_PIXEL );
 
     /* The border paths derive their start/end rows from
      * i_threadslice_start/end; present the full-frame view (as the old sweep
@@ -3086,11 +3124,11 @@ static void paff_reference_band( x264_t *h, int e, int b_end )
     h->i_threadslice_start = 0;
     h->i_threadslice_end = h->mb.i_mb_height;
     if( h->fdec->b_kept_as_ref )
-        x264_frame_expand_border( h, h->fdec, e );
+        x264_frame_expand_border( h, h->fdec, e, parity );
     if( b_hpel )
     {
-        x264_frame_filter( h, h->fdec, e, b_end );
-        x264_frame_expand_border_filtered( h, h->fdec, e, b_end );
+        x264_frame_filter( h, h->fdec, e, b_end, parity );
+        x264_frame_expand_border_filtered( h, h->fdec, e, b_end, parity );
     }
     h->i_threadslice_start = saved_start;
     h->i_threadslice_end = saved_end;
@@ -3098,11 +3136,11 @@ static void paff_reference_band( x264_t *h, int e, int b_end )
 
 /* PAFF: per-pass row filtering, called at each same-parity row start (and once
  * more after the last MB of the pass).  Deblocks the previous same-parity
- * row.  During the SECOND pass it also performs the reference-data work at
- * row cadence (frame threads) via paff_reference_band, and broadcasts the
- * per-parity progress.  The first field's reference data is generated by the
- * intermediate full-frame sweep between the passes (paff_sync_references);
- * the final full-frame sweep is gone (paff_frame_finish). */
+ * row, performs the reference-data work for the coding parity at row cadence
+ * (frame threads) via paff_reference_band, and broadcasts the per-parity
+ * progress.  BOTH passes generate their own parity's reference data at
+ * cadence; the residual band and the completion
+ * sentinel of each pass are in paff_pass_finish. */
 static void paff_filter_row( x264_t *h, int mb_y )
 {
     int b_deblock = h->sh.i_disable_deblocking_filter_idc != 1;
@@ -3112,20 +3150,16 @@ static void paff_filter_row( x264_t *h, int mb_y )
     if( b_deblock )
         x264_frame_deblock_row( h, mb_y - 2 );
 
-    /* Second pass only: the coding parity is the opposite of pass 0's.  The
-     * first pass must not generate reference data at row cadence -- its rows
-     * become referenceable only via the intermediate full-frame sweep. */
-    if( h->sh.b_bottom_field != (h->param.b_tff ? 0 : 1) )
     {
         /* The just-deblocked field row k's bottom 4 field lines can still be
          * modified by the NEXT row's deblock (its top edge), so the pipeline
          * trails the deblock by one field row: process band kb = k-1 (frame
          * MB rows 2kb, 2kb+1), all of whose lines are final.  The last band
-         * is residual work in paff_frame_finish. */
+         * is residual work in paff_pass_finish. */
         int kb = ((mb_y - 2) >> 1) - 1;
         if( kb >= 0 )
         {
-            paff_reference_band( h, 2*kb, 0 );
+            paff_reference_band( h, 2*kb, 0, h->sh.b_bottom_field );
             /* Field lines [0, 16*(kb+1) - X264_THREAD_HEIGHT) of the coding
              * parity are now final, borders and hpel included (the margin is
              * the progressive one: 16 lines for the in-flight hpel batch
@@ -3145,60 +3179,22 @@ static void paff_filter_row( x264_t *h, int mb_y )
         }
 }
 
-/* PAFF: INTERMEDIATE reference-data sweep, run between the two field
- * passes: sync the field-layout reference copy, expand borders and generate
- * hpel data for the whole frame.  Only the first field is valid then; the
- * stale second-field rows are copied/filtered but never referenced by the
- * next pass, and are re-done band-by-band at row cadence during the second
- * pass (paff_filter_row). */
-static void paff_sync_references( x264_t *h )
+/* PAFF: end-of-pass residual reference work: the
+ * row-cadence pipeline (paff_filter_row) trails the deblock by one field row,
+ * so the last band (the bottom two frame MB rows) of the coding parity is
+ * done here, with b_end, followed by the parity's completion sentinel. */
+static void paff_pass_finish( x264_t *h, int parity )
 {
-    /* PAFF: copy reconstructed rows plane[] -> plane_fld[] and generate the
-     * field borders + hpel (filtered_fld) so the first field is usable as a
-     * reference. */
-    int b_hpel = h->fdec->b_kept_as_ref && h->param.analyse.i_subpel_refine;
-    int saved_start = h->i_threadslice_start;
-    int saved_end = h->i_threadslice_end;
-
-    for( int p = 0; p < h->fdec->i_plane; p++ )
-        for( int i = 0; i < h->fdec->i_lines[p]; i++ )
-            memcpy( h->fdec->plane_fld[p] + i*h->fdec->i_stride[p],
-                    h->fdec->plane[p]     + i*h->fdec->i_stride[p],
-                    h->mb.i_mb_width*16*SIZEOF_PIXEL );
-
-    /* Filter the full frame.  Some hpel/border paths transit
-     * i_threadslice_start/end (set per pass by the PAFF driver), so save and
-     * restore around the full-frame [0, i_mb_height) sweep. */
-    h->i_threadslice_start = 0;
-    h->i_threadslice_end = h->mb.i_mb_height;
-    for( int mb_y = 0; mb_y < h->mb.i_mb_height; mb_y += 2 )
-    {
-        int b_end = mb_y + 2 >= h->mb.i_mb_height;
-        if( h->fdec->b_kept_as_ref )
-            x264_frame_expand_border( h, h->fdec, mb_y );
-        if( b_hpel )
-        {
-            x264_frame_filter( h, h->fdec, mb_y, b_end );
-            x264_frame_expand_border_filtered( h, h->fdec, mb_y, b_end );
-        }
-    }
-    h->i_threadslice_start = saved_start;
-    h->i_threadslice_end = saved_end;
+    paff_reference_band( h, h->mb.i_mb_height - 2, 1, parity );
+    if( h->i_thread_frames > 1 && h->fdec->b_kept_as_ref )
+        x264_frame_cond_broadcast_fld( h->fdec, parity, 10000 );
 }
 
 static void paff_frame_finish( x264_t *h )
 {
-    /* Residual band: the row-cadence pipeline (paff_filter_row) trails the
-     * deblock by one field row, so the last band (the bottom two frame MB
-     * rows) is done here, with b_end.  Then only the completion sentinels
-     * and the quality measurement remain. */
-    paff_reference_band( h, h->mb.i_mb_height - 2, 1 );
-    if( h->i_thread_frames > 1 && h->fdec->b_kept_as_ref )
-    {
-        x264_frame_cond_broadcast_fld( h->fdec, 0, 10000 );
-        x264_frame_cond_broadcast_fld( h->fdec, 1, 10000 );
-    }
-
+    /* Both parities' reference data and sentinels are produced by the
+     * per-pass cadence + paff_pass_finish; only the pair-level quality
+     * measurement remains. */
     if( h->param.analyse.b_psnr || h->param.analyse.b_ssim )
         fdec_measure_quality( h, 0, h->mb.i_mb_height*16, 1 );
 }
@@ -3979,22 +3975,203 @@ int x264_encoder_invalidate_reference( x264_t *h, int64_t pts )
  *       B      6   2*5
  ****************************************************************************/
 
-/* PAFF field-pair pool job (H.264 7.4.3): codes one complementary field pair,
- * both passes synchronously, as one frame-thread work item.  The caller
- * (x264_encoder_encode, serial before dispatch) has already done everything
- * that touches shared or next-call state: the pair-list snapshots, the first
- * field's DPB marking (incl. the frames.reference eviction), the
- * i_frame_num / i_idr_pic_id advancement, and both passes' field-list
- * expansions with the per-parity metadata published onto h->fdec.  The
- * job therefore never reads h->frames.reference or the unused-frame pool, and
- * writes only what progressive slices_write writes (out, stat.frame, mb, fdec
- * pixels/progress) plus the per-pass h->sh view, which it restores to the
- * pair-level view at the end.  Every h->sh state the next slot's
- * thread_sync_context memcpy can observe is either the pair-level view or a
- * per-pass view whose marking fields are pair-level (pass 0) or suppressed
- * (pass 1); the only read-before-overwrite consumer on the next slot --
- * reference_update's MMCO application -- is a no-op in all three cases
- * because this pair's caller already applied the marking. */
+/* PAFF per-pass coding body: codes one field pass of a complementary pair
+ * -- slice init from the job parameters, per-pass field lists, SEI,
+ * slices_write, per-pass accounting (per-field bits, pair-folded ref
+ * counts), and the residual reference work for the coding parity.  Shared
+ * by the monolithic --threads 1 pair driver (paff_pair_write: two
+ * sequential calls on one context) and the frame-thread pool job
+ * (paff_pass_write: one call on the pass's own slot).
+ *
+ * The caller (x264_encoder_encode, serial before dispatch) has already done
+ * everything that touches shared or next-call state: the pair-list
+ * snapshots, the first field's DPB marking (incl. the
+ * frames.reference eviction), the i_frame_num / i_idr_pic_id advancement,
+ * and both passes' field-list expansions with the per-parity metadata
+ * published onto h->fdec.  The job therefore never reads
+ * h->frames.reference or the unused-frame pool, and writes only what
+ * progressive slices_write writes (out, stat.frame, mb, its coding parity's
+ * fdec rows/progress) plus its own pass's h->sh view.
+ *
+ * shared_out_bits is non-NULL only for the monolithic driver, whose out.bs
+ * spans both passes: pass 0 returns the bitstream position at the end of
+ * its AU through it, pass 1 undoes the resulting double-counted misc bits. */
+static int paff_pass_code( x264_t *h, x264_paff_job_t *job, int pass, int *shared_out_bits )
+{
+    int parity = h->param.b_tff ? pass : !pass;
+    /* PAFF never carries reference duplicates (b_ref_pic_list_reordering is
+     * pinned to 0), so the refdupe ME branch must never be taken.  The
+     * reference_build_list clear runs caller-side on the pass-0 slot only;
+     * with pass-granular jobs the pass-1 slot would keep its initial
+     * ref_blind_dupe == 0, and since every PAFF second field has the
+     * complementary field at L0[0] it would take the refdupe branch and
+     * seed the start MV from the uninitialised analysis struct (worker
+     * stack garbage -- the determinism root cause). */
+    h->mb.ref_blind_dupe = -1;
+    /* PAFF: a keyframe complementary field pair is coded Ip --
+     * the first field is the I/IDR access unit, the second field is a
+     * NON-IDR P field referencing the pair's first field.  This applies
+     * to open-GOP recovery pairs (non-IDR I) as much as to IDR pairs:
+     * I+P is what QSV and broadcast PAFF encoders emit. */
+    int pass_nal_type = job->i_nal_type;
+    if( pass && job->pair_slice_type == SLICE_TYPE_I )
+    {
+        pass_nal_type = NAL_SLICE;
+        h->sh.i_type = SLICE_TYPE_P;
+        h->i_nal_type = NAL_SLICE;
+    }
+    /* Present this pass's pair-level view (pre-marking for pass 0,
+     * post-marking for pass 1) so paff_slice_init sizes num_ref_idx from
+     * the pair count and macroblock_slice_init reads the pair-level
+     * colocated state. */
+    h->i_ref[0] = job->pair_count[pass][0];
+    h->i_ref[1] = job->pair_count[pass][1];
+    memcpy( h->fref[0], job->pair_fref[pass][0], job->pair_count[pass][0] * sizeof(x264_frame_t *) );
+    memcpy( h->fref[1], job->pair_fref[pass][1], job->pair_count[pass][1] * sizeof(x264_frame_t *) );
+    if( pass )
+    {
+        /* PAFF: field 2 must not duplicate field 1's marking commands
+         * (8.2.5.4: multiple opcodes in one header). */
+        h->sh.i_mmco_command_count = 0;
+        h->sh.i_mmco_remove_from_end = 0;
+    }
+    paff_slice_init( h, job, pass_nal_type );
+    /* PAFF: fdec->i_poc stays the even frame-level POC for the whole pair;
+     * the per-field POC goes only into the slice header. */
+    h->sh.i_poc = job->base_poc + h->fdec->i_delta_poc[parity];
+    h->sh.b_field_pic = 1;
+    h->sh.b_bottom_field = parity;
+    h->sh.i_first_mb = parity * h->mb.i_mb_width;
+    h->sh.i_last_mb = (h->mb.i_mb_height - 1 + parity) * h->mb.i_mb_width - 1;
+    /* Load this pass's caller-expanded field lists, parity/frame maps and
+     * num_ref_idx sizing (the job never expands). */
+    h->i_ref[0] = job->i_ref[pass][0];
+    h->i_ref[1] = job->i_ref[pass][1];
+    memcpy( h->fref[0], job->fref[pass][0], h->i_ref[0] * sizeof(x264_frame_t *) );
+    memcpy( h->fref[1], job->fref[pass][1], h->i_ref[1] * sizeof(x264_frame_t *) );
+    h->mb.pic.i_fref[0] =
+    h->mb.pic.i_paff_field_ref0 = job->i_paff_field_ref[pass][0];
+    h->mb.pic.i_fref[1] =
+    h->mb.pic.i_paff_field_ref1 = job->i_paff_field_ref[pass][1];
+    memcpy( h->mb.pic.i_fref_frame, job->i_fref_frame[pass][0], h->i_ref[0] );
+    memcpy( h->mb.pic.i_fref_parity, job->i_fref_parity[pass][0], h->i_ref[0] );
+    memcpy( h->mb.pic.i_fref_frame_l1, job->i_fref_frame[pass][1], h->i_ref[1] );
+    memcpy( h->mb.pic.i_fref_parity_l1, job->i_fref_parity[pass][1], h->i_ref[1] );
+    h->sh.i_num_ref_idx_l0_active = job->i_num_ref_idx_active[pass][0];
+    h->sh.i_num_ref_idx_l1_active = job->i_num_ref_idx_active[pass][1];
+    h->sh.b_num_ref_idx_override = job->b_num_ref_idx_override[pass];
+    /* PAFF (2-pass): the pair-level optimal reorder is disabled, so the
+     * expanded field lists always match the decoder's default order and
+     * no ref_pic_list_modification needs signalling. */
+    h->sh.b_ref_pic_list_reordering[0] = 0;
+    h->sh.b_ref_pic_list_reordering[1] = 0;
+    weighted_pred_init( h );
+    /* PAFF: build map_col_to_list0 for this field pass.  The
+     * colocated picture is fref[1][0] (RefPicList1[0], a single field
+     * entry) at parity i_fref_parity_l1[0]; its L0 ref POCs are the
+     * per-parity ref_poc[0][col_parity] (stored when it was encoded). */
+    if( h->sh.i_type == SLICE_TYPE_B )
+    {
+        int col_parity = h->mb.pic.i_fref_parity_l1[0];
+        map_col_to_list0(-1) = -1;
+        map_col_to_list0(-2) = -2;
+        for( int i = 0; i < h->fref[1][0]->i_ref[0][col_parity]; i++ )
+        {
+            int poc = h->fref[1][0]->ref_poc[0][col_parity][i];
+            map_col_to_list0(i) = -2;
+            for( int j = 0; j < h->i_ref[0]; j++ )
+                if( h->fref[0][j]->i_poc
+                    + h->fref[0][j]->i_delta_poc[h->mb.pic.i_fref_parity[j]] == poc )
+                {
+                    map_col_to_list0(i) = j;
+                    break;
+                }
+        }
+    }
+    /* PAFF: redo the direct_spatial_mv_pred decision with the
+     * colocated field's actual L0[0] per-field POC (8.4.1.2). */
+    if( !h->mb.b_direct_auto_read && h->sh.i_type == SLICE_TYPE_B )
+    {
+        int col_parity = h->mb.pic.i_fref_parity_l1[0];
+        int col_l0ref0 = h->fref[1][0]->i_poc_l0ref0[col_parity];
+        int cur_l0ref0 = h->fdec->i_poc_l0ref0[parity];
+        if( col_l0ref0 == cur_l0ref0 )
+        {
+            if( h->mb.b_direct_auto_write )
+                h->sh.b_direct_spatial_mv_pred = ( h->stat.i_direct_score[1] > h->stat.i_direct_score[0] );
+            else
+                h->sh.b_direct_spatial_mv_pred = ( h->param.analyse.i_direct_mv_pred == X264_DIRECT_PRED_SPATIAL );
+        }
+        else
+        {
+            h->mb.b_direct_auto_write = 0;
+            h->sh.b_direct_spatial_mv_pred = 1;
+        }
+    }
+    /* PAFF: build the bipred tables for this field pass. */
+    if( h->sh.i_type == SLICE_TYPE_B )
+        x264_macroblock_bipred_init_paff( h, parity );
+    h->mb.b_interlaced = 1;
+    h->i_threadslice_start = parity;
+    h->i_threadslice_end = h->mb.i_mb_height - 1 + parity;
+    /* PAFF: pic_timing SEI per coded field (Table D-1 mandates pic_struct
+     * 1/2 for field pictures). */
+    if( h->sps->vui.b_pic_struct_present || h->sps->vui.b_nal_hrd_parameters_present )
+    {
+        nal_start( h, NAL_SEI, NAL_PRIORITY_DISPOSABLE );
+        x264_sei_pic_timing_write( h, &h->out.bs, pass );
+        if( nal_end( h ) )
+            return -1;
+    }
+    if( (intptr_t)slices_write( h ) )
+        return -1;
+    if( shared_out_bits )
+    {
+        /* Monolithic driver only: out.bs spans BOTH field passes of the
+         * pair, so slice_write's i_misc_bits at the end of pass 1 counts
+         * the first field's bytes a second time; undo that with the exact
+         * first-field total, captured at the end of pass 0 together with
+         * the AU boundary (the per-field VBV model splits the pair's NAL
+         * payload sums there).  The split pool jobs have per-slot out
+         * buffers and need neither. */
+        if( pass )
+            h->stat.frame.i_misc_bits -= *shared_out_bits;
+        else
+        {
+            *shared_out_bits = bs_pos( &h->out.bs ) + h->out.i_nal*NALU_OVERHEAD*8;
+            h->out.i_paff_au_boundary = h->out.i_nal;
+        }
+    }
+    /* PAFF: fold this pass's per-field-entry L0 ref counts into
+     * reference-PAIR counts via this pass's map, in place; the pair merge
+     * (monolith tail or harvest) then sums two already-folded values. */
+    int folded[X264_REF_MAX*2] = {0};
+    for( int e = 0; e < h->mb.pic.i_paff_field_ref0; e++ )
+        if( h->mb.pic.i_fref_frame[e] >= 0 )
+            folded[h->mb.pic.i_fref_frame[e]] += h->stat.frame.i_mb_count_ref[0][e];
+    memcpy( h->stat.frame.i_mb_count_ref[0], folded, sizeof(folded) );
+    /* PAFF: per-field bit accounting for the per-field VBV model. */
+    h->fdec->i_field_bits[pass] = h->stat.frame.i_tex_bits
+        + h->stat.frame.i_mv_bits + h->stat.frame.i_misc_bits;
+    /* PAFF: each pass generates its own parity's
+     * reference data at row cadence and finishes it here (residual band
+     * + completion sentinel); the intermediate full-frame sweep is gone. */
+    paff_pass_finish( h, parity );
+    return 0;
+}
+
+/* PAFF field-pair driver, --threads 1: codes one
+ * complementary field pair, both passes synchronously on one context.
+ * The pool path (paff_pass_write) runs the two passes as separate jobs on
+ * two slots; this driver keeps the monolithic shape so that single-thread
+ * output is bit-identical by construction and pass 1 sees pass 0's actual
+ * rc/stat state on the shared h.
+ * Every h->sh state the next slot's thread_sync_context memcpy can observe
+ * is either the pair-level view or a per-pass view whose marking fields are
+ * pair-level (pass 0) or suppressed (pass 1); the only read-before-overwrite
+ * consumer on the next slot -- reference_update's MMCO application -- is a
+ * no-op in all three cases because this pair's caller already applied the
+ * marking. */
 static void *paff_pair_write( x264_t *h )
 {
     x264_paff_job_t *job = &h->paff_job;
@@ -4006,162 +4183,13 @@ static void *paff_pair_write( x264_t *h )
      * evict the trimmed pairs from h->frames.reference. */
     int mmco_command_count = h->sh.i_mmco_command_count;
     int mmco_remove_from_end = h->sh.i_mmco_remove_from_end;
-    /* PAFF: pair-folded L0 ref counts, accumulated per pass below (each pass
-     * folds its own per-field-entry counts while ITS entry->pair map is
-     * live). */
-    int pair_refcount[X264_REF_MAX*2] = {0};
 
     for( int pass = 0; pass < 2; pass++ )
     {
-        int parity = h->param.b_tff ? pass : !pass;
-        /* PAFF: a keyframe complementary field pair is coded Ip --
-         * the first field is the I/IDR access unit, the second field is a
-         * NON-IDR P field referencing the pair's first field.  This applies
-         * to open-GOP recovery pairs (non-IDR I) as much as to IDR pairs:
-         * I+P is what QSV and broadcast PAFF encoders emit. */
-        int pass_nal_type = job->i_nal_type;
-        if( pass && job->pair_slice_type == SLICE_TYPE_I )
-        {
-            pass_nal_type = NAL_SLICE;
-            h->sh.i_type = SLICE_TYPE_P;
-            h->i_nal_type = NAL_SLICE;
-        }
-        /* Present this pass's pair-level view (pre-marking for pass 0,
-         * post-marking for pass 1) so paff_slice_init sizes num_ref_idx from
-         * the pair count and macroblock_slice_init reads the pair-level
-         * colocated state. */
-        h->i_ref[0] = job->pair_count[pass][0];
-        h->i_ref[1] = job->pair_count[pass][1];
-        memcpy( h->fref[0], job->pair_fref[pass][0], job->pair_count[pass][0] * sizeof(x264_frame_t *) );
-        memcpy( h->fref[1], job->pair_fref[pass][1], job->pair_count[pass][1] * sizeof(x264_frame_t *) );
-        if( pass )
-        {
-            /* PAFF: field 2 must not duplicate field 1's marking commands
-             * (8.2.5.4: multiple opcodes in one header). */
-            h->sh.i_mmco_command_count = 0;
-            h->sh.i_mmco_remove_from_end = 0;
-        }
-        paff_slice_init( h, job, pass_nal_type );
-        /* PAFF: fdec->i_poc stays the even frame-level POC for the whole pair;
-         * the per-field POC goes only into the slice header. */
-        h->sh.i_poc = job->base_poc + h->fdec->i_delta_poc[parity];
-        h->sh.b_field_pic = 1;
-        h->sh.b_bottom_field = parity;
-        h->sh.i_first_mb = parity * h->mb.i_mb_width;
-        h->sh.i_last_mb = (h->mb.i_mb_height - 1 + parity) * h->mb.i_mb_width - 1;
-        /* Load this pass's caller-expanded field lists, parity/frame maps and
-         * num_ref_idx sizing (the job never expands). */
-        h->i_ref[0] = job->i_ref[pass][0];
-        h->i_ref[1] = job->i_ref[pass][1];
-        memcpy( h->fref[0], job->fref[pass][0], h->i_ref[0] * sizeof(x264_frame_t *) );
-        memcpy( h->fref[1], job->fref[pass][1], h->i_ref[1] * sizeof(x264_frame_t *) );
-        h->mb.pic.i_fref[0] =
-        h->mb.pic.i_paff_field_ref0 = job->i_paff_field_ref[pass][0];
-        h->mb.pic.i_fref[1] =
-        h->mb.pic.i_paff_field_ref1 = job->i_paff_field_ref[pass][1];
-        memcpy( h->mb.pic.i_fref_frame, job->i_fref_frame[pass][0], h->i_ref[0] );
-        memcpy( h->mb.pic.i_fref_parity, job->i_fref_parity[pass][0], h->i_ref[0] );
-        memcpy( h->mb.pic.i_fref_frame_l1, job->i_fref_frame[pass][1], h->i_ref[1] );
-        memcpy( h->mb.pic.i_fref_parity_l1, job->i_fref_parity[pass][1], h->i_ref[1] );
-        h->sh.i_num_ref_idx_l0_active = job->i_num_ref_idx_active[pass][0];
-        h->sh.i_num_ref_idx_l1_active = job->i_num_ref_idx_active[pass][1];
-        h->sh.b_num_ref_idx_override = job->b_num_ref_idx_override[pass];
-        /* PAFF (2-pass): the pair-level optimal reorder is disabled, so the
-         * expanded field lists always match the decoder's default order and
-         * no ref_pic_list_modification needs signalling. */
-        h->sh.b_ref_pic_list_reordering[0] = 0;
-        h->sh.b_ref_pic_list_reordering[1] = 0;
-        weighted_pred_init( h );
-        /* PAFF: build map_col_to_list0 for this field pass.  The
-         * colocated picture is fref[1][0] (RefPicList1[0], a single field
-         * entry) at parity i_fref_parity_l1[0]; its L0 ref POCs are the
-         * per-parity ref_poc[0][col_parity] (stored when it was encoded). */
-        if( h->sh.i_type == SLICE_TYPE_B )
-        {
-            int col_parity = h->mb.pic.i_fref_parity_l1[0];
-            map_col_to_list0(-1) = -1;
-            map_col_to_list0(-2) = -2;
-            for( int i = 0; i < h->fref[1][0]->i_ref[0][col_parity]; i++ )
-            {
-                int poc = h->fref[1][0]->ref_poc[0][col_parity][i];
-                map_col_to_list0(i) = -2;
-                for( int j = 0; j < h->i_ref[0]; j++ )
-                    if( h->fref[0][j]->i_poc
-                        + h->fref[0][j]->i_delta_poc[h->mb.pic.i_fref_parity[j]] == poc )
-                    {
-                        map_col_to_list0(i) = j;
-                        break;
-                    }
-            }
-        }
-        /* PAFF: redo the direct_spatial_mv_pred decision with the
-         * colocated field's actual L0[0] per-field POC (8.4.1.2). */
-        if( !h->mb.b_direct_auto_read && h->sh.i_type == SLICE_TYPE_B )
-        {
-            int col_parity = h->mb.pic.i_fref_parity_l1[0];
-            int col_l0ref0 = h->fref[1][0]->i_poc_l0ref0[col_parity];
-            int cur_l0ref0 = h->fdec->i_poc_l0ref0[parity];
-            if( col_l0ref0 == cur_l0ref0 )
-            {
-                if( h->mb.b_direct_auto_write )
-                    h->sh.b_direct_spatial_mv_pred = ( h->stat.i_direct_score[1] > h->stat.i_direct_score[0] );
-                else
-                    h->sh.b_direct_spatial_mv_pred = ( h->param.analyse.i_direct_mv_pred == X264_DIRECT_PRED_SPATIAL );
-            }
-            else
-            {
-                h->mb.b_direct_auto_write = 0;
-                h->sh.b_direct_spatial_mv_pred = 1;
-            }
-        }
-        /* PAFF: build the bipred tables for this field pass. */
-        if( h->sh.i_type == SLICE_TYPE_B )
-            x264_macroblock_bipred_init_paff( h, parity );
-        h->mb.b_interlaced = 1;
-        h->i_threadslice_start = parity;
-        h->i_threadslice_end = h->mb.i_mb_height - 1 + parity;
-        /* PAFF: pic_timing SEI per coded field (Table D-1 mandates pic_struct
-         * 1/2 for field pictures). */
-        if( h->sps->vui.b_pic_struct_present || h->sps->vui.b_nal_hrd_parameters_present )
-        {
-            nal_start( h, NAL_SEI, NAL_PRIORITY_DISPOSABLE );
-            x264_sei_pic_timing_write( h, &h->out.bs, pass );
-            if( nal_end( h ) )
-                return (void*)(intptr_t)-1;
-        }
-        if( (intptr_t)slices_write( h ) )
+        if( paff_pass_code( h, job, pass, &pass0_end_bits ) )
             return (void*)(intptr_t)-1;
-        /* out.bs spans BOTH field passes of the pair, so slice_write's
-         * i_misc_bits at the end of pass 1 counts the first field's bytes a
-         * second time; undo that with the exact first-field total. */
-        if( pass )
-            h->stat.frame.i_misc_bits -= pass0_end_bits;
-        /* PAFF: fold this pass's per-field-entry L0 ref counts into
-         * reference-PAIR counts via this pass's map. */
-        for( int e = 0; e < h->mb.pic.i_paff_field_ref0; e++ )
-            if( h->mb.pic.i_fref_frame[e] >= 0 )
-                pair_refcount[h->mb.pic.i_fref_frame[e]] += h->stat.frame.i_mb_count_ref[0][e];
-        /* PAFF: per-field bit accounting for the per-field VBV model. */
-        h->fdec->i_field_bits[pass] = h->stat.frame.i_tex_bits
-            + h->stat.frame.i_mv_bits + h->stat.frame.i_misc_bits;
         if( !pass )
-        {
-            /* bitstream position and NAL index at the end of the first
-             * field's AU (the per-field VBV model splits the pair's NAL
-             * payload sums here). */
-            pass0_end_bits = bs_pos( &h->out.bs ) + h->out.i_nal*NALU_OVERHEAD*8;
-            h->out.i_paff_au_boundary = h->out.i_nal;
             stat_first = h->stat.frame;
-            /* PAFF: make the just-coded first field referenceable by the
-             * second pass (sync plane_fld + borders + hpel for its parity). */
-            paff_sync_references( h );
-            /* Frame threading: the first field is phase-complete after
-             * the intermediate sweep -- broadcast its parity as fully
-             * reconstructed (sentinel, as progressive end-of-frame).  Guard
-             * mirrors fdec_filter_row. */
-            if( h->i_thread_frames > 1 && h->fdec->b_kept_as_ref )
-                x264_frame_cond_broadcast_fld( h->fdec, parity, 10000 );
-        }
     }
     /* Restore the pair-level view (post-marking) for frame-end consumers --
      * ratecontrol, reference_update, the next slot's context sync. */
@@ -4182,11 +4210,97 @@ static void *paff_pair_write( x264_t *h )
     /* All entries in stat.frame are ints except for ssd/ssim. */
     for( size_t j = 0; j < (offsetof(x264_t,stat.frame.i_ssd) - offsetof(x264_t,stat.frame.i_mv_bits)) / sizeof(int); j++ )
         ((int*)&h->stat.frame)[j] += ((int*)&stat_first)[j];
-    /* publish the pair-folded L0 ref counts, overwriting the merged
-     * raw per-entry counts (mixed pass layouts). */
-    memcpy( h->stat.frame.i_mb_count_ref[0], pair_refcount, sizeof(pair_refcount) );
     paff_frame_finish( h );
     return (void*)(intptr_t)0;
+}
+
+/* PAFF field-pass pool job: codes ONE field pass of
+ * a complementary pair as one frame-thread work item on its own slot.  The
+ * pair's other pass runs on the neighbouring slot; the harvest
+ * (paff_merge_pass) rendezvous-waits both jobs and stitches their output.
+ * The job touches only its own slot's context plus its coding parity's rows
+ * of the shared pair fdec (audit: recon, deblock, reference band, VBV
+ * re-encode are all parity-scoped; cross-pass state on the slot's x264_t
+ * does not exist). */
+static void *paff_pass_write( x264_t *h )
+{
+    x264_paff_job_t *job = &h->paff_job;
+    int parity = h->param.b_tff ? job->pass : !job->pass;
+    if( paff_pass_code( h, job, job->pass, NULL ) )
+    {
+        /* PAFF: broadcast the completion sentinel for our own parity before
+         * returning the error, so row waiters (the pair's other pass,
+         * younger pairs' passes) wake instead of hanging the pool.  If the
+         * FAILED job is pass 0, pass 1 wakes and codes against garbage
+         * first-field rows -- harmless: the caller's rendezvous wait
+         * returns this job's -1 first and the pair's output is discarded
+         * (same discarded-work shape as upstream's progressive error
+         * paths). */
+        if( h->i_thread_frames > 1 && h->fdec->b_kept_as_ref )
+            x264_frame_cond_broadcast_fld( h->fdec, parity, 10000 );
+        return (void*)(intptr_t)-1;
+    }
+    return (void*)(intptr_t)0;
+}
+
+/* PAFF harvest merge: the rendezvous of a pair's two
+ * pass jobs is complete (both waited by the caller).  Run the pair-level
+ * view restore and the stat/rc merge on the PASS-0 slot, stitch the pass-1
+ * slot's NAL array into its out, and measure the completed pair's quality.
+ * Pass-1's NAL payloads stay in its slot's bitstream buffer until
+ * encapsulation copies them; that slot is not redispatched before the next
+ * encode call, so the API's NAL lifetime rule is unchanged. */
+static int paff_merge_pass( x264_t *h, x264_t *h1 )
+{
+    x264_paff_job_t *job = &h->paff_job;
+
+    /* Restore the pair-level reference view (post-marking) for frame-end
+     * consumers (ratecontrol, reference_update, the next slot's context
+     * sync): the pass-0 job left its expanded field list in h->i_ref/h->fref.
+     * h->sh needs no restore here: the pass-0 job's sh is the pair-level
+     * view (its marking commands were never suppressed on this slot and the
+     * pair slice type / nal type are pass 0's). */
+    h->i_ref[0] = job->pair_count[1][0];
+    h->i_ref[1] = job->pair_count[1][1];
+    memcpy( h->fref[0], job->pair_fref[1][0], job->pair_count[1][0] * sizeof(x264_frame_t *) );
+    memcpy( h->fref[1], job->pair_fref[1][1], job->pair_count[1][1] * sizeof(x264_frame_t *) );
+
+    /* merge the pass-1 slot's per-frame stats (both slots'
+     * i_mb_count_ref[0] are already pair-folded by paff_pass_code) */
+    for( size_t j = 0; j < (offsetof(x264_t,stat.frame.i_ssd) - offsetof(x264_t,stat.frame.i_mv_bits)) / sizeof(int); j++ )
+        ((int*)&h->stat.frame)[j] += ((int*)&h1->stat.frame)[j];
+    /* fold pass-1's row QP sums into the pair accumulators */
+    x264_paff_merge_ratecontrol( h, h1 );
+
+    /* stitch the pass-1 slot's NALs after the pass-0 slot's, and set the
+     * AU boundary BEFORE any harvest-side consumer (the per-field VBV/HRD
+     * split, the buffering-period SEI insertion, the 4-byte start code in
+     * encapsulation) reads the merged array: it is the count of NALs
+     * completed by the end of the first field's AU. */
+    if( h->out.i_nal + h1->out.i_nal > h->out.i_nals_allocated )
+    {
+        int new_count = h->out.i_nals_allocated;
+        x264_nal_t *new_out;
+        while( h->out.i_nal + h1->out.i_nal > new_count )
+            new_count *= 2;
+        new_out = x264_malloc( sizeof(x264_nal_t) * new_count );
+        if( !new_out )
+            return -1;
+        memcpy( new_out, h->out.nal, sizeof(x264_nal_t) * h->out.i_nal );
+        x264_free( h->out.nal );
+        h->out.nal = new_out;
+        h->out.i_nals_allocated = new_count;
+    }
+    h->out.i_paff_au_boundary = h->out.i_nal;
+    for( int i = 0; i < h1->out.i_nal; i++ )
+        h->out.nal[h->out.i_nal++] = h1->out.nal[i];
+
+    /* The pair is complete: the full-frame quality measurement runs here,
+     * not in a job -- a non-reference pair's passes never wait on each
+     * other, so either job could finish first and measure in-flight rows. */
+    if( h->param.analyse.b_psnr || h->param.analyse.b_ssim )
+        fdec_measure_quality( h, 0, h->mb.i_mb_height*16, 1 );
+    return 0;
 }
 
 int     x264_encoder_encode( x264_t *h,
@@ -4195,6 +4309,9 @@ int     x264_encoder_encode( x264_t *h,
                              x264_picture_t *pic_out )
 {
     x264_t *thread_current, *thread_prev, *thread_oldest;
+    /* PAFF pass threading: the pair's second-pass slot of this dispatch and
+     * of the oldest pair in flight (the rendezvous partner at harvest). */
+    x264_t *pass1_slot = NULL, *thread_oldest1 = NULL;
     int i_nal_type, i_nal_ref_idc, i_global_qp;
     int overhead = NALU_OVERHEAD;
 
@@ -4205,13 +4322,45 @@ int     x264_encoder_encode( x264_t *h,
 
     if( h->i_thread_frames > 1 )
     {
-        thread_prev    = h->thread[ h->i_thread_phase ];
-        h->i_thread_phase = (h->i_thread_phase + 1) % h->i_thread_frames;
-        thread_current = h->thread[ h->i_thread_phase ];
-        thread_oldest  = h->thread[ (h->i_thread_phase + 1) % h->i_thread_frames ];
-        thread_sync_context( thread_current, thread_prev );
-        x264_thread_sync_ratecontrol( thread_current, thread_prev, thread_oldest );
-        h = thread_current;
+        if( h->param.b_paff )
+        {
+            /* PAFF pass-granular frame threading: a
+             * complementary pair consumes TWO frame-thread slots, dispatched
+             * back to back in pool FIFO order (first field, then second),
+             * and the round robin advances by two per encode call.  Pairs
+             * use an even slot count: a pair then always occupies an
+             * aligned slot pair, so the oldest pair's pass-0 slot (whose
+             * out buffer the harvest stitches into) is never redispatched
+             * before its rendezvous.  With an odd --threads N the last slot
+             * simply never receives a pair job.  Both slots sync from the
+             * previous pair's PASS-0 slot -- the last slot whose prologue
+             * ran, so its frames.reference / ratecontrol state is the
+             * current serial view; the pass-1 slot skips the rc end-var
+             * chain (ratecontrol_end runs on pass-0 slots only). */
+            int i_paff_slots = h->i_thread_frames & ~1;
+            x264_t *thread_prev0 = h->thread[ (h->i_thread_phase + i_paff_slots - 1) % i_paff_slots ];
+            thread_current = h->thread[ (h->i_thread_phase + 1) % i_paff_slots ];
+            pass1_slot     = h->thread[ (h->i_thread_phase + 2) % i_paff_slots ];
+            h->i_thread_phase = (h->i_thread_phase + 2) % i_paff_slots;
+            thread_oldest  = h->thread[ (h->i_thread_phase + 1) % i_paff_slots ];
+            thread_oldest1 = h->thread[ (h->i_thread_phase + 2) % i_paff_slots ];
+            thread_prev    = thread_prev0;
+            thread_sync_context( thread_current, thread_prev0 );
+            thread_sync_context( pass1_slot, thread_prev0 );
+            x264_thread_sync_ratecontrol( thread_current, thread_prev0, thread_oldest );
+            x264_thread_sync_ratecontrol( pass1_slot, thread_prev0, pass1_slot );
+            h = thread_current;
+        }
+        else
+        {
+            thread_prev    = h->thread[ h->i_thread_phase ];
+            h->i_thread_phase = (h->i_thread_phase + 1) % h->i_thread_frames;
+            thread_current = h->thread[ h->i_thread_phase ];
+            thread_oldest  = h->thread[ (h->i_thread_phase + 1) % h->i_thread_frames ];
+            thread_sync_context( thread_current, thread_prev );
+            x264_thread_sync_ratecontrol( thread_current, thread_prev, thread_oldest );
+            h = thread_current;
+        }
     }
     else
     {
@@ -4312,7 +4461,8 @@ int     x264_encoder_encode( x264_t *h,
         /* 2: Place the frame into the queue for its slice type decision */
         x264_lookahead_put_frame( h, fenc );
 
-        if( h->frames.i_input <= h->frames.i_delay + 1 - h->i_thread_frames )
+        if( h->frames.i_input <= h->frames.i_delay + 1 -
+            (h->param.b_paff && h->i_thread_frames > 1 ? (h->i_thread_frames & ~1)/2 : h->i_thread_frames) )
         {
             /* Nothing yet to encode, waiting for filling of buffers */
             pic_out->i_type = X264_TYPE_AUTO;
@@ -4334,7 +4484,7 @@ int     x264_encoder_encode( x264_t *h,
         x264_lookahead_get_frames( h );
 
     if( !h->frames.current[0] && x264_lookahead_is_empty( h ) )
-        return encoder_frame_end( thread_oldest, thread_current, pp_nal, pi_nal, pic_out );
+        return encoder_frame_end( thread_oldest, thread_current, thread_oldest1, pp_nal, pi_nal, pic_out );
 
     /* ------------------- Get frame to be encoded ------------------------- */
     /* 4: get picture to encode */
@@ -5128,13 +5278,42 @@ int     x264_encoder_encode( x264_t *h,
 
         if( h->i_thread_frames > 1 )
         {
-            x264_threadpool_run( h->threadpool, (void*)paff_pair_write, h );
+            /* Publish the pair to the pass-1 slot:
+             * the same job parameters (each job reads only its own pass's
+             * half), the shared pair fdec (+1 reference, released at the
+             * slot's next context sync; the fdec it synced from the
+             * previous pair goes back to the pool), the pair fenc pointer,
+             * the pair-level slice header and NAL fields, and a
+             * deterministic dispatch-time snapshot of the ratecontrol
+             * state (its row VBV sees predicted pass-0 bits). */
+            x264_t *h1 = pass1_slot;
+            memcpy( &h1->paff_job, &h->paff_job, sizeof(x264_paff_job_t) );
+            h->paff_job.pass = 0;
+            h1->paff_job.pass = 1;
+            x264_frame_push_unused( h1, h1->fdec );
+            h1->fdec = h->fdec;
+            h1->fdec->i_reference_count++;
+            h1->fenc = h->fenc;
+            h1->i_nal_type = job->i_nal_type;
+            h1->i_nal_ref_idc = i_nal_ref_idc;
+            h1->i_cpb_delay_pir_offset = h->i_cpb_delay_pir_offset;
+            h1->sh = h->sh;
+            x264_paff_sync_ratecontrol( h1, h );
+            bs_init( &h1->out.bs, h1->out.p_bitstream, h1->out.i_bitstream );
+            h1->out.i_nal = 0;
+
+            /* Pool FIFO order is coding order: F0(N), F1(N), F0(N+1), ...
+             * so a worker blocking on a row wait always leaves the job it
+             * waits for running or queued ahead. */
+            x264_threadpool_run( h->threadpool, (void*)paff_pass_write, h );
             h->b_thread_active = 1;
+            x264_threadpool_run( h->threadpool, (void*)paff_pass_write, h1 );
+            h1->b_thread_active = 1;
         }
         else if( (intptr_t)paff_pair_write( h ) )
             return -1;
 
-        return encoder_frame_end( thread_oldest, thread_current, pp_nal, pi_nal, pic_out );
+        return encoder_frame_end( thread_oldest, thread_current, thread_oldest1, pp_nal, pi_nal, pic_out );
     }
 
     /* ------------------------ Create slice header  ----------------------- */
@@ -5166,10 +5345,10 @@ int     x264_encoder_encode( x264_t *h,
         if( (intptr_t)slices_write( h ) )
             return -1;
 
-    return encoder_frame_end( thread_oldest, thread_current, pp_nal, pi_nal, pic_out );
+    return encoder_frame_end( thread_oldest, thread_current, NULL, pp_nal, pi_nal, pic_out );
 }
 
-static int encoder_frame_end( x264_t *h, x264_t *thread_current,
+static int encoder_frame_end( x264_t *h, x264_t *thread_current, x264_t *thread_oldest1,
                               x264_nal_t **pp_nal, int *pi_nal,
                               x264_picture_t *pic_out )
 {
@@ -5181,10 +5360,28 @@ static int encoder_frame_end( x264_t *h, x264_t *thread_current,
         if( (intptr_t)x264_threadpool_wait( h->threadpool, h ) )
             return -1;
     }
-    /* PAFF: the job (if any) is complete here -- release the DPB pairs whose
-     * eviction was deferred from the caller-side first-field marking. */
+    /* PAFF rendezvous: also wait the oldest pair's
+     * second-pass job.  The caller is not a pool worker, so the wait order
+     * cannot deadlock. */
+    if( thread_oldest1 && thread_oldest1->b_thread_active )
+    {
+        thread_oldest1->b_thread_active = 0;
+        if( (intptr_t)x264_threadpool_wait( thread_oldest1->threadpool, thread_oldest1 ) )
+            return -1;
+    }
     if( h->param.b_paff )
+    {
+        /* the pair's two jobs are complete: stitch and merge on the pass-0
+         * slot, then release the DPB pairs whose eviction was deferred
+         * from the caller-side first-field marking.  The h->out.i_nal gate
+         * distinguishes "a pair job ran on this slot" from pipeline-fill and
+         * flush calls where the slot never coded a pair: a pass-0 job that
+         * ran always emitted at least its slice NAL (a failed job already
+         * returned -1 from the wait above). */
+        if( thread_oldest1 && h->out.i_nal && paff_merge_pass( h, thread_oldest1 ) )
+            return -1;
         paff_release_evicted( h );
+    }
     if( !h->out.i_nal )
     {
         pic_out->i_type = X264_TYPE_AUTO;
@@ -5241,7 +5438,25 @@ static int encoder_frame_end( x264_t *h, x264_t *thread_current,
         pic_out->img.plane[i] = (uint8_t*)h->fdec->plane[i];
     }
 
-    x264_frame_push_unused( thread_current, h->fenc );
+    /* PAFF pass threading: defer the fenc recycle to the upstream margin
+     * (see paff_fenc_defer): the pair harvest happens N - slots/2 calls
+     * earlier than the pair-granular one did. */
+    if( h->param.b_paff && thread_oldest1 )
+    {
+        x264_t *hm = h->thread[0];
+        int defer = h->i_thread_frames - (h->i_thread_frames & ~1)/2;
+        if( hm->i_paff_fenc_defer == defer )
+        {
+            x264_frame_push_unused( thread_current, hm->paff_fenc_defer[0] );
+            memmove( &hm->paff_fenc_defer[0], &hm->paff_fenc_defer[1],
+                     (defer-1) * sizeof(x264_frame_t *) );
+            hm->paff_fenc_defer[defer-1] = h->fenc;
+        }
+        else
+            hm->paff_fenc_defer[hm->i_paff_fenc_defer++] = h->fenc;
+    }
+    else
+        x264_frame_push_unused( thread_current, h->fenc );
 
     /* ---------------------- Update encoder state ------------------------- */
 
@@ -5483,6 +5698,10 @@ void    x264_encoder_close  ( x264_t *h )
 
     if( h->param.b_sliced_threads )
         threadpool_wait_all( h );
+    /* PAFF pass threading: release the harvested fencs still held back by
+     * the deferred-recycle FIFO. */
+    while( h->i_paff_fenc_defer )
+        x264_frame_push_unused( h, h->paff_fenc_defer[--h->i_paff_fenc_defer] );
     if( h->param.i_threads > 1 )
         x264_threadpool_delete( h->threadpool );
     if( h->param.i_lookahead_threads > 1 )
@@ -5497,9 +5716,18 @@ void    x264_encoder_close  ( x264_t *h )
             }
 
         x264_t *thread_prev = h->thread[h->i_thread_phase];
+        int i_in_flight = h->i_thread_frames;
+        if( h->param.b_paff )
+        {
+            /* PAFF pass threading: the freshest rc end-vars live on the
+             * last pair's PASS-0 slot; the pipeline depth is in pairs. */
+            int i_paff_slots = h->i_thread_frames & ~1;
+            thread_prev = h->thread[ (h->i_thread_phase + i_paff_slots - 1) % i_paff_slots ];
+            i_in_flight = i_paff_slots/2;
+        }
         x264_thread_sync_ratecontrol( h, thread_prev, h );
         x264_thread_sync_ratecontrol( thread_prev, thread_prev, h );
-        h->i_frame = thread_prev->i_frame + 1 - h->i_thread_frames;
+        h->i_frame = thread_prev->i_frame + 1 - i_in_flight;
     }
     h->i_frame++;
 

@@ -683,8 +683,9 @@ static ALWAYS_INLINE void macroblock_load_pic_pointers( x264_t *h, int mb_x, int
                     /* MBAFF: both fields of frame j>>1 share one weighting
                      * slot.  PAFF: j is the field-entry index and
                      * weighted_pred_init assigns the pair's shared scaled
-                     * plane per entry (pair_slot), so index j as-is. */
-                    h->mb.pic.p_fref_w[j] = &h->fenc->weighted[FIELD_PIC ? j : (j >> mb_interlaced)][ref_pix_offset[refidx]];
+                     * plane per entry (pair_slot) into the slot's shadow,
+                     * so index j as-is. */
+                    h->mb.pic.p_fref_w[j] = &(h->param.b_paff ? h->paff_weighted : h->fenc->weighted)[FIELD_PIC ? j : (j >> mb_interlaced)][ref_pix_offset[refidx]];
                 else
                     h->mb.pic.p_fref_w[j] = h->mb.pic.p_fref[0][j][0];
             }

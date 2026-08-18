@@ -2873,6 +2873,63 @@ void x264_thread_sync_ratecontrol( x264_t *cur, x264_t *prev, x264_t *next )
     /* the rest of the variables are either constant or thread-local */
 }
 
+/* PAFF pass-granular frame threading: give the
+ * pair's second-pass slot a deterministic dispatch-time snapshot of the
+ * ratecontrol state.  Its row VBV then sees PREDICTED first-field bits --
+ * the progressive threading semantics (a frame coding against an in-flight
+ * previous frame predicts its bits the same way).  Same memcpy shape as
+ * x264_threads_distribute_ratecontrol, plus the row predictor array (the
+ * monolithic --threads 1 driver's second pass sees the first pass's
+ * predictors; the dispatch-time snapshot is the deterministic
+ * approximation of that).  The end-chain vars are NOT copied: they flow
+ * through pass-0 slots only (x264_thread_sync_ratecontrol). */
+void x264_paff_sync_ratecontrol( x264_t *dst, x264_t *src )
+{
+    /* The end-chain vars updated by x264_ratecontrol_end and the central
+     * VBV accumulator buffer_fill_final (authoritative on thread[0], which
+     * is a pass-1 slot for some pair of every round-robin cycle) must NOT
+     * be clobbered by the snapshot: they flow through pass-0 slots only
+     * (x264_thread_sync_ratecontrol's cur->next chain, which the pass-1
+     * slot skips).  Save and restore them around the memcpy. */
+    int64_t buffer_fill_final     = dst->rc->buffer_fill_final;
+    int64_t buffer_fill_final_min = dst->rc->buffer_fill_final_min;
+    double cplxr_sum           = dst->rc->cplxr_sum;
+    double expected_bits_sum   = dst->rc->expected_bits_sum;
+    int64_t filler_bits_sum    = dst->rc->filler_bits_sum;
+    double wanted_bits_window  = dst->rc->wanted_bits_window;
+    int    bframe_bits         = dst->rc->bframe_bits;
+    int    initial_cpb_removal_delay        = dst->rc->initial_cpb_removal_delay;
+    int    initial_cpb_removal_delay_offset = dst->rc->initial_cpb_removal_delay_offset;
+    double nrt_first_access_unit            = dst->rc->nrt_first_access_unit;
+    double previous_cpb_final_arrival_time  = dst->rc->previous_cpb_final_arrival_time;
+
+    memcpy( dst->rc, src->rc, offsetof(x264_ratecontrol_t, row_pred) );
+    memcpy( dst->rc->row_preds, src->rc->row_preds, sizeof(src->rc->row_preds) );
+    dst->rc->row_pred = dst->rc->row_preds[src->sh.i_type];
+
+    dst->rc->buffer_fill_final     = buffer_fill_final;
+    dst->rc->buffer_fill_final_min = buffer_fill_final_min;
+    dst->rc->cplxr_sum           = cplxr_sum;
+    dst->rc->expected_bits_sum   = expected_bits_sum;
+    dst->rc->filler_bits_sum    = filler_bits_sum;
+    dst->rc->wanted_bits_window  = wanted_bits_window;
+    dst->rc->bframe_bits         = bframe_bits;
+    dst->rc->initial_cpb_removal_delay        = initial_cpb_removal_delay;
+    dst->rc->initial_cpb_removal_delay_offset = initial_cpb_removal_delay_offset;
+    dst->rc->nrt_first_access_unit            = nrt_first_access_unit;
+    dst->rc->previous_cpb_final_arrival_time  = previous_cpb_final_arrival_time;
+}
+
+/* PAFF pass-granular frame threading: fold the second-pass slot's per-frame
+ * ratecontrol accumulators into the first-pass slot's at the pair's
+ * harvest rendezvous (the monolithic driver accumulates both passes onto
+ * one context; same sums). */
+void x264_paff_merge_ratecontrol( x264_t *h, x264_t *h1 )
+{
+    h->rc->qpa_rc += h1->rc->qpa_rc;
+    h->rc->qpa_aq += h1->rc->qpa_aq;
+}
+
 static int find_underflow( x264_t *h, double *fills, int *t0, int *t1, int over )
 {
     /* find an interval ending on an overflow or underflow (depending on whether
