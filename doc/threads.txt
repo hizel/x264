@@ -115,7 +115,23 @@ even slot count, so at an odd thread count the last slot idles.  Output
 is deterministic at a fixed thread count, but not byte-identical to
 --threads 1 (the MV-range clamp applies as in progressive).  This now
 holds with VBV enabled too (see "Threaded VBV determinism" below).
-Slice-based threading stays rejected.  See doc/paff.txt.
+Slice-based threading under PAFF is supported (paff-sliced-threads):
+frame threading is off by construction (one pair in flight, monolithic
+pair driver) and each field pass is split into N parity-interleaved
+slice bands, one slice per band, coded in parallel.  Each thread
+deblocks its own band rows at its slice end (cross-slice deblock off,
+idc=2), and all reference-data work (field-layout copy, borders, hpel)
+runs in a serial post-join sweep on the main context -- no cross-thread
+pixel synchronization.  The thread count is capped at four field MB
+rows per band (half the progressive cap: a field has half the frame's
+MB rows).  Row-VBV budgets are per field: pass 0 gets the pair plan
+scaled by its parity's SATD share, pass 1 the exact leftover floored at
+5% of the pair plan.  Non-VBV modes (CRF/CQP/ABR) are byte-repeatable
+at a fixed thread count; CBR+VBV inherits the sliced-threads timing
+exception (below).  Measured on the same machine: 1.84x at N=2 and
+3.21x at N=4 on 1080i; BD-rate overhead at or below the sliced-
+progressive penalty at the same operating point (numbers in
+doc/paff.txt).  See doc/paff.txt.
 
 Measured (AMD Ryzen 7 9800X3D, 8C/16T; best of 3 runs; --paff --tff,
 CBR+VBV, --aud for the drift metrics; "pair-job" is the pre-split
@@ -195,7 +211,12 @@ fixed thread count (verified at N = 2/4/8/16, with and without B-frames,
 under --paff, and at 720p).  --threads 1 and the non-VBV ratecontrol
 modes (CRF, CQP, ABR without VBV) are byte-identical before and after.
 Slice-based threading is excepted: its cross-slice reads of live
-bits_so_far / frame_size_estimated remain timing-dependent.
+bits_so_far / frame_size_estimated remain timing-dependent.  This
+exception covers sliced PAFF equally (--paff --sliced-threads): CRF,
+CQP and ABR-without-VBV stay byte-identical across repeat runs at a
+fixed thread count (verified at N = 2/4/8 with and without B-frames),
+while CBR+VBV output is timing-dependent and gated instead on Annex C
+CPB compliance plus zero underflow warnings.
 
 Measured consequences of the new threaded CBR+VBV trajectory (vs the old
 nondeterministic one; tools/test_vbv_determinism.sh --quality):

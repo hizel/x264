@@ -227,6 +227,37 @@ encode_2pass rc_2p_bff --paff --bff --bframes 0 --bitrate 300
 encode hrd_tff --paff --tff --bframes 0 --bitrate 300 \
     --vbv-maxrate 300 --vbv-bufsize 300 --nal-hrd cbr
 
+# --- paff-sliced-threads (5.4): multi-slice field-picture streams --------
+# Sliced PAFF needs >= 4 field MB rows per thread, so these run on a 576i
+# clip (the default 144-line clip clamps to one thread and is not
+# multi-slice).  TFF+BFF, I+P+B and CBR+VBV with filler (maxrate == bitrate
+# forces filler NALs), N=4 -> 4 slices per field picture.
+SL_WIDTH=704
+SL_HEIGHT=576
+SL_CLIP=$WORKDIR/clip_${SL_WIDTH}x${SL_HEIGHT}.yuv
+if [ ! -f "$SL_CLIP" ]; then
+    "$FFMPEG" -y -loglevel error \
+        -f lavfi -i "testsrc2=size=${SL_WIDTH}x${SL_HEIGHT}:rate=50:duration=1" \
+        -vf tinterlace -frames:v $FRAMES -pix_fmt yuv420p "$SL_CLIP" \
+        || die "576i clip synthesis failed"
+fi
+
+sliced_encode() { # name opts...
+    local name=$1; shift
+    "$X264" "$SL_CLIP" --input-res ${SL_WIDTH}x${SL_HEIGHT} --frames $FRAMES \
+        --threads 4 --sliced-threads -o "$WORKDIR/$name.264" "$@" >"$WORKDIR/$name.enc.log" 2>&1 \
+        || die "$name: x264 encode failed (see $WORKDIR/$name.enc.log)"
+}
+
+sliced_encode sl_tff_intra --paff --tff --qp 20 --keyint 1 --bframes 0 --weightp 0
+sliced_encode sl_tff_ipb   --paff --tff --crf 23 --bframes 3
+sliced_encode sl_bff_ipb   --paff --bff --crf 23 --bframes 3
+# filler-flavoured CBR: a high target with a QP floor keeps the encoder
+# underspending, so update_vbv pads the field AUs with filler NALs
+# (23+ of them on the deterministic clip) -- decode must ignore them.
+sliced_encode sl_cbr_filler --paff --tff --bframes 0 --bitrate 5000 \
+    --vbv-maxrate 5000 --vbv-bufsize 5000 --qpmin 35 --nal-hrd cbr
+
 # --- run the gate over every stream ---------------------------------------
 for entry in "${PAFF_MATRIX[@]}"; do
     hw_check "${entry%%|*}"
@@ -235,6 +266,9 @@ for name in paff_tff_intra paff_tff_ip paff_bff_ip paff_tff_ref4 paff_bff_ref4 \
             paff_tff_ref2_evict paff_bff_ref2_evict paff_tff_ref8_16fld \
             paff_bff_ref8_16fld paff_tff_crf \
             rc_cbr_tff rc_cbr_bff rc_2p_tff rc_2p_bff hrd_tff; do
+    hw_check "$name"
+done
+for name in sl_tff_intra sl_tff_ipb sl_bff_ipb sl_cbr_filler; do
     hw_check "$name"
 done
 

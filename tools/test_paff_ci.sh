@@ -13,8 +13,12 @@
 #     are byte-identical);
 #   - an --nal-hrd cbr stream is CPB-compliant at field granularity per the
 #     independent Annex C simulator (tools/check_hrd.py);
+#   - sliced-threads PAFF cells (paff-sliced-threads): N=4 encode with the
+#     expected 4 slices per field picture, the field-row thread-count clamp,
+#     fixed-N byte repeatability, and a sliced CBR+VBV CPB check;
 #   - unsupported combinations are rejected at validation (non-zero exit):
-#     --sliced-threads, --pulldown, --avcintra-class.
+#     PAFF+sliced with explicit sub-slicing, PAFF+slice-max-mbs/--slices at
+#     any thread count, --pulldown, --avcintra-class.
 #
 # It uses raw YUV input (--input-res) and raw Annex-B output, so it needs no
 # lavf/swscale linkage and no ffmpeg.  The clip is synthesized with python3.
@@ -167,7 +171,15 @@ else
 fi
 
 # 4. Unsupported combinations must be rejected.
-encode_fail "--paff --sliced-threads"   --paff --sliced-threads
+#    paff-sliced-threads: sliced threads are now ACCEPTED under PAFF; the
+#    rejections are the explicit sub-slicing combinations (band = the only
+#    slice shape) and PAFF + slice-max-mbs/--slices at any thread count
+#    (previously silent empty output).
+encode_fail "--paff --sliced-threads --slice-max-size"   --paff --sliced-threads --threads 2 --slice-max-size 1500
+encode_fail "--paff --sliced-threads --slice-max-mbs"   --paff --sliced-threads --threads 2 --slice-max-mbs 30
+encode_fail "--paff --sliced-threads --slices"          --paff --sliced-threads --threads 2 --slices 2
+encode_fail "--paff --slice-max-mbs (any threads)"      --paff --slice-max-mbs 30
+encode_fail "--paff --slices (any threads)"             --paff --slices 2
 encode_fail "--paff --pulldown"         --paff --pulldown 1
 encode_fail "--paff --avcintra-class"   --paff --avcintra-class 50
 
@@ -183,6 +195,68 @@ for entry in "${PAFF_MATRIX[@]}"; do
     opts=${entry#*|}
     encode_ok "matrix/$name" "$WORKDIR/mx_$((i++)).264" --paff $opts
 done
+
+# 6. Sliced-threads PAFF (paff-sliced-threads 5.5): encode-only CI cells.
+#    Sliced bands need >= 4 field MB rows per thread, so these run on a
+#    dedicated 352x512 clip (16 field rows -> field cap 4); the main clip
+#    (128 lines) clamps sliced PAFF to one thread and exercises nothing.
+SL_WIDTH=352 SL_HEIGHT=512
+SL_CLIP="$WORKDIR/in_sliced.yuv"
+python3 - "$SL_CLIP" "$SL_WIDTH" "$SL_HEIGHT" "$FRAMES" <<'PY' || die "sliced clip generation failed"
+import sys
+path, w, h, n = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4])
+frame = w*h*3//2
+data = bytearray()
+for f in range(n):
+    for i in range(frame):
+        data.append((i*11 + f*17 + (i//w)*3) & 0xff)
+with open(path, "wb") as fh:
+    fh.write(data)
+PY
+SL_COMMON=(--input-res ${SL_WIDTH}x${SL_HEIGHT} --fps 25)
+
+# 6a. encode + multi-slice geometry: N=4 must produce exactly N slices per
+#     field picture (2*FRAMES fields -> 2*FRAMES*N slice NALs).
+SL_OUT="$WORKDIR/sliced_n4.264"
+if "$X264" "$SL_CLIP" "${SL_COMMON[@]}" -o "$SL_OUT" --paff --tff --sliced-threads \
+        --threads 4 --crf 23 >"$WORKDIR/log" 2>&1 && [ -s "$SL_OUT" ] \
+   && python3 - "$SL_OUT" $((FRAMES*2*4)) <<'PY'
+import re, sys
+data = open(sys.argv[1], 'rb').read()
+nal_types = [data[m.start()+3] & 0x1f for m in re.finditer(b'\x00\x00\x01', data)]
+slices = sum(1 for t in nal_types if t in (1, 5))
+sys.exit(0 if slices == int(sys.argv[2]) else 1)
+PY
+then ok "sliced N=4: encode + $((FRAMES*2*4)) slice NALs (4 per field)"
+else bad "sliced N=4: encode/slice-count check failed"; fi
+
+# 6b. thread-count clamp: 8 threads over 16 field rows reduces to the cap
+#     (4) with the warning that makes the clamp observable.
+if "$X264" "$SL_CLIP" "${SL_COMMON[@]}" -o /dev/null --paff --tff --sliced-threads \
+        --threads 8 --crf 23 --frames 4 >"$WORKDIR/log" 2>&1 \
+   && grep -q "reducing to 4" "$WORKDIR/log"; then
+    ok "sliced clamp: --threads 8 reduces to the field cap (4)"
+else bad "sliced clamp: not clamped/warned"; fi
+
+# 6c. determinism: two N=4 runs byte-identical (non-VBV modes are
+#     byte-repeatable; CBR+VBV inherits the progressive sliced exception).
+"$X264" "$SL_CLIP" "${SL_COMMON[@]}" -o "$WORKDIR/sdet_a.264" --paff --tff \
+    --sliced-threads --threads 4 --crf 23 >"$WORKDIR/log" 2>&1 \
+    || die "sliced determinism encode A failed"
+"$X264" "$SL_CLIP" "${SL_COMMON[@]}" -o "$WORKDIR/sdet_b.264" --paff --tff \
+    --sliced-threads --threads 4 --crf 23 >"$WORKDIR/log" 2>&1 \
+    || die "sliced determinism encode B failed"
+if cmp -s "$WORKDIR/sdet_a.264" "$WORKDIR/sdet_b.264"; then ok "sliced determinism: N=4 repeatable"
+else bad "sliced determinism: N=4 not repeatable"; fi
+
+# 6d. HRD: sliced CBR+VBV stream must be CPB-compliant per field AU.
+SL_HRD="$WORKDIR/shrd.264"
+"$X264" "$SL_CLIP" "${SL_COMMON[@]}" -o "$SL_HRD" --paff --tff --sliced-threads \
+    --threads 4 --bframes 0 --bitrate 300 --vbv-maxrate 300 --vbv-bufsize 300 \
+    --nal-hrd cbr >"$WORKDIR/log" 2>&1 || die "sliced nal-hrd cbr encode failed"
+if python3 "$REPO_ROOT/tools/check_hrd.py" "$SL_HRD" >"$WORKDIR/shrd.log" 2>&1; then
+    ok "sliced Annex C CPB check (field granularity)"
+else bad "sliced Annex C CPB check"; cat "$WORKDIR/shrd.log" >&2; fi
 
 echo
 echo "PAFF CI smoke: $PASS passed, $FAIL failed"

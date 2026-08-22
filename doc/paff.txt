@@ -101,8 +101,9 @@ reverting the validation block in x264_encoder_open first.
 Threading
 ---------
 
-PAFF supports frame-based threading.  Slice-based threading
-(--sliced-threads) is rejected at validation with an explicit error.
+PAFF supports frame-based threading and slice-based threading.
+
+Frame threads (--threads N, N > 1, no --sliced-threads):
 
 The two field passes of a complementary pair are coded as TWO separate
 frame-thread jobs: the caller dispatches pass 0 and pass 1 from the same
@@ -141,6 +142,54 @@ implementation.  One inherited caveat: with VBV enabled, threaded
 output is not byte-deterministic even on pre-PAFF upstream
 (ratecontrol reads in-flight threads' state), so byte-repeat gates run
 on non-VBV configs.
+
+Sliced threads (--paff --sliced-threads --threads N): frame threading is
+off by construction (b_sliced_threads forces i_thread_frames == 1), so
+the pair is coded by the monolithic --threads 1 pair driver, and each
+field pass is split into N parity-interleaved slice bands -- one slice
+per band, coded in parallel by the slice threads (2N slice NALs per
+pair; that NAL-count asymmetry vs progressive sliced encoding is part
+of its overhead).  A band covers field rows [b0,b1) of the pass's
+parity, i.e. frame-coordinate MB rows parity+2*b0 .. parity+2*(b1-1);
+the thread count is capped so a band is never thinner than four field
+MB rows (half the progressive cap, computed from FIELD rows: a
+1080-line input caps at 8, 576-line at 4).  Cross-slice deblocking is
+disabled within each field picture (i_disable_deblocking_filter_idc=2,
+like progressive sliced encoding), so each thread deblocks its own
+band rows at its slice end, race-free.
+
+All reference-data work (field-layout copy, borders, hpel) runs AFTER
+the join, single-threaded on the main context, as a loop of
+paff_reference_band over every field row of the coding parity -- the
+same shape the pre-threading pipeline used between the passes, and
+byte-identical to the row-cadence result by construction.  No
+cross-thread pixel synchronization exists in this mode.  Measured on a
+Ryzen 7 9800X3D the serial sweep is ~1% of encode time at 1080i N=4
+(perf: hpel 0.4%, border expansion 0.3%, plane_fld copy ~0.2%), so the
+D3 estimate holds and the boundary-window parallelization below is not
+needed.
+
+Row-VBV budget granularity is per FIELD under sliced threads: pass 0
+receives the pair plan scaled by its parity's share of the row SATD,
+pass 1 receives the pair plan minus pass 0's actual coded bits, floored
+at 5% of the pair plan (an overshooting first field must not hand the
+sliced normalization a zero/negative plan).  The budgets are logged at
+X264_LOG_DEBUG ("paff field budget", one line per field) -- the test
+matrix asserts the sum from them.  Pair-level ratecontrol accumulators
+(qpa_rc/qpa_aq) are zeroed in each non-main worker at the pass-1
+distribute so the two distribute/merge cycles per pair count each pass
+exactly once.
+
+Determinism under sliced threads inherits the progressive sliced-threads
+exception -- CBR+VBV output is timing-dependent (cross-slice reads of
+live ratecontrol state), while CRF/CQP/ABR-without-VBV are
+byte-identical across repeat runs at a fixed thread count.  No sliced
+output is byte-identical to a non-sliced one (slice headers, CABAC
+reinit, disabled cross-slice deblock), same as progressive.
+Measured quality/speed (see Quality and Speed below): the sliced-PAFF
+BD-rate overhead is BELOW the progressive-sliced reference at the same
+operating point, and the speedup is 1.8x at N=2 and 3.2x at N=4 on
+1080i.
 
 Motion-vector limits
 --------------------
@@ -203,8 +252,18 @@ D1+D2 attribution builds):
 Future work
 -----------
 
-  * Low-latency slicing / sliced threads under PAFF (rejected at
-    validation, see Unsupported combinations).
+  * Sliced threads: parallelize the post-join reference sweep
+    (progressive-style pass-1/pass-2 boundary windows).  The serial
+    sweep measured at ~1% of encode time (1080i, N=4), so this only
+    matters if profiling at much higher thread counts or resolutions
+    shows otherwise.
+  * Sliced threads: stride-aware sub-slicing (--slice-max-size/
+    --slice-max-mbs/--slices within a field band) -- the current
+    boundary arithmetic assumes a contiguous raster.
+  * Sliced threads: deterministic stand-ins for the cross-slice live
+    ratecontrol reads (in the spirit of vbv_inflight_bits), making
+    CBR+VBV byte-deterministic under sliced threads (an inherited
+    upstream exception, not PAFF-specific).
   * Full II-pair AVC-Intra support (rejected at validation).
   * Per-field mbtree propagation: lookahead/mbtree analyze whole frames, so
     per-field propagate weights are ~2x off (quality-only).  Gated on a
@@ -219,7 +278,15 @@ Unsupported combinations (rejected at validation)
   * --paff with --interlaced (MBAFF) or fake interlacing.
   * --paff with an AVC-Intra class (i_avcintra_class).  Full II-pair AVC-Intra
     support is future work.
-  * --paff with --sliced-threads (see Threading).
+  * --paff with --sliced-threads plus any explicit sub-slicing
+    (--slice-max-size, --slice-max-mbs, --slices): slice threads make one
+    slice per band; slice-max-size row-recode restarts break the row
+    monotonicity the row ratecontrol assumes, and the slice-max-mbs/--slices
+    boundary arithmetic assumes a contiguous raster.
+  * --paff with --slice-max-mbs or --slices at ANY thread count (the same
+    contiguous-raster assumption; previously this silently produced EMPTY
+    output with exit code 0).  --slice-max-size without sliced threads stays
+    accepted.
   * --paff with --weightb: force-disabled with a warning (measured and
     rejected: no quality gain, see Rate control and VBV).
   * --paff with --pulldown: pulldown patterns have no coded frame picture to
@@ -230,8 +297,9 @@ Unsupported combinations (rejected at validation)
     per-field pic_struct 1/2 is carried by the per-field pic_timing SEI).
 
 Working combinations include --tff/--bff, --tcfile-in/--tcfile-out, --timebase
-and VFR (handled at pair-level PTS), --weightp 0/1/2, B-frame pyramids, and the
-full CRF/2-pass/CBR rate-control matrix.
+and VFR (handled at pair-level PTS), --weightp 0/1/2, B-frame pyramids,
+--sliced-threads --threads N (see Threading), and the full CRF/2-pass/CBR
+rate-control matrix.
 
 What works as in progressive: --csp (all chroma formats compiled in), both bit
 depths, CABAC/CAVLC, all intra prediction, open/closed GOP, B-pyramid.
@@ -252,6 +320,34 @@ tinterlace'd test clips at matched bitrate (CRF sweep, PSNR-Y):
 
 These are content-dependent; the ordering (PAFF >= progressive > MBAFF) holds
 across the tested clips but the gaps shrink on nearly-progressive material.
+
+Sliced-threads PAFF vs PAFF --threads 1 (BD-rate PSNR-Y, CRF 18/23/28/33,
+100-frame tinterlace'd hall clip, bframes 3, Ryzen 7 9800X3D):
+
+  * 1080i: N=2 +1.85%, N=4 +5.90%.
+  * 576i:  N=2 +3.77%, N=4 +12.61%.
+
+The acceptance reference is progressive sliced at the SAME N on a
+HALF-HEIGHT progressive clip (equal band height in MB rows AND equal
+slice count per picture -- 540p for 1080i, 288p for 576i):
+
+  * 540p: N=2 +8.67%, N=4 +10.49%  ->  ratios 0.21x / 0.56x.
+  * 288p: N=2 +7.21%, N=4 +13.02%  ->  ratios 0.52x / 0.97x.
+
+Every ratio is below the 1.5-2x acceptance ceiling: sliced-PAFF's
+overhead is at or below the sliced-progressive penalty at the same
+operating point.  The remaining overhead is slice-header/CABAC-reinit
+cost and the 2N-NALs-per-pair asymmetry, not the field budgets.
+
+Speed (same clip, bframes 0, wall-clock of 100 frames):
+
+  * 1080i: 1.84x at N=2, 3.21x at N=4, 4.73x at N=8 (cap 8).
+  * 576i:  1.85x at N=2, 3.03x at N=4 (N=8 clamps to 4: cap 4).
+
+Speedup grows monotonically 2 -> 4 and clears the 1.3x-at-N=4 floor by
+2.4x; the serial post-join reference sweep is ~1% of encode time
+(measured with perf at 1080i N=4), so the boundary-window
+parallelization listed under Future work is not needed at these sizes.
 
 Progressive and MBAFF outputs are bit-identical to the pre-PAFF encoder: the
 PAFF paths are gated on param.b_paff and never run otherwise.
@@ -285,9 +381,17 @@ Testing
 
   * tools/test_paff.sh: scripted JM round-trip over a config matrix
     (CRF/2-pass/CBR x TFF/BFF x I/P/B, plus progressive/MBAFF baselines).
+    The `sliced` command covers the sliced-threads cells (JM round-trips
+    TFF/BFF x I/I+P/I+P+B x N in {2,4}, weightp 1/2, CAVLC, band-geometry
+    edges, CBR+VBV, 2-pass, HRD, byte-repeat, the field-budget assertion,
+    an mb_info API cell and a 10-bit ffmpeg decode cell, on a 576i clip).
   * tools/test_paff_hw.sh: hardware-decoder interop smoke (software,
     NVDEC/cuvid, NVDEC/nvdec, QSV, VAAPI backends) with a pixel-exact
-    cross-check against ffmpeg's software decoder.
+    cross-check against ffmpeg's software decoder; includes the
+    multi-slice sliced-PAFF streams (TFF/BFF, I+P+B, CBR+VBV with filler).
+  * tools/test_paff_ci.sh: JM-free CI smoke; includes sliced-PAFF cells
+    (N=4 encode with the expected slice count, the field-row thread clamp,
+    fixed-N byte repeatability, sliced CBR+VBV CPB check).
   * tools/check_hrd.py: Annex C CPB simulator for --nal-hrd cbr streams.
   * tools/test_paff.sh opengop: open-GOP round-trips vs JM -- keyint-driven
     non-IDR Ip keyframe pairs plus a hard-scene-cut clip whose GOP-tail B

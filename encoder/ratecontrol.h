@@ -83,6 +83,10 @@ void x264_ratecontrol_summary( x264_t * );
 int  x264_rc_analyse_slice( x264_t *h );
 #define x264_threads_distribute_ratecontrol x264_template(threads_distribute_ratecontrol)
 void x264_threads_distribute_ratecontrol( x264_t *h );
+#define x264_paff_slice_field_budget x264_template(paff_slice_field_budget)
+void x264_paff_slice_field_budget( x264_t *h, int pass );
+#define x264_paff_slice_restore_pair_plan x264_template(paff_slice_restore_pair_plan)
+void x264_paff_slice_restore_pair_plan( x264_t *h );
 #define x264_threads_merge_ratecontrol x264_template(threads_merge_ratecontrol)
 void x264_threads_merge_ratecontrol( x264_t *h );
 #define x264_hrd_fullness x264_template(hrd_fullness)

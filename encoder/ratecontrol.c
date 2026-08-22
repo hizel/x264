@@ -1696,13 +1696,17 @@ static float predict_row_size( x264_t *h, int y, float qscale )
 static int row_bits_so_far( x264_t *h, int y )
 {
     int bits = 0;
-    /* PAFF threaded: the pair's two passes share the row arrays and run as
-     * concurrent pool jobs, so rows of the opposite parity are live writes
-     * of the sibling pass.  Sum only this pass's parity rows (the pass's
-     * own writes) to keep the total timing-independent.  At --threads 1
-     * the sibling field is already final, so the original full sum is kept
-     * (byte-identity). */
-    int step = (FIELD_PIC && h->i_thread_frames > 1) ? 2 : 1;
+    /* PAFF threaded: the pair's two passes share the row arrays and run
+     * as concurrent pool jobs, so rows of the opposite parity are live
+     * writes of the sibling pass.  Sum only this pass's parity rows (the
+     * pass's own writes) to keep the total timing-independent.  At
+     * --threads 1 the sibling field is already final, so the original
+     * full sum is kept (byte-identity).  paff-sliced-threads (D6): the
+     * same parity-only sum applies -- a slice thread's band owns only
+     * its parity's rows, and the row-VBV budget is field-granular (D4).
+     * The gate must NOT be a bare FIELD_PIC: the t1 step-1 sum is
+     * load-bearing for non-sliced byte-identity. */
+    int step = (FIELD_PIC && (h->i_thread_frames > 1 || h->param.b_sliced_threads)) ? 2 : 1;
     for( int i = h->i_threadslice_start; i <= y; i += step )
         bits += h->fdec->i_row_bits[i];
     return bits;
@@ -1712,7 +1716,16 @@ static float predict_row_size_to_end( x264_t *h, int y, float qp )
 {
     float qscale = qp2qscale( qp );
     float bits = 0;
-    for( int i = y+1; i < h->i_threadslice_end; i++ )
+    /* paff-sliced-threads (D6): a sliced field pass budgets per FIELD
+     * (D4), so the remaining-size prediction sums only own-parity rows
+     * of the band: start at y+2 (y+1 is the SIBLING parity's row -- a
+     * naive step-2 from y+1 would sum the wrong field's rows) and step
+     * 2.  Non-sliced modes keep the contiguous sum: at --threads 1 the
+     * pair-level plan (and its frozen byte-identity) covers both
+     * parities, and the frame-threaded pass keeps the landed snapshot
+     * semantics. */
+    int step = 1 + (FIELD_PIC && h->param.b_sliced_threads);
+    for( int i = y+1 + (FIELD_PIC && h->param.b_sliced_threads); i < h->i_threadslice_end; i += step )
         bits += predict_row_size( h, i, qscale );
     return bits;
 }
@@ -1830,7 +1843,7 @@ int x264_ratecontrol_mb( x264_t *h, int bits )
         rc->qpm -= step_size;
         float b2 = bits_so_far + predict_row_size_to_end( h, y, rc->qpm ) + size_of_other_slices;
         while( rc->qpm > qp_min && rc->qpm < prev_row_qp
-               && (rc->qpm > h->fdec->f_row_qp[(FIELD_PIC && h->i_thread_frames > 1) ? h->i_threadslice_start : 0] || rc->single_frame_vbv)
+               && (rc->qpm > h->fdec->f_row_qp[(FIELD_PIC && (h->i_thread_frames > 1 || h->param.b_sliced_threads)) ? h->i_threadslice_start : 0] || rc->single_frame_vbv)
                && (b2 < max_frame_size)
                && ((b2 < rc->frame_size_planned * 0.8f) || (b2 < b_max)) )
         {
@@ -2930,13 +2943,32 @@ void x264_threads_distribute_ratecontrol( x264_t *h )
     {
         x264_t *t = h->thread[i];
         if( t != h )
+        {
             memcpy( t->rc, rc, offsetof(x264_ratecontrol_t, row_pred) );
+            /* paff-sliced-threads (D5): the pair-level QP accumulators are
+             * zeroed once per pair by ratecontrol_start, but sliced PAFF
+             * runs two distribute/merge cycles per pair -- without this,
+             * the pass-1 distribute copies the pass-0 accumulated base
+             * into every worker and the merge adds it back once per
+             * worker (an N-fold double count in the pair's average-QP
+             * statistics, poisoning 2-pass stats).  Zero them in each
+             * non-main worker: merge folds only i >= 1, and h's own rc
+             * carries the running pair total, so the sum stays exact. */
+            if( FIELD_PIC )
+            {
+                t->rc->qpa_rc = 0;
+                t->rc->qpa_aq = 0;
+            }
+        }
         t->rc->row_pred = t->rc->row_preds[h->sh.i_type];
         /* Calculate the planned slice size. */
         if( rc->b_vbv && rc->frame_size_planned )
         {
             int size = 0;
-            for( row = t->i_threadslice_start; row < t->i_threadslice_end; row++ )
+            /* paff-sliced-threads (D6): a field pass's band covers every
+             * second frame-coordinate row (start is own-parity by
+             * construction, end is one past the last coded row). */
+            for( row = t->i_threadslice_start; row < t->i_threadslice_end; row += 1+FIELD_PIC )
                 size += h->fdec->i_row_satd[row];
             t->rc->slice_size_planned = predict_size( &rc->pred[h->sh.i_type + (i+1)*5], qscale, size );
         }
@@ -2964,6 +2996,76 @@ void x264_threads_distribute_ratecontrol( x264_t *h )
     }
 }
 
+/* paff-sliced-threads (D4): scale the pair-level row-VBV plan to the
+ * current FIELD pass, called from threaded_slices_write before the
+ * distribute.  The row-VBV plan covers the PAIR, so the sliced
+ * normalization and the per-row guards would see a doubled budget.
+ * Pass 0 gets the pair plan scaled by its parity's share of the row SATD
+ * (known for the whole frame before dispatch); pass 1 gets the exact
+ * leftover (pair plan minus pass-0 actual bits -- available because pass
+ * 0 has fully completed; the units are the pass-0 stat.frame sum of
+ * tex+mv+misc, the units the plan and the row predictors live in),
+ * floored at 5% of the pair plan so an overshooting first field cannot
+ * hand the normalization a zero/negative plan (NaN-prone trust-coefficient
+ * division, garbage size_of_other_slices_planned).  With the floor the
+ * arithmetic stays in its normal regime and an exhausted pair budget
+ * still drives the second field to qp_absolute_max through the normal
+ * row-VBV loops.  frame_size_maximum is scaled by the same factor; the
+ * pair plan is restored on h after the pass's join (update_vbv's
+ * plan-error tracker integrates bits - frame_size_planned at pair end).
+ * One X264_LOG_DEBUG line per field budget: the budgets have no API/log
+ * surface otherwise, and the test matrix reads them for the budget-sum
+ * assertion. */
+void x264_paff_slice_field_budget( x264_t *h, int pass )
+{
+    x264_ratecontrol_t *rc = h->rc;
+    if( !rc->b_vbv || rc->frame_size_planned <= 0 )
+        return;
+
+    double pair_plan = rc->frame_size_planned;
+    double pair_maximum = rc->frame_size_maximum;
+    double field_plan;
+
+    if( !pass )
+    {
+        int parity = h->sh.b_bottom_field;
+        int64_t pair_satd = 0, pass_satd = 0;
+        for( int y = 0; y < h->mb.i_mb_height; y++ )
+        {
+            pair_satd += h->fdec->i_row_satd[y];
+            if( (y & 1) == parity )
+                pass_satd += h->fdec->i_row_satd[y];
+        }
+        double share = pair_satd ? (double)pass_satd / pair_satd : 0.5;
+        field_plan = pair_plan * share;
+    }
+    else
+    {
+        field_plan = pair_plan - h->fdec->i_field_bits[0];
+        if( field_plan < pair_plan * 0.05 )
+            field_plan = pair_plan * 0.05;
+    }
+
+    h->paff_slice_pair_plan = pair_plan;
+    h->paff_slice_pair_maximum = pair_maximum;
+    rc->frame_size_maximum = pair_maximum * (field_plan / pair_plan);
+    rc->frame_size_planned = field_plan;
+    x264_log( h, X264_LOG_DEBUG, "paff field budget: pass %d plan %.0f bits (pair plan %.0f)\n",
+              pass, field_plan, pair_plan );
+}
+
+/* paff-sliced-threads (D4): restore the pair-level plan/max after the
+ * pass's join (see x264_paff_slice_field_budget). */
+void x264_paff_slice_restore_pair_plan( x264_t *h )
+{
+    x264_ratecontrol_t *rc = h->rc;
+    if( rc->b_vbv && h->paff_slice_pair_plan > 0 )
+    {
+        rc->frame_size_planned = h->paff_slice_pair_plan;
+        rc->frame_size_maximum = h->paff_slice_pair_maximum;
+    }
+}
+
 void x264_threads_merge_ratecontrol( x264_t *h )
 {
     x264_ratecontrol_t *rc = h->rc;
@@ -2976,10 +3078,13 @@ void x264_threads_merge_ratecontrol( x264_t *h )
         if( h->param.rc.i_vbv_buffer_size )
         {
             int size = 0;
-            for( int row = t->i_threadslice_start; row < t->i_threadslice_end; row++ )
+            /* paff-sliced-threads (D6): same stride-2 band rows as the
+             * distribute; the band's MB count is half the contiguous
+             * row span. */
+            for( int row = t->i_threadslice_start; row < t->i_threadslice_end; row += 1+FIELD_PIC )
                 size += h->fdec->i_row_satd[row];
             int bits = t->stat.frame.i_mv_bits + t->stat.frame.i_tex_bits + t->stat.frame.i_misc_bits;
-            int mb_count = (t->i_threadslice_end - t->i_threadslice_start) * h->mb.i_mb_width;
+            int mb_count = ((t->i_threadslice_end - t->i_threadslice_start + FIELD_PIC) / (1+FIELD_PIC)) * h->mb.i_mb_width;
             update_predictor( &rc->pred[h->sh.i_type+(i+1)*5], qp2qscale( rct->qpa_rc/mb_count ), size, bits );
         }
         if( !i )

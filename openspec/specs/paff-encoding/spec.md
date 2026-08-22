@@ -31,10 +31,22 @@ both are requested.
 - **THEN** encoder initialization fails with a validation error
 
 #### Scenario: Threading restricted under PAFF
-- **WHEN** PAFF is enabled while sliced threads are requested
+- **WHEN** PAFF is enabled together with sliced threads and any explicit
+  sub-slicing option (`--slice-max-size`, `--slice-max-mbs`, or
+  `--slices`): slice-max-size restarts recode earlier rows (breaking the
+  row-monotonicity assumption of the row-level ratecontrol guarantees),
+  and slice-max-mbs/slices boundary arithmetic assumes a contiguous
+  raster that field-picture bands do not have
 - **THEN** encoder initialization fails with a validation error naming the
-  unsupported combination; requesting frame threads (`--threads N`, N > 1)
-  is accepted and enables frame-threaded PAFF encoding
+  unsupported combination; PAFF with frame threads (`--threads N`, N > 1)
+  or with sliced threads alone (`--sliced-threads --threads N`) is accepted
+
+#### Scenario: Explicit MB/count slicing rejected under PAFF
+- **WHEN** PAFF is enabled together with `--slice-max-mbs` or `--slices`,
+  at any thread count
+- **THEN** encoder initialization fails with a validation error naming the
+  unsupported combination (previously this silently produced empty
+  output); `--slice-max-size` without sliced threads remains accepted
 
 ### Requirement: Complementary field pairs per access unit
 
@@ -256,17 +268,32 @@ Under PAFF, rate control SHALL keep frame-level QP decisions while emitting a QP
 per coded field (each field picture carries its own slice header and therefore
 its own QP), and SHALL account bits per field for ABR/CBR/CRF and 2-pass modes.
 
+Under PAFF with slice-based threading, the row-level VBV budget SHALL be
+field-granular: the first field pass SHALL receive the pair-level planned
+frame size scaled by its parity's share of the pair's measured complexity
+(SATD), and the second field pass SHALL receive the pair plan minus the
+first pass's actual coded bits. Pair-level ratecontrol accumulators (average
+QP sums) SHALL be accumulated exactly once per pair across the two passes'
+distribute/merge cycles.
+
 #### Scenario: CBR PAFF stream
 - **WHEN** a PAFF stream is encoded in CBR mode
 - **THEN** the output respects the target bitrate and VBV constraints at field
   access-unit granularity
 
-### Requirement: Threading behavior under PAFF
+#### Scenario: Sliced CBR PAFF field budgets
+- **WHEN** a PAFF stream is encoded with `--sliced-threads --threads N` in
+  CBR+VBV mode
+- **THEN** row-level VBV decisions within each field pass are made against
+  that field's budget (satd share for the first field, leftover for the
+  second), the pair's average-QP accounting equals the sum over both fields
+  exactly once, and the output passes the Annex C CPB simulation
+
+### Requirement: Threaded encoding under PAFF
 
 Under PAFF with frame threading, each field pass of a complementary field
 pair SHALL be coded as its own pool job (two jobs per pair, two frame-thread
-slots per pair), and slice-based threading SHALL be rejected at validation
-time with a clear error. Frame-threaded PAFF encoding (`--threads N`, N > 1)
+slots per pair). Frame-threaded PAFF encoding (`--threads N`, N > 1)
 SHALL be deterministic at a fixed thread count: two runs with identical
 parameters and identical N SHALL produce byte-identical output, matching the
 frame-thread determinism invariant of progressive encoding (including the
@@ -289,10 +316,31 @@ between the passes is thereby removed; its work is rescheduled into the
 first pass's row cadence, and `--threads 1` output SHALL remain
 byte-identical to the pre-change single-threaded output (pure rescheduling).
 
-#### Scenario: Slice threads rejected
-- **WHEN** the user requests PAFF together with slice-based threading
-- **THEN** encoder initialization fails with a validation error naming the
-  unsupported combination
+Under PAFF with slice-based threading (`--sliced-threads --threads N`,
+N > 1), frame threading SHALL be off (one pair in flight, monolithic pair
+driver) and each field pass SHALL be split into N horizontal bands, one
+slice per band, coded in parallel by the slice threads. A band SHALL cover
+a contiguous range of the field's own MB rows (every second frame-coordinate
+MB row of the pass's parity), and slice headers SHALL carry the field-raster
+addresses required for field pictures. Deblocking across band boundaries
+SHALL be disabled within each field picture
+(`i_disable_deblocking_filter_idc = 2`), exactly as in progressive sliced
+threading. Reference-data filtering (field-layout copy, borders,
+half-pixel interpolation) for a pass SHALL produce results identical to the
+single-threaded PAFF row-cadence pipeline; the number of slice threads
+SHALL be capped so that a band is never thinner than four field MB rows
+(half the progressive cap, since a field has half the frame's MB rows).
+
+Slice-threaded PAFF with CBR+VBV rate control is NOT required to be
+byte-deterministic at a fixed thread count: it inherits the documented
+progressive sliced-threads exception (cross-slice reads of live ratecontrol
+state are timing-dependent). Slice-threaded PAFF with CRF, CQP, or ABR
+without VBV SHALL be byte-identical across repeat runs at a fixed thread
+count. No slice-threaded output is required to be byte-identical to any
+non-sliced output of the same parameters (slice headers, CABAC reinit, and
+disabled cross-slice deblocking change the bitstream by construction);
+every slice-threaded output SHALL remain a conformant, reference-decodable
+PAFF bitstream.
 
 #### Scenario: Frame threads work
 - **WHEN** a PAFF stream is encoded with `--threads N` (N > 1) and with
@@ -307,16 +355,6 @@ byte-identical to the pre-change single-threaded output (pure rescheduling).
 - **WHEN** a PAFF stream is encoded with `--threads 1` before and after the
   sweep-to-cadence rescheduling
 - **THEN** the outputs are byte-identical
-
-#### Scenario: Frame threads deferred
-- **WHEN** pass-granular PAFF frame threading cannot be validated (deadlock,
-  nondeterminism at fixed N, conformance failure, quality regression beyond
-  the progressive-threading tolerance, or a data race surfaced during
-  implementation)
-- **THEN** the change is not merged: the pair-granular threading of the
-  prior implementation (or the forced `i_threads = 1` bailout, whichever is
-  the last-known-good state) stays in place until the failure is fixed, and
-  sliced threads remain rejected in all cases
 
 #### Scenario: Reference readiness gating
 - **WHEN** a dependent job — a later pair's pass, or the pair's own second
@@ -334,6 +372,40 @@ byte-identical to the pre-change single-threaded output (pure rescheduling).
   the first field's access unit followed by the second field's access unit,
   with pair-level statistics, rate control and DPB marking applied once per
   pair, identical to the single-threaded structure
+
+#### Scenario: Sliced threads accepted and conformant
+- **WHEN** a PAFF stream is encoded with `--sliced-threads --threads N`
+  (N > 1) across TFF/BFF, I/P/B slice-type combinations, CRF/CQP/2-pass/
+  CBR rate-control modes, and weighted prediction (`--weightp 1/2`) on P
+  fields
+- **THEN** every field picture is coded as N slices with field-raster
+  addressing, cross-slice deblocking is disabled within each field picture,
+  and every output decodes bit-exactly against the encoder reconstruction
+  in the reference decoder (JM)
+
+#### Scenario: Sliced threads non-VBV byte-repeat
+- **WHEN** a PAFF stream is encoded with `--sliced-threads --threads N` in
+  CRF, CQP, or ABR-without-VBV mode, repeatedly with identical parameters
+- **THEN** all repeat runs produce byte-identical output
+
+#### Scenario: Sliced threads VBV compliance without byte-determinism
+- **WHEN** a PAFF stream is encoded with `--sliced-threads --threads N` in
+  CBR+VBV mode with `--nal-hrd cbr`, using a VBV configuration under which
+  the equivalent non-sliced PAFF run (same content, same rate-control
+  parameters) produces no buffer underflow warnings
+- **THEN** the output passes the Annex C CPB simulation and the sliced run
+  produces no more buffer underflow warnings than the non-sliced reference
+  run, while byte-determinism at a fixed thread count is not required (the
+  progressive sliced-threads exception).  Deliberately undersized-buffer
+  robustness (forcing a first-field budget overshoot against the budget
+  floor) is exercised by the test plan as a robustness cell, not by this
+  scenario
+
+#### Scenario: Sliced threads band cap
+- **WHEN** a PAFF stream is encoded with `--sliced-threads --threads N`
+  where N exceeds four field MB rows per thread
+- **THEN** the thread count is clamped so that each band covers at least
+  four field MB rows (half the progressive cap)
 
 ### Requirement: IDR field pair structure
 

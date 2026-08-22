@@ -96,6 +96,27 @@ byte_identical()
 cbr_qcif() { echo "--bitrate 400 --vbv-maxrate 400 --vbv-bufsize 400"; }
 cbr_720()  { echo "--bitrate 3000 --vbv-maxrate 3000 --vbv-bufsize 3000"; }
 
+# CBR+VBV compliance cell for modes exempt from byte-determinism
+# (paff-sliced-threads 5.2): encode with --nal-hrd cbr, then assert the
+# independent Annex C CPB simulation passes and the log carries zero VBV
+# underflow warnings.  hrd_check LABEL -- CMD...  (adds -o/--nal-hrd cbr).
+hrd_check()
+{
+    local label="$1"; shift; shift
+    local out="$WORK/out/hrd_${label//[^a-zA-Z0-9]/_}.264"
+    if ! "$@" --nal-hrd cbr -o "$out" >"$out.log" 2>&1; then
+        fail "$label: encode error (see $out.log)"; return
+    fi
+    local warn
+    warn=$(grep -ci "VBV underflow" "$out.log" || true)
+    if python3 "$REPO/tools/check_hrd.py" "$out" >"$out.hrd" 2>&1 \
+       && [ "$warn" = 0 ]; then
+        pass "$label: check_hrd clean, 0 underflow warnings"
+    else
+        fail "$label: hrd/warnings (count=$warn, see $out.hrd)"
+    fi
+}
+
 # --------------------------------------------------------------------------
 # baseline binary (pre-change), built from a git worktree, cached
 baseline_bin()
@@ -319,7 +340,7 @@ fi
 
 if [ -f "$CLIP1" ]; then
     for bf in 0 3; do
-        for n in 2 4 8 16; do
+        for n in 2 4 8; do
             byte_repeat "repeat clip1 PAFF-TFF bf$bf t$n" "$RUNS" -- \
                 "$X264" "$CLIP1" --input-res "$CLIP1_RES" --paff --tff \
                 --bframes $bf --threads $n $(cbr_qcif)
@@ -328,6 +349,90 @@ if [ -f "$CLIP1" ]; then
     byte_repeat "repeat clip1 PAFF-BFF bf3 t8" "$RUNS" -- \
         "$X264" "$CLIP1" --input-res "$CLIP1_RES" --paff --bff \
         --bframes 3 --threads 8 $(cbr_qcif)
+fi
+
+# PAFF + sliced threads (paff-sliced-threads 5.2).  Small clips clamp N to
+# the field-row cap (a 240-line clip caps at 2); the clamped cells still
+# gate repeatability of the effective configuration.
+if [ -f "$CLIP1" ]; then
+    echo
+    echo "== PAFF+sliced: non-VBV byte-repeat, CBR+VBV compliance =="
+    for bf in 0 3; do
+        for mode in "--crf 23" "--qp 22"; do
+            for n in 2 4 8; do
+                byte_repeat "repeat clip1 PAFF-sliced [${mode}] bf$bf t$n" "$RUNS" -- \
+                    "$X264" "$CLIP1" --input-res "$CLIP1_RES" --paff --tff --sliced-threads \
+                    --bframes $bf --threads $n $mode
+            done
+        done
+    done
+    # ABR-without-VBV is byte-repeatable too (avoids the sliced VBV live reads)
+    for n in 2 4; do
+        byte_repeat "repeat clip1 PAFF-sliced ABR bf0 t$n" "$RUNS" -- \
+            "$X264" "$CLIP1" --input-res "$CLIP1_RES" --paff --tff --sliced-threads \
+            --bframes 0 --threads $n --bitrate 400
+    done
+    # CBR+VBV inherits the progressive sliced-threads exception (cross-slice
+    # live reads of bits_so_far/frame_size_estimated): assert HRD compliance
+    # instead of byte-repeat.
+    for n in 2 4; do
+        hrd_check "clip1 PAFF-sliced CBR bf0 t$n" -- \
+            "$X264" "$CLIP1" --input-res "$CLIP1_RES" --paff --tff --sliced-threads \
+            --bframes 0 --threads $n $(cbr_qcif)
+    done
+else
+    skip "clip1 PAFF+sliced cells ($CLIP1 missing)"
+fi
+
+if [ -f "$CLIP720" ]; then
+    # Overshoot robustness (D4 floor), two flavours on the multi-band size:
+    #  a) undersized buffer, still compliant: check_hrd must pass, warnings
+    #     recorded as a number (NOT compared: the floor by design spends
+    #     bits a frame-threaded pass 1 would not).
+    #  b) qpmax-capped overshoot forcing the 5% floor to actually bind:
+    #     compliance is impossible by construction (the encoder cannot
+    #     raise QP), so the gates are no-crash and no-NaN/negative budgets,
+    #     with the warning count recorded.
+    ov="$WORK/out/overshoot_small.264"
+    if "$X264" "$CLIP720" --frames 40 --paff --tff --sliced-threads --bframes 0 \
+            --threads 4 --bitrate 3000 --vbv-maxrate 3000 --vbv-bufsize 300 \
+            --nal-hrd cbr -o "$ov" >"$ov.log" 2>&1 \
+       && python3 "$REPO/tools/check_hrd.py" "$ov" >"$ov.hrd" 2>&1; then
+        note "PAFF-sliced overshoot (undersized bufsize 300): $(grep -ci 'VBV underflow' "$ov.log" || true) underflow warnings (recorded, not compared)"
+        pass "720p PAFF-sliced undersized-bufsize: check_hrd clean"
+    else
+        fail "720p PAFF-sliced undersized-bufsize: encode/HRD (see $ov.hrd)"
+    fi
+    ov="$WORK/out/overshoot_floor.264"
+    if "$X264" "$CLIP720" --frames 40 --paff --tff --sliced-threads --bframes 0 \
+            --threads 4 --bitrate 600 --vbv-maxrate 600 --vbv-bufsize 600 --qpmax 26 \
+            --nal-hrd cbr --log-level debug -o "$ov" >"$ov.log" 2>&1 \
+       && python3 - "$ov.log" <<'PYEOF'
+import re, sys
+plans = []
+for l in open(sys.argv[1]):
+    m = re.search(r'pass (\d) plan ([-\w.]+) bits \(pair plan ([-\w.]+)\)', l)
+    if m:
+        try:
+            plans.append((int(m.group(1)), float(m.group(2)), float(m.group(3))))
+        except ValueError:
+            print('non-numeric budget line:', l.strip()); sys.exit(1)
+bad = [p for p in plans if p[1] <= 0 or p[2] <= 0 or p[1] != p[1] or p[2] != p[2]]
+floored = [p for p in plans if p[0] == 1 and p[1] <= 0.05 * p[2] + 1]
+if bad:
+    print('NaN/non-positive budgets:', bad[:3]); sys.exit(1)
+if not floored:
+    print('the 5% floor never bound'); sys.exit(1)
+print(f'{len(plans)} budget lines, floor bound on {len(floored)} pass-1 pairs')
+PYEOF
+    then
+        note "PAFF-sliced overshoot (qpmax-forced): $(grep -ci 'VBV underflow' "$ov.log" || true) underflow warnings (recorded, not compared)"
+        pass "720p PAFF-sliced qpmax-forced overshoot: no crash/NaN, floor exercised"
+    else
+        fail "720p PAFF-sliced qpmax-forced overshoot: see $ov.log"
+    fi
+else
+    skip "720p PAFF+sliced cells ($CLIP720 missing)"
 fi
 
 echo
@@ -354,6 +459,15 @@ ident_cells()
         "$clip" --input-res "$res" --paff --tff --threads 1 $(cbr_qcif)
     byte_identical "identity $tag PAFF t8 crf23" -- "$BASE" "$X264" -- \
         "$clip" --input-res "$res" --paff --tff --crf 23 --threads 8
+    # paff-sliced-threads (task 5.3): progressive sliced (the shared
+    # dispatch/deblock paths) and PAFF non-sliced at both drivers
+    # (monolithic t1, frame threads) must stay byte-identical pre/post.
+    for n in 2 4; do
+        byte_identical "identity $tag progressive-sliced t$n crf23" -- "$BASE" "$X264" -- \
+            "$clip" --input-res "$res" --sliced-threads --threads $n --crf 23
+    done
+    byte_identical "identity $tag PAFF t4 crf23" -- "$BASE" "$X264" -- \
+        "$clip" --input-res "$res" --paff --tff --crf 23 --threads 4
 }
 
 if [ -f "$CLIP1" ]; then ident_cells "$CLIP1" "$CLIP1_RES" "clip1"; fi

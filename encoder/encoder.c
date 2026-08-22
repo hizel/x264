@@ -504,7 +504,28 @@ static int validate_parameters( x264_t *h, int b_open )
         }
         if( h->param.b_sliced_threads )
         {
-            x264_log( h, X264_LOG_ERROR, "PAFF does not support sliced threads\n" );
+            /* paff-sliced-threads (D8): slice bands are the only supported
+             * sub-slicing under PAFF+sliced.  slice-max-size row-recode
+             * restarts break the row-monotonicity assumption of the row
+             * ratecontrol guarantees (same caveat as the threaded-VBV
+             * guarantee); slice-max-mbs/--slices boundary arithmetic in
+             * slices_write assumes a contiguous raster, which the parity
+             * bands of a field picture do not have. */
+            if( h->param.i_slice_max_size || h->param.i_slice_max_mbs || h->param.i_slice_count > 0 )
+            {
+                x264_log( h, X264_LOG_ERROR, "PAFF + sliced-threads does not support --slice-max-size, --slice-max-mbs or --slices (slice threads make one slice per band)\n" );
+                return -1;
+            }
+        }
+        else if( h->param.i_slice_max_mbs || h->param.i_slice_count > 0 )
+        {
+            /* Pre-existing bug (paff-sliced-threads D8 drive-by): the
+             * contiguous-raster slice boundary arithmetic of slice-max-mbs
+             * and --slices is incompatible with field pictures at ANY thread
+             * count -- without this rejection it silently produced EMPTY
+             * output with exit code 0.  slice-max-size stays accepted (its
+             * row-recode restarts are raster-agnostic). */
+            x264_log( h, X264_LOG_ERROR, "PAFF does not support --slice-max-mbs or --slices (field pictures use parity row bands)\n" );
             return -1;
         }
         /* D8/D2: rate-control soundness boundary.  Rate control runs once
@@ -634,7 +655,21 @@ static int validate_parameters( x264_t *h, int b_open )
         /* Avoid absurdly small thread slices as they can reduce performance
          * and VBV compliance.  Capped at an arbitrary 4 rows per thread. */
         if( h->param.b_sliced_threads )
-            h->param.i_threads = X264_MIN( h->param.i_threads, max_sliced_threads );
+        {
+            /* paff-sliced-threads (D2): a field picture has half the frame's
+             * MB rows, so the cap is computed from FIELD rows to keep the
+             * 4-rows-per-band floor.  Local value only: the shared
+             * max_sliced_threads above also clamps i_lookahead_threads in
+             * all modes, and the lookahead is frame-granular. */
+            int max_field_sliced_threads = X264_MAX( 1, ((h->param.i_height/2+15)/16) / 4 );
+            if( h->param.b_paff && h->param.i_threads > max_field_sliced_threads )
+            {
+                x264_log( h, X264_LOG_WARNING, "too many threads for field size -- reducing to %d\n", max_field_sliced_threads );
+                h->param.i_threads = max_field_sliced_threads;
+            }
+            else
+                h->param.i_threads = X264_MIN( h->param.i_threads, max_sliced_threads );
+        }
     }
     h->param.i_threads = x264_clip3( h->param.i_threads, 1, X264_THREAD_MAX );
     if( h->param.i_threads == 1 )
@@ -3144,9 +3179,30 @@ static void paff_reference_band( x264_t *h, int e, int b_end, int parity )
  * sentinel of each pass are in paff_pass_finish. */
 static void paff_filter_row( x264_t *h, int mb_y )
 {
-    int b_deblock = h->sh.i_disable_deblocking_filter_idc != 1;
+    int b_deblock;
     if( mb_y - 2 < h->i_threadslice_start )
         return;
+    /* paff-sliced-threads (D3): no cadence deblock and no reference-band
+     * work here.  Deblock is row-deterministic and band-local (idc=2: the
+     * cross-band edges are not filtered), so ALL of it moves to the slice
+     * end without changing a single output pixel; the reference sweep for
+     * the coding parity runs post-join on the main context, and the row
+     * readiness broadcast is a frame-threads mechanism (inactive at
+     * i_thread_frames == 1).  Only the intra-border-backup rotation
+     * remains, at the monolithic cadence (the same rows, the same gate:
+     * from the band's second own-parity row on), because intra
+     * prediction of the next own row reads it. */
+    if( h->param.b_sliced_threads )
+    {
+        if( !h->mb.b_reencode_mb )
+            for( int i = 0; i < 3; i++ )
+            {
+                XCHG( pixel *, h->intra_border_backup[0][i], h->intra_border_backup[3][i] );
+                XCHG( pixel *, h->intra_border_backup[1][i], h->intra_border_backup[4][i] );
+            }
+        return;
+    }
+    b_deblock = h->sh.i_disable_deblocking_filter_idc != 1;
     b_deblock &= h->fdec->b_kept_as_ref || h->param.b_full_recon || h->param.psz_dump_yuv;
     if( b_deblock )
         x264_frame_deblock_row( h, mb_y - 2 );
@@ -3752,28 +3808,58 @@ cont:
                                   - h->stat.frame.i_tex_bits
                                   - h->stat.frame.i_mv_bits;
         if( FIELD_PIC )
-            paff_filter_row( h, h->mb.i_mb_height + h->sh.b_bottom_field );
+        {
+            if( h->param.b_sliced_threads )
+            {
+                /* paff-sliced-threads (D3): (a) NO final paff_filter_row --
+                 * it would deblock a foreign row and fire reference-band
+                 * work; (b) the thread deblocks ALL its own band rows
+                 * ([i_threadslice_start, i_threadslice_end), stride 2)
+                 * BEFORE signalling completion -- the writes stay inside
+                 * the band (idc=2: cross-band edges are not filtered), so
+                 * they are race-free; (c) only the join signal of the
+                 * progressive sliced block is kept -- hpel and the
+                 * boundary-row wait are replaced by the post-join serial
+                 * reference sweep. */
+                int b_band_deblock = h->sh.i_disable_deblocking_filter_idc != 1
+                              && (h->fdec->b_kept_as_ref || h->param.b_full_recon || h->param.psz_dump_yuv);
+                if( b_band_deblock )
+                    for( int mb_y = h->i_threadslice_start; mb_y < h->i_threadslice_end; mb_y += 2 )
+                        x264_frame_deblock_row( h, mb_y );
+                x264_threadslice_cond_broadcast( h, 1 );
+            }
+            else
+                paff_filter_row( h, h->mb.i_mb_height + h->sh.b_bottom_field );
+        }
         else
+        {
             fdec_filter_row( h, h->i_threadslice_end, 0 );
 
-        if( h->param.b_sliced_threads )
-        {
-            /* Tell the main thread we're done. */
-            x264_threadslice_cond_broadcast( h, 1 );
-            /* Do hpel now */
-            for( int mb_y = h->i_threadslice_start; mb_y <= h->i_threadslice_end; mb_y++ )
-                fdec_filter_row( h, mb_y, 1 );
-            x264_threadslice_cond_broadcast( h, 2 );
-            /* Do the first row of hpel, now that the previous slice is done */
-            if( h->i_thread_idx > 0 )
+            if( h->param.b_sliced_threads )
             {
-                x264_threadslice_cond_wait( h->thread[h->i_thread_idx-1], 2 );
-                fdec_filter_row( h, h->i_threadslice_start + (1 << SLICE_MBAFF), 2 );
+                /* Tell the main thread we're done. */
+                x264_threadslice_cond_broadcast( h, 1 );
+                /* Do hpel now */
+                for( int mb_y = h->i_threadslice_start; mb_y <= h->i_threadslice_end; mb_y++ )
+                    fdec_filter_row( h, mb_y, 1 );
+                x264_threadslice_cond_broadcast( h, 2 );
+                /* Do the first row of hpel, now that the previous slice is done */
+                if( h->i_thread_idx > 0 )
+                {
+                    x264_threadslice_cond_wait( h->thread[h->i_thread_idx-1], 2 );
+                    fdec_filter_row( h, h->i_threadslice_start + (1 << SLICE_MBAFF), 2 );
+                }
             }
         }
 
         /* Free mb info after the last thread's done using it */
-        if( h->fdec->mb_info_free && (!h->param.b_sliced_threads || h->i_thread_idx == (h->param.i_threads-1)) )
+        /* paff-sliced-threads (D3d): NO worker frees -- pass 0's last
+         * worker would free the pair-shared fdec->mb_info that pass 1's
+         * analysis still reads (analyse.c fast-skip/CONSTANT-flag reset);
+         * the main context frees once after the second pass's join
+         * (paff_pair_write). */
+        if( h->fdec->mb_info_free && !(FIELD_PIC && h->param.b_paff && h->param.b_sliced_threads)
+         && (!h->param.b_sliced_threads || h->i_thread_idx == (h->param.i_threads-1)) )
         {
             h->fdec->mb_info_free( h->fdec->mb_info );
             h->fdec->mb_info = NULL;
@@ -3874,6 +3960,12 @@ fail:
 static int threaded_slices_write( x264_t *h )
 {
     int round_bias = h->param.i_avcintra_class ? 0 : h->param.i_slice_count/2;
+    int field_pic = FIELD_PIC;
+    /* paff-sliced-threads: the pass index of this dispatch (TFF: pass ==
+     * parity; BFF: inverted), for the per-pass output, misc-bits and
+     * field-budget bookkeeping below. */
+    int pass = field_pic ? (h->param.b_tff ? h->sh.b_bottom_field : !h->sh.b_bottom_field) : 0;
+    int merge_base = 0;
 
     /* set first/last mb and sync contexts */
     for( int i = 0; i < h->param.i_threads; i++ )
@@ -3883,15 +3975,62 @@ static int threaded_slices_write( x264_t *h )
         {
             t->param = h->param;
             memcpy( &t->i_frame, &h->i_frame, offsetof(x264_t, rc) - offsetof(x264_t, i_frame) );
+            /* paff-sliced-threads (D3e): the per-frame worker output reset
+             * in x264_encoder_encode runs once per PAIR; reset the
+             * non-main workers at EVERY pass dispatch so pass 1's merge
+             * does not re-copy pass 0's worker NALs.  h (thread[0]) keeps
+             * its monolithic i_nal/bs across the pair -- resetting it
+             * would clobber the merged pass-0 AU and the pass-1 SEI
+             * written on h before this dispatch.  No per-pass bs_init
+             * either: the workers' bitstream buffers must keep growing
+             * across the pair (see the stash below). */
+            if( field_pic )
+                t->out.i_nal = 0;
         }
         int height = h->mb.i_mb_height >> PARAM_INTERLACED;
-        t->i_threadslice_start = ((height *  i    + round_bias) / h->param.i_threads) << PARAM_INTERLACED;
-        t->i_threadslice_end   = ((height * (i+1) + round_bias) / h->param.i_threads) << PARAM_INTERLACED;
+        if( FIELD_PIC )
+        {
+            /* paff-sliced-threads (D2): a field pass codes every second
+             * frame-coordinate MB row; thread i gets field rows [b0,b1) of
+             * the pass's parity.  start is the band's first coded row; end
+             * is numerically one past the band's last coded row (last coded
+             * = end-1 = parity+2*(b1-1)), so the end-of-slice flush gate
+             * i_last_mb == i_threadslice_end*width-1 fires, and the last
+             * band's end equals the monolithic pass value
+             * i_mb_height-1+parity exactly. */
+            int parity = h->sh.b_bottom_field;
+            int field_rows = h->mb.i_mb_height >> 1;
+            int b0 = (field_rows *  i    + round_bias) / h->param.i_threads;
+            int b1 = (field_rows * (i+1) + round_bias) / h->param.i_threads;
+            t->i_threadslice_start = parity + 2*b0;
+            t->i_threadslice_end   = parity + 2*b1 - 1;
+        }
+        else
+        {
+            t->i_threadslice_start = ((height *  i    + round_bias) / h->param.i_threads) << PARAM_INTERLACED;
+            t->i_threadslice_end   = ((height * (i+1) + round_bias) / h->param.i_threads) << PARAM_INTERLACED;
+        }
         t->sh.i_first_mb = t->i_threadslice_start * h->mb.i_mb_width;
         t->sh.i_last_mb  =   t->i_threadslice_end * h->mb.i_mb_width - 1;
     }
 
     x264_analyse_weight_frame( h, h->mb.i_mb_height*16 + 16 );
+    if( h->param.b_paff )
+    {
+        /* paff-sliced-threads (D9): the per-pass weighted-reference
+         * pointers live in the slot-local shadow, OUTSIDE the
+         * i_frame..rc sync region; publish h's shadow (set up by
+         * weighted_pred_init and scaled just above) to the workers.
+         * Workers read thread 0's weight buffers read-only, exactly as
+         * progressive sliced threads read fenc->weighted; the pair's
+         * passes run sequentially on one job, so the interleaving race
+         * the shadow exists for cannot occur here. */
+        for( int i = 1; i < h->param.i_threads; i++ )
+            memcpy( h->thread[i]->paff_weighted, h->paff_weighted, sizeof(h->paff_weighted) );
+    }
+
+    if( field_pic )
+        x264_paff_slice_field_budget( h, pass );
 
     x264_threads_distribute_ratecontrol( h );
 
@@ -3909,8 +4048,40 @@ static int threaded_slices_write( x264_t *h )
     for( int i = 0; i < h->param.i_threads; i++ )
         x264_threadslice_cond_wait( h->thread[i], 1 );
 
+    if( field_pic )
+    {
+        /* paff-sliced-threads: recycle the pool job slots after EVERY
+         * pass.  The per-frame threadpool_wait_all in x264_encoder_encode
+         * runs once per PAIR, but the dispatch above runs twice -- without
+         * this, pass 1's threadpool_run finds the bounded uninit list
+         * empty and blocks forever.  The workers return right after the
+         * cond-1 broadcast (no post-signal filtering work under PAFF), so
+         * the wait is bounded by the signal. */
+        if( threadpool_wait_all( h ) < 0 )
+            return -1;
+
+        /* paff-sliced-threads (D3e): undo the pass-0 bytes that the pass-1
+         * end-of-slice misc accounting double-counts -- a worker's bs_pos
+         * spans both passes (no per-pass bs_init) and so does h's.  This
+         * MUST run before x264_threads_merge_ratecontrol: the merge's
+         * per-slice update_predictor consumes t->stat.frame.i_misc_bits,
+         * and a later correction would teach the predictors
+         * double-counted bits.  Workers (i > 0) subtract their bare
+         * pass-0 bs_pos (their i_nal was reset at the dispatch, so the
+         * pass-0 NAL overhead is not re-counted); h subtracts its
+         * pass-0 bs_pos + i_nal*NALU_OVERHEAD*8 captured post-merge (the
+         * shared_out_bits shape of the monolithic driver). */
+        if( pass )
+        {
+            for( int i = 1; i < h->param.i_threads; i++ )
+                h->thread[i]->stat.frame.i_misc_bits -= h->thread[i]->i_paff_slice_pass0_bs;
+            h->stat.frame.i_misc_bits -= h->i_paff_slice_pass0_base;
+        }
+    }
+
     x264_threads_merge_ratecontrol( h );
 
+    merge_base = h->out.i_nal;
     for( int i = 1; i < h->param.i_threads; i++ )
     {
         x264_t *t = h->thread[i];
@@ -3927,6 +4098,83 @@ static int threaded_slices_write( x264_t *h )
             h->stat.frame.i_ssd[j] += t->stat.frame.i_ssd[j];
         h->stat.frame.f_ssim += t->stat.frame.f_ssim;
         h->stat.frame.i_ssim_cnt += t->stat.frame.i_ssim_cnt;
+    }
+
+    if( field_pic )
+    {
+        int n_merged = h->out.i_nal - merge_base;
+        if( !pass )
+        {
+            /* paff-sliced-threads (D3e): record the pass-0 baselines
+             * (post-merge: h's NAL count includes the workers' slices),
+             * the second-AU boundary index, and take the merged worker
+             * slices OUT of h->out: they borrow the workers' bitstream
+             * buffers, which a mid-pass-1 realloc (the worker's own or
+             * h's) would strand.  The stash re-inserts them ahead of
+             * pass 1's NALs after the pass-1 join; i_paff_au_boundary
+             * keeps pointing at the second field's first NAL, whose
+             * final index equals this post-merge i_nal. */
+            h->i_paff_slice_pass0_base = bs_pos( &h->out.bs ) + h->out.i_nal*NALU_OVERHEAD*8;
+            for( int i = 1; i < h->param.i_threads; i++ )
+                h->thread[i]->i_paff_slice_pass0_bs = bs_pos( &h->thread[i]->out.bs );
+            h->out.i_paff_au_boundary = h->out.i_nal;
+            if( n_merged )
+            {
+                size_t payload = 0;
+                for( int i = 0; i < n_merged; i++ )
+                    payload += h->out.nal[merge_base+i].i_payload;
+                uint8_t *stash = x264_malloc( n_merged*sizeof(x264_nal_t) + payload );
+                if( !stash )
+                    return -1;
+                x264_nal_t *snal = (x264_nal_t *)stash;
+                uint8_t *blob = stash + n_merged*sizeof(x264_nal_t);
+                for( int i = 0; i < n_merged; i++ )
+                {
+                    x264_nal_t *nal = &h->out.nal[merge_base+i];
+                    memcpy( blob, nal->p_payload, nal->i_payload );
+                    snal[i] = *nal;
+                    snal[i].p_payload = blob;
+                    blob += nal->i_payload;
+                }
+                x264_free( h->paff_slice_stash );
+                h->paff_slice_stash = stash;
+                h->i_paff_slice_stash_count = n_merged;
+                h->i_paff_slice_stash_base = merge_base;
+                h->out.i_nal = merge_base;
+            }
+            else
+                /* Unreachable (every worker emits at least its slice
+                 * NAL), but do not let a previous pair's stash leak
+                 * into this pair's pass-1 re-insertion. */
+                h->i_paff_slice_stash_count = 0;
+        }
+        else
+        {
+            /* Re-insert pass-0's stashed slices ahead of pass 1's NALs
+             * (their payloads live in the stash, which no realloc can
+             * touch).  The stash allocation outlives the pair -- it is
+             * recycled at the next stash-out and freed at close, after
+             * the pair's output has been encapsulated. */
+            int n0 = h->i_paff_slice_stash_count;
+            if( n0 )
+            {
+                int base = h->i_paff_slice_stash_base;
+                int n1 = h->out.i_nal - base;
+                h->out.i_nal += n0;
+                while( h->out.i_nal >= h->out.i_nals_allocated )
+                    if( nal_check_buffer( h ) )
+                        return -1;
+                memmove( &h->out.nal[base+n0], &h->out.nal[base], n1*sizeof(x264_nal_t) );
+                memcpy( &h->out.nal[base], h->paff_slice_stash, n0*sizeof(x264_nal_t) );
+                h->out.i_nal = base + n0 + n1;
+            }
+        }
+        /* Restore the pair-level VBV plan on h (D4): update_vbv's
+         * plan-error tracker integrates bits - frame_size_planned at
+         * pair end, and the field-scaled leftover must not be left as
+         * the pair plan. */
+        if( field_pic )
+            x264_paff_slice_restore_pair_plan( h );
     }
 
     return 0;
@@ -4124,9 +4372,22 @@ static int paff_pass_code( x264_t *h, x264_paff_job_t *job, int pass, int *share
         if( nal_end( h ) )
             return -1;
     }
-    if( (intptr_t)slices_write( h ) )
+    if( h->param.b_sliced_threads )
+    {
+        if( threaded_slices_write( h ) )
+            return -1;
+        /* paff-sliced-threads (D3): serial post-join reference sweep for
+         * the coding parity -- the pre-threading full-pass shape: one
+         * paff_reference_band per field MB row (band-local plane_fld
+         * copy, borders, hpel), b_end on the last, single-threaded on
+         * the main context after the join.  No cross-thread pixel
+         * synchronization exists in this mode. */
+        for( int kb = 0; kb < h->mb.i_mb_height/2; kb++ )
+            paff_reference_band( h, 2*kb, kb == h->mb.i_mb_height/2 - 1, parity );
+    }
+    else if( (intptr_t)slices_write( h ) )
         return -1;
-    if( shared_out_bits )
+    if( shared_out_bits && !h->param.b_sliced_threads )
     {
         /* Monolithic driver only: out.bs spans BOTH field passes of the
          * pair, so slice_write's i_misc_bits at the end of pass 1 counts
@@ -4156,8 +4417,12 @@ static int paff_pass_code( x264_t *h, x264_paff_job_t *job, int pass, int *share
         + h->stat.frame.i_mv_bits + h->stat.frame.i_misc_bits;
     /* D15/D2 (paff-pass-threads): each pass generates its own parity's
      * reference data at row cadence and finishes it here (residual band
-     * + completion sentinel); the intermediate full-frame sweep is gone. */
-    paff_pass_finish( h, parity );
+     * + completion sentinel); the intermediate full-frame sweep is gone.
+     * paff-sliced-threads (D3): the sweep above already covered every
+     * band of the parity (b_end included), and the completion sentinel
+     * is a frame-threads mechanism (gated off at i_thread_frames == 1). */
+    if( !h->param.b_sliced_threads )
+        paff_pass_finish( h, parity );
     return 0;
 }
 
@@ -4211,6 +4476,16 @@ static void *paff_pair_write( x264_t *h )
     /* All entries in stat.frame are ints except for ssd/ssim. */
     for( size_t j = 0; j < (offsetof(x264_t,stat.frame.i_ssd) - offsetof(x264_t,stat.frame.i_mv_bits)) / sizeof(int); j++ )
         ((int*)&h->stat.frame)[j] += ((int*)&stat_first)[j];
+    /* paff-sliced-threads (D3d): no worker freed the pair-shared
+     * fdec->mb_info (pass 1's analysis still read it); free it now, once,
+     * after the second pass's join -- the app callback fires once per
+     * pair, matching the non-sliced drivers. */
+    if( h->param.b_sliced_threads && h->fdec->mb_info_free )
+    {
+        h->fdec->mb_info_free( h->fdec->mb_info );
+        h->fdec->mb_info = NULL;
+        h->fdec->mb_info_free = NULL;
+    }
     paff_frame_finish( h );
     return (void*)(intptr_t)0;
 }
@@ -6018,6 +6293,9 @@ void    x264_encoder_close  ( x264_t *h )
     x264_cqm_delete( h );
     x264_free( h->nal_buffer );
     x264_free( h->reconfig_h );
+    /* paff-sliced-threads: a pair aborted mid-way (error return) may
+     * leave its pass-0 NAL stash allocated. */
+    x264_free( h->paff_slice_stash );
     x264_analyse_free_costs( h );
     x264_free( h->cost_table );
 

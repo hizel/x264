@@ -94,8 +94,17 @@ before reconfiguring.
   gone); dependent pairs, and pass 1 for its own first field, wait per
   reference field and clamp their vertical MV range in field lines; output
   is deterministic at a fixed thread count but not byte-identical to
-  `--threads 1` (the MV-range clamp differs).  Sliced threads are rejected;
-  PAFF and MBAFF are mutually
+  `--threads 1` (the MV-range clamp differs).  Sliced threads
+  (`--paff --sliced-threads --threads N`) are supported: frame threading
+  is off, the monolithic pair driver runs, and each field pass is split
+  into N parity-interleaved slice bands (one slice per band, capped at
+  four field MB rows per band); band threads deblock their own rows at
+  slice end (cross-slice deblock off, idc=2) and ALL reference-data
+  work runs in a serial post-join sweep on the main context (no
+  cross-thread pixel synchronization); row-VBV budgets are per field
+  (pass 0 = pair plan × parity SATD share, pass 1 = leftover floored at
+  5%); non-VBV modes are byte-repeatable at a fixed N, CBR+VBV inherits
+  the sliced-threads timing exception.  PAFF and MBAFF are mutually
   exclusive.  See `doc/paff.txt`.  Non-PAFF output must stay bit-identical:
   all PAFF paths are gated on `param.b_paff`.
 - **API versioning**: `version.sh` derives `X264_VERSION`/`X264_POINTVER`

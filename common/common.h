@@ -376,6 +376,31 @@ struct x264_t
      * context, so the shadowed values are identical. */
     pixel          *paff_weighted[X264_REF_MAX];
     int             paff_i_lines_weighted;
+    /* paff-sliced-threads (D3e): pair-scoped sliced-thread bookkeeping on
+     * the main context (thread[0]).  paff_slice_stash deep-copies pass-0's
+     * merged worker slice NALs (nal array, then payload blob) OUT of
+     * h->out for the duration of pass 1: a bitstream realloc mid-pass-1
+     * corrupts h's borrowed pass-0 pointers -- a worker's realloc moves
+     * only that worker's buffer and fixes up only its own nal entries,
+     * and h's own realloc shifts every entry it still owns by the buffer
+     * delta.  The stash is re-inserted ahead of pass 1's NALs after the
+     * pass-1 join and freed at the next pair's stash-out or at close --
+     * after the pair's output has been consumed (encapsulated into
+     * h->nal_buffer).  i_paff_slice_stash_base is the h->out.nal index
+     * the stashed entries belong at; i_paff_slice_pass0_bs/base are the
+     * pass-0 bitstream baselines of the pass-1 i_misc_bits corrections
+     * (workers: bare bs_pos; h: bs_pos + i_nal*NALU_OVERHEAD*8). */
+    uint8_t        *paff_slice_stash;
+    int             i_paff_slice_stash_count;
+    int             i_paff_slice_stash_base;
+    int             i_paff_slice_pass0_bs;
+    int             i_paff_slice_pass0_base;
+    /* paff-sliced-threads (D4): the pair-level row-VBV plan and maximum,
+     * saved while the per-field budget is active and restored after the
+     * pass's join (update_vbv's plan-error tracker reads them at pair
+     * end). */
+    double          paff_slice_pair_plan;
+    double          paff_slice_pair_maximum;
     /* PAFF pass threading (master slot only): harvested fencs awaiting
      * deferred recycle.  The pair pipeline is shallower than the slot
      * count (pairs in flight = slots/2), so a fenc pushed unused at the

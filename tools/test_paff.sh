@@ -15,6 +15,11 @@
 #   baseline-check  re-encode, diff against saved baselines (bit-identical)
 #   paff            PAFF round-trip tests against JM (TFF/BFF, I-only/I+P,
 #                   plus a default-CRF smoke run)
+#   sliced          sliced-threads PAFF cells (paff-sliced-threads 5.1):
+#                   JM round-trips {TFF,BFF} x {I,I+P,I+P+B} x N in {2,4},
+#                   weightp 1/2, CAVLC, band-geometry edges, CBR+VBV,
+#                   2-pass, HRD, byte-repeat, field-budget assertion,
+#                   mb_info API and 10-bit ffmpeg decode cells (576i clip)
 #   matrix          14-config B-field matrix vs JM (tools/paff_matrix.sh):
 #                   TFF/BFF x b-pyramid x ref 1-4 x direct x CABAC/CAVLC
 #                   x keyint 8/24 x --no-deblock
@@ -89,7 +94,7 @@ die()  { echo "ERROR: $*" >&2; exit 2; }
 check_tools() {
     [ -x "$X264" ]   || die "x264 binary not found/executable: $X264"
     case " $* " in
-        *" baseline-save "*|*" baseline-check "*|*" paff "*|*" matrix "*|*" rc "*|*" la_range "*|*" wide_range "*|*" motion "*|*" opengop "*|*" all "*)
+        *" baseline-save "*|*" baseline-check "*|*" paff "*|*" matrix "*|*" rc "*|*" sliced "*|*" la_range "*|*" wide_range "*|*" motion "*|*" opengop "*|*" all "*)
             [ -x "$LDECOD" ] || die "JM ldecod not found/executable: $LDECOD (set LDECOD or JM_HOME)" ;;
     esac
     command -v ffmpeg  >/dev/null || die "ffmpeg not found in PATH"
@@ -420,7 +425,7 @@ baseline_encode() {
     local ref=$WORKDIR/baseline/$name.264
 
     "$X264" "$clip" --input-res ${WIDTH}x${HEIGHT} --frames $FRAMES \
-        --threads 1 -o "$out" "$@" >/dev/null 2>&1 \
+        --threads ${THREADS:-1} -o "$out" "$@" >/dev/null 2>&1 \
         || { bad "$name: x264 encode failed"; return; }
 
     if [ "$mode" = save ]; then
@@ -470,12 +475,24 @@ cmd_baseline_save() {
     make_clip "$WORKDIR/clip_${WIDTH}x${HEIGHT}.yuv"
     baseline_encode progressive save --crf 20
     baseline_encode mbaff       save --crf 20 --interlaced --tff
+    # paff-sliced-threads (task 5.3): regression byte/pixel-identity cells
+    # for the modes the change must not alter -- progressive sliced (the
+    # dispatch and deblock paths it shares) and non-sliced PAFF at t1 and
+    # frame threads (the monolithic/parallel pair drivers).
+    THREADS=2 baseline_encode prog_sliced_t2 save --crf 20 --sliced-threads
+    THREADS=4 baseline_encode prog_sliced_t4 save --crf 20 --sliced-threads
+    baseline_encode paff_t1       save --crf 20 --paff --tff
+    THREADS=4 baseline_encode paff_ft_t4   save --crf 20 --paff --tff
 }
 
 cmd_baseline_check() {
     make_clip "$WORKDIR/clip_${WIDTH}x${HEIGHT}.yuv"
     baseline_encode progressive check --crf 20
     baseline_encode mbaff       check --crf 20 --interlaced --tff
+    THREADS=2 baseline_encode prog_sliced_t2 check --crf 20 --sliced-threads
+    THREADS=4 baseline_encode prog_sliced_t4 check --crf 20 --sliced-threads
+    baseline_encode paff_t1       check --crf 20 --paff --tff
+    THREADS=4 baseline_encode paff_ft_t4   check --crf 20 --paff --tff
 }
 
 cmd_paff() {
@@ -546,6 +563,226 @@ cmd_rc() {
 # doc/paff.txt); weightb is permanently force-disabled under PAFF, so the
 # "on" rows now warn and encode weightb-off (BD-rate 0.000%); the command
 # stays so the measurement setup remains reproducible.
+# Sliced-threads PAFF cells (paff-sliced-threads task 5.1): the field-band
+# geometry, per-pass dispatch, serial reference sweep and field-granular
+# VBV budget against JM, plus the sliced-specific edges and non-JM gates.
+# Sliced bands need >= 4 field MB rows per thread, so the cells run on a
+# 576i clip (18 field rows, field-thread cap 4); the default 144-line clip
+# clamps sliced PAFF to one thread and would exercise nothing.
+SL_WIDTH=704
+SL_HEIGHT=576
+
+cmd_sliced() {
+    local save_w=$WIDTH save_h=$HEIGHT save_frames=$FRAMES
+    local n log out out2 plan0 plan1 pair
+    WIDTH=$SL_WIDTH HEIGHT=$SL_HEIGHT
+    make_clip "$WORKDIR/clip_${WIDTH}x${HEIGHT}.yuv"
+
+    # Thread-count clamp: 8 threads over 18 field rows must reduce to the
+    # field cap (4) with the warning that makes the clamp observable.
+    log=$WORKDIR/sl_cap.log
+    if "$X264" "$WORKDIR/clip_${WIDTH}x${HEIGHT}.yuv" --input-res ${WIDTH}x${HEIGHT} \
+            --frames 3 --paff --tff --sliced-threads --threads 8 --crf 23 \
+            -o /dev/null >"$log" 2>&1 \
+       && grep -q "reducing to 4" "$log"; then
+        ok "sl_cap: --threads 8 clamps to the field-row cap (4) with a warning"
+    else
+        bad "sl_cap: --threads 8 not clamped/warned (see $log)"
+    fi
+
+    # JM round-trips: {TFF,BFF} x {I-only, I+P, I+P+B} x N in {2,4},
+    # plus the weighted-prediction shadow cells (D9: workers read thread
+    # 0's weight buffers through the per-slot shadow) and CAVLC (the
+    # entropy coder takes a different flush path in slice_write).
+    for n in 2 4; do
+        THREADS=$n roundtrip sl${n}_tff_intra --paff --tff --sliced-threads --qp 20 --keyint 1 --bframes 0 --weightp 0
+        THREADS=$n roundtrip sl${n}_bff_intra --paff --bff --sliced-threads --qp 20 --keyint 1 --bframes 0 --weightp 0
+        THREADS=$n roundtrip sl${n}_tff_ip     --paff --tff --sliced-threads --qp 20 --bframes 0 --weightp 0 --ref 4
+        THREADS=$n roundtrip sl${n}_bff_ip     --paff --bff --sliced-threads --qp 20 --bframes 0 --weightp 0 --ref 4
+        THREADS=$n roundtrip sl${n}_tff_ipb    --paff --tff --sliced-threads --crf 23 --bframes 3
+        THREADS=$n roundtrip sl${n}_bff_ipb    --paff --bff --sliced-threads --crf 23 --bframes 3
+        THREADS=$n roundtrip sl${n}_tff_wp1    --paff --tff --sliced-threads --crf 23 --bframes 0 --weightp 1
+        THREADS=$n roundtrip sl${n}_tff_wp2    --paff --tff --sliced-threads --crf 23 --bframes 0 --weightp 2
+        THREADS=$n roundtrip sl${n}_tff_cavlc  --paff --tff --sliced-threads --crf 23 --bframes 0 --no-cabac
+    done
+
+    # Non-VBV byte-repeat (CRF, CABAC and CAVLC): no PAFF+sliced output is
+    # required to match any non-sliced output, but repeat runs at a fixed
+    # thread count must be byte-identical.
+    for n in 2 4; do
+        for extra in "" "--no-cabac"; do
+            out=$WORKDIR/sl_rep${n}.264; out2=$WORKDIR/sl_rep${n}_b.264
+            "$X264" "$WORKDIR/clip_${WIDTH}x${HEIGHT}.yuv" --input-res ${WIDTH}x${HEIGHT} \
+                --frames $FRAMES --paff --tff --sliced-threads --threads $n --crf 23 \
+                $extra -o "$out" >/dev/null 2>&1 \
+                && "$X264" "$WORKDIR/clip_${WIDTH}x${HEIGHT}.yuv" --input-res ${WIDTH}x${HEIGHT} \
+                --frames $FRAMES --paff --tff --sliced-threads --threads $n --crf 23 \
+                $extra -o "$out2" >/dev/null 2>&1 \
+                && cmp -s "$out" "$out2" \
+                && ok "sl_rep${n}${extra:+_cavlc}: byte-identical repeat run" \
+                || bad "sl_rep${n}${extra:+_cavlc}: repeat run differs"
+        done
+    done
+
+    # Rate control: CBR+VBV and 2-pass ABR round-trips.
+    THREADS=4 roundtrip sl_cbr --paff --tff --sliced-threads --bframes 0 \
+        --bitrate 800 --vbv-maxrate 800 --vbv-bufsize 1600
+    THREADS=4 roundtrip_2pass sl_2p --paff --tff --sliced-threads --bframes 0 --bitrate 800
+
+    # --nal-hrd cbr through the independent Annex C CPB simulator.
+    out=$WORKDIR/sl_hrd.264
+    "$X264" "$WORKDIR/clip_${WIDTH}x${HEIGHT}.yuv" --input-res ${WIDTH}x${HEIGHT} \
+        --frames $FRAMES --paff --tff --sliced-threads --threads 4 --bframes 0 \
+        --bitrate 800 --vbv-maxrate 800 --vbv-bufsize 1600 --nal-hrd cbr \
+        -o "$out" >/dev/null 2>&1 \
+        && python3 "$REPO_ROOT/tools/check_hrd.py" "$out" >"$out.hrd" 2>&1 \
+        && ok "sl_hrd: Annex C CPB check (field granularity, N slices/field)" \
+        || bad "sl_hrd: CPB check failed (see $out.hrd)"
+
+    # Field-budget assertion (D4): every pair logs both field budgets; the
+    # plans must be positive, bounded by the pair plan, the pass-1 floor
+    # must hold, and (where the floor is not binding) the two budgets sum
+    # back to the pair plan within the plan/actual slack.
+    log=$WORKDIR/sl_budget.log
+    "$X264" "$WORKDIR/clip_${WIDTH}x${HEIGHT}.yuv" --input-res ${WIDTH}x${HEIGHT} \
+        --frames $FRAMES --paff --tff --sliced-threads --threads 4 --bframes 0 \
+        --bitrate 800 --vbv-maxrate 800 --vbv-bufsize 1600 --log-level debug \
+        -o /dev/null >"$log" 2>&1
+    if python3 - "$log" <<'PYEOF'
+import re, sys
+lines = [l for l in open(sys.argv[1]) if 'paff field budget' in l]
+pairs = {}
+for idx, l in enumerate(lines):
+    m = re.search(r'pass (\d) plan (\d+) bits \(pair plan (\d+)\)', l)
+    if m:
+        pairs.setdefault(idx // 2, {})[int(m.group(1))] = (int(m.group(2)), int(m.group(3)))
+fail = []
+for pi, p in pairs.items():
+    if 0 not in p or 1 not in p:
+        fail.append(f'pair {pi}: missing a pass budget'); continue
+    (plan0, pair), (plan1, _) = p[0], p[1]
+    if not (0 < plan0 <= pair): fail.append(f'pair {pi}: pass-0 plan {plan0} outside (0, {pair}]')
+    if not (0 < plan1 <= pair): fail.append(f'pair {pi}: pass-1 plan {plan1} outside (0, {pair}]')
+    if plan1 < 0.05 * pair - 1: fail.append(f'pair {pi}: pass-1 plan {plan1} below the 5% floor of {pair}')
+    elif abs(plan0 + plan1 - pair) > 0.5 * pair:
+        fail.append(f'pair {pi}: budgets {plan0}+{plan1} do not sum back to pair plan {pair}')
+if fail:
+    print('; '.join(fail)); sys.exit(1)
+print(f'{len(pairs)} pairs OK')
+PYEOF
+    then ok "sl_budget: field budgets sum back to the pair plan ($(grep -c 'paff field budget' "$log") lines)"
+    else bad "sl_budget: see above"
+    fi
+
+    # Band-geometry edge: 544 lines -> 17 field rows; N=4 splits 4/4/5/4
+    # (not divisible by the thread count; the round band bias must place
+    # every row exactly once).
+    WIDTH=704 HEIGHT=544
+    make_clip "$WORKDIR/clip_${WIDTH}x${HEIGHT}.yuv"
+    THREADS=4 roundtrip sl_edge544_t4 --paff --tff --sliced-threads --crf 23 --bframes 0
+    THREADS=2 roundtrip sl_edge544_t2 --paff --bff --sliced-threads --crf 23 --bframes 3
+    WIDTH=$SL_WIDTH HEIGHT=$SL_HEIGHT
+
+    # API-level mb_info cell (task 2.5): the pair-shared mb_info buffer
+    # must be freed exactly once per pair, after the pair completes
+    # (no worker frees under paff+sliced).
+    if cmd_sliced_mbinfo; then :; fi
+
+    # 10-bit sliced PAFF (worker bitstream growth is depth-dependent):
+    # ffmpeg conformance decode, clean log, exact frame count.
+    # (JM bit-exactness stays 8-bit-only, as everywhere in this harness.)
+    out=$WORKDIR/sl_10bit.264
+    # PAFF demuxes as one packet per field access unit: 2*FRAMES packets.
+    if "$X264" "$WORKDIR/clip_${WIDTH}x${HEIGHT}.yuv" --input-res ${WIDTH}x${HEIGHT} \
+            --frames $FRAMES --paff --tff --sliced-threads --threads 4 --crf 23 \
+            --output-depth 10 -o "$out" >/dev/null 2>&1 \
+       && [ -z "$(ffmpeg -v error -i "$out" -f null - 2>&1)" ] \
+       && [ "$(ffprobe -v error -count_packets -select_streams v -show_entries stream=nb_read_packets -of csv=p=0 "$out" 2>/dev/null | paste -sd+ | bc)" = $((FRAMES*2)) ]; then
+        ok "sl_10bit: ffmpeg decodes cleanly, $FRAMES frames ($((FRAMES*2)) field AUs)"
+    else
+        bad "sl_10bit: encode/decode/frame-count check failed"
+    fi
+
+    WIDTH=$save_w HEIGHT=$save_h FRAMES=$save_frames
+}
+
+# API-level mb_info smoke (paff-sliced-threads task 2.5): builds a small
+# harness against the repo's static lib, runs it, checks the callback
+# count (one per pair).  Skips (with a FAIL, not silently) when no
+# compiler or lib is available.
+cmd_sliced_mbinfo() {
+    local src=$WORKDIR/mbinfo_smoke.c bin=$WORKDIR/mbinfo_smoke clip=$WORKDIR/clip_${SL_WIDTH}x${SL_HEIGHT}.yuv
+    cat > "$src" <<'CEOF'
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include "x264.h"
+#define W 704
+#define H 576
+#define N_FRAMES 12
+static int free_calls = 0;
+static void my_mb_info_free( void *p ) { free_calls++; free( p ); }
+int main( int argc, char **argv )
+{
+    x264_param_t param;
+    x264_picture_t pic, pic_out;
+    x264_t *h;
+    x264_nal_t *nal;
+    int i_nal, i;
+    FILE *f = fopen( argv[1], "rb" );
+    if( !f ) return 2;
+    x264_param_default_preset( &param, "medium", "zerolatency" );
+    param.i_csp = X264_CSP_I420;
+    param.i_width = W; param.i_height = H;
+    param.b_paff = 1; param.b_tff = 1;
+    param.i_threads = 4; param.b_sliced_threads = 1;
+    param.i_timebase_num = 1; param.i_timebase_den = 25;
+    param.i_keyint_max = 1 << 16;
+    param.analyse.b_mb_info = 1;
+    param.analyse.b_mb_info_update = 1;
+    h = x264_encoder_open( &param );
+    if( !h ) return 1;
+    x264_picture_init( &pic );
+    pic.img.i_csp = X264_CSP_I420;
+    int64_t fsz = (int64_t)W * H * 3 / 2;
+    uint8_t *buf = malloc( fsz );
+    for( i = 0; i < N_FRAMES; i++ )
+    {
+        if( fread( buf, 1, fsz, f ) != fsz ) return 1;
+        pic.img.plane[0] = buf;
+        pic.img.i_plane = 3;
+        pic.img.plane[1] = buf + W*H;
+        pic.img.plane[2] = buf + W*H*5/4;
+        pic.img.i_stride[0] = W;
+        pic.img.i_stride[1] = pic.img.i_stride[2] = W/2;
+        pic.i_pts = i;
+        pic.prop.mb_info = calloc( 1, (W/16) * (H/16) );
+        pic.prop.mb_info_free = my_mb_info_free;
+        int before = free_calls;
+        if( x264_encoder_encode( h, &nal, &i_nal, &pic, &pic_out ) < 0 ) return 1;
+        if( free_calls > before + 1 ) { fprintf( stderr, "freed twice in one pair\n" ); return 1; }
+    }
+    while( x264_encoder_encode( h, &nal, &i_nal, NULL, &pic_out ) > 0 );
+    x264_encoder_close( h );
+    printf( "%d\n", free_calls );
+    free( buf );
+    return free_calls == N_FRAMES ? 0 : 1;
+}
+CEOF
+    command -v gcc >/dev/null || { bad "sl_mbinfo: gcc not found"; return 1; }
+    [ -f "$REPO_ROOT/libx264.a" ] || { bad "sl_mbinfo: libx264.a not built"; return 1; }
+    gcc -O1 -o "$bin" -I"$REPO_ROOT" "$src" "$REPO_ROOT/libx264.a" -lm -lpthread -ldl 2>>"$WORKDIR/sl_mbinfo.log" \
+        || { bad "sl_mbinfo: harness build failed"; return 1; }
+    if "$bin" "$clip" >"$WORKDIR/sl_mbinfo.out" 2>/dev/null \
+       && [ "$(cat "$WORKDIR/sl_mbinfo.out" 2>/dev/null)" = 12 ]; then
+        ok "sl_mbinfo: mb_info freed exactly once per pair"
+    else
+        bad "sl_mbinfo: callback count wrong (see $WORKDIR/sl_mbinfo.out)"
+        return 1
+    fi
+}
+
 cmd_weightb() {
     make_dissolve_clip "$WORKDIR/dissolve_${WIDTH}x${HEIGHT}.yuv"
     make_control_clip  "$WORKDIR/control_${WIDTH}x${HEIGHT}.yuv"
@@ -625,12 +862,13 @@ for cmd in $cmds; do
         paff)           cmd_paff ;;
         matrix)         cmd_matrix ;;
         rc)             cmd_rc ;;
+        sliced)         cmd_sliced ;;
         la_range)       cmd_la_range ;;
         wide_range)     cmd_wide_range ;;
         motion)         cmd_motion ;;
         weightb)        cmd_weightb ;;
         opengop)        cmd_opengop ;;
-        all)            cmd_baseline_check; cmd_paff; cmd_matrix; cmd_rc; cmd_la_range; cmd_wide_range; cmd_motion; cmd_opengop ;;
+        all)            cmd_baseline_check; cmd_paff; cmd_matrix; cmd_rc; cmd_sliced; cmd_la_range; cmd_wide_range; cmd_motion; cmd_opengop ;;
         *)              die "unknown command: $cmd" ;;
     esac
 done

@@ -68,6 +68,15 @@ rotation by two per pair, one slot per pass); the output of a slot is
 returned to the caller several units later.
 _Avoid_: frame thread (that is the thread, not the slot)
 
+**Thread slice band**:
+The rows one slice thread codes under `--sliced-threads`: a contiguous
+range of MB rows in progressive coding; under PAFF, a contiguous range of
+the FIELD's own rows (every second frame-coordinate MB row of the pass's
+parity). Start is the first coded row, end is one PAST the last coded row
+(`i_threadslice_start/end`) — so under PAFF the next band's start is the
+previous band's end + 1, because of the stride-2 raster.
+_Avoid_: slice range
+
 **Field pass**:
 One coding pass of a PAFF pair; codes one field as its own coded picture.
 Pass 0/1 is coding order; the pass's parity is set by TFF/BFF
