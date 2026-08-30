@@ -37,6 +37,14 @@
 #                   a non-dissolve control, weightb on vs off, BD-rate
 #                   (PSNR-Y).  Outcome: kill (0.272% < 0.5% floor,
 #                   doc/paff.txt); kept for reproducibility.
+#   weightb2        weightb re-measurement (paff-weightb-remeasure, design
+#                   D1/D2): five clips (real-scene crossfade, dip-to-black,
+#                   grained synthetic, legacy synthetic, non-dissolve
+#                   control) x modes (progressive positive control, paff-tff,
+#                   paff-bff) x CRF 18/23/28/33, weightb on vs off, BD-rate
+#                   (PSNR-Y).  The PAFF weightb-on rows need the local
+#                   validation revert documented on cmd_weightb2; the command
+#                   aborts if the force-off warning shows up in an on-row log.
 #   opengop         open-GOP round-trips vs JM: non-IDR Ip keyframe pairs
 #                   plus a hard-scene-cut clip whose GOP-tail B pairs MUST
 #                   reference across the I pair to decode correctly
@@ -54,6 +62,14 @@
 #             (default: 1; set to 4/8 for threaded JM round-trips.
 #             la_range and wide_range ignore it -- they pin --threads 1
 #             deliberately)
+#   PAFF_WB_SRC_A / PAFF_WB_SRC_B
+#             real-scene source clips for the weightb2 C1/C2 cells
+#             (lavf-readable, >= 4 s each; C1/C2 skip when unset, C5 falls
+#             back to the lavfi control recipe -- the skip/fallback is
+#             recorded with the results)
+#   WB2_MODES mode subset for weightb2 (default: "prog tff bff"); use
+#             "prog" for the stage-1 positive control, which needs no
+#             local validation revert
 
 set -u
 
@@ -90,7 +106,7 @@ bad()  { FAIL=$((FAIL+1)); echo "FAIL: $*"; }
 die()  { echo "ERROR: $*" >&2; exit 2; }
 
 # Args: the commands to run; JM ldecod is required unless every command is
-# weightb (the only command that never round-trips through JM).
+# weightb/weightb2 (the only commands that never round-trip through JM).
 check_tools() {
     [ -x "$X264" ]   || die "x264 binary not found/executable: $X264"
     case " $* " in
@@ -160,6 +176,237 @@ make_control_clip() {
             -f lavfi -i "testsrc2=size=${WIDTH}x${HEIGHT}:rate=50:duration=4" \
             -vf tinterlace -frames:v $WB_FRAMES -pix_fmt yuv420p "$clip" \
             || die "failed to synthesize $clip"
+    fi
+}
+
+# --------------------------------------------------------------------------
+# weightb re-measurement clip set (paff-weightb-remeasure, design D1).
+# Every clip exists in two variants holding the SAME pixels: the tinterlaced
+# PAFF input (wb2_<name>_<W>x<H>.yuv) and the pre-tinterlace progressive
+# stream (wb2_<name>_<W>x<H>_prog.yuv), so the progressive positive control
+# and the PAFF measurement are comparable per clip.
+#
+#   C1  crossfade between two DISTINCT real scenes (PAFF_WB_SRC_A/B,
+#       lavf-readable), trimmed to 4 s each, xfade fade 1.5 s at offset
+#       0.5 s -- the blend zone t=0.5..2.0 s sits inside the coded window on
+#       BOTH ffmpeg lines (ffmpeg 8's tinterlace merge doubles the height, so
+#       100 coded frames cover only the first ~2 s of the timeline).  Also
+#       generated at 720x576 (native interlace-broadcast geometry) for the
+#       sign-agreement duplicate cell.  Skips when the env vars are unset.
+#   C2  dip-to-black: source A, fade out 1.5 s, black, fade in 1.5 s.
+#       Diagnostic only (weightp territory per the paff-weightb design),
+#       never the stage-2 primary clip.  Skips when PAFF_WB_SRC_A is unset.
+#   C3  the C4 xfade recipe plus film grain (noise=alls=10:allf=t+u, pinned
+#       seed): tests the "the old clip was too clean to need weights"
+#       hypothesis.
+#   C4  the legacy synthetic xfade clip (make_dissolve_clip), unmodified --
+#       reference cell that must reproduce the archived ~0.272%.
+#   C5  non-dissolve control: source A straight when PAFF_WB_SRC_A is set,
+#       else the lavfi control recipe (make_control_clip pattern); never
+#       skips.  The variant used is echoed for the results file.
+
+WB2_SRC_A=${PAFF_WB_SRC_A:-}
+WB2_SRC_B=${PAFF_WB_SRC_B:-}
+WB2_MODES=${WB2_MODES:-"prog tff bff"}
+
+have_wb2_sources()  { [ -n "$WB2_SRC_A" ] && [ -n "$WB2_SRC_B" ] && [ -f "$WB2_SRC_A" ] && [ -f "$WB2_SRC_B" ]; }
+have_wb2_source_a() { [ -n "$WB2_SRC_A" ] && [ -f "$WB2_SRC_A" ]; }
+
+# How many progressive frames fill the $WB_FRAMES-coded-frame PAFF window:
+# $WB_FRAMES when the tinterlace merge doubles the height (ffmpeg 8), twice
+# that when it keeps the height (ffmpeg <= 7).  Detected empirically with a
+# tiny probe -- version strings are unreliable across distros/nightlies.
+wb2_detect_window() {
+    local probe=$WORKDIR/wb2_tint_probe.yuv fsz=$((32 * 32 * 3 / 2)) sz
+    ffmpeg -y -loglevel error \
+        -f lavfi -i "color=red:size=32x32:rate=50:duration=0.16" \
+        -vf tinterlace -frames:v 4 -pix_fmt yuv420p "$probe" \
+        || die "wb2: tinterlace probe failed"
+    sz=$(stat -c%s "$probe")
+    rm -f "$probe"
+    if [ "$sz" = $((4 * fsz)) ]; then
+        WB2_PROG_FRAMES=$((2 * WB_FRAMES))   # height kept: window ~4 s
+    elif [ "$sz" = $((8 * fsz)) ]; then
+        WB2_PROG_FRAMES=$WB_FRAMES           # height doubled: window ~2 s
+    else
+        die "wb2: unexpected tinterlace probe size $sz bytes"
+    fi
+}
+
+# fps/geometry-normalize a real source so it can be xfaded or tinterlaced
+# alongside the lavfi clips (50 fps CFR, exact cell geometry, square SAR).
+wb2_src_filter() {
+    echo "fps=50,scale=$1:$2:force_original_aspect_ratio=decrease,pad=$1:$2:(ow-iw)/2:(oh-ih)/2,setsar=1,setpts=PTS-STARTPTS"
+}
+
+# C1: real-scene crossfade, both variants (args: prog tint W H).
+make_wb2_c1() {
+    local prog=$1 tint=$2 w=$3 h=$4
+    local fa fb
+    fa=$(wb2_src_filter $w $h); fb=$fa
+    if [ ! -f "$prog" ]; then
+        ffmpeg -y -loglevel error -t 4 -i "$WB2_SRC_A" -t 4 -i "$WB2_SRC_B" \
+            -filter_complex "[0:v]$fa[a];[1:v]$fb[b];[a][b]xfade=transition=fade:duration=1.5:offset=0.5" \
+            -frames:v $WB2_PROG_FRAMES -pix_fmt yuv420p "$prog" \
+            || die "failed to synthesize $prog"
+    fi
+    if [ ! -f "$tint" ]; then
+        ffmpeg -y -loglevel error -t 4 -i "$WB2_SRC_A" -t 4 -i "$WB2_SRC_B" \
+            -filter_complex "[0:v]$fa[a];[1:v]$fb[b];[a][b]xfade=transition=fade:duration=1.5:offset=0.5,tinterlace" \
+            -frames:v $WB_FRAMES -pix_fmt yuv420p "$tint" \
+            || die "failed to synthesize $tint"
+    fi
+}
+
+# C2: dip-to-black on source A, both variants (args: prog tint W H).
+# Fade out 0.25..1.75 s, black plateau 1.75..2.0 s, fade in 2.0..3.5 s: the
+# full fade-out and the plateau sit inside the ~2 s ffmpeg-8 window, the
+# whole dip inside the ~4 s ffmpeg <= 7 window.  split/concat because
+# fade=t=in forces BLACK for every frame before its start time -- chaining
+# it after fade=t:out on one timeline blacks out the whole clip.
+make_wb2_c2() {
+    local prog=$1 tint=$2 w=$3 h=$4
+    local fa fc
+    fa=$(wb2_src_filter $w $h)
+    fc="[0:v]$fa,split=2[x][y];[x]trim=end=2.0,fade=t=out:st=0.25:d=1.5[p];[y]trim=start=2.0:end=4,setpts=PTS-STARTPTS,fade=t=in:st=0:d=1.5[q];[p][q]concat=n=2:v=1"
+    if [ ! -f "$prog" ]; then
+        ffmpeg -y -loglevel error -t 4 -i "$WB2_SRC_A" \
+            -filter_complex "$fc" \
+            -frames:v $WB2_PROG_FRAMES -pix_fmt yuv420p "$prog" \
+            || die "failed to synthesize $prog"
+    fi
+    if [ ! -f "$tint" ]; then
+        ffmpeg -y -loglevel error -t 4 -i "$WB2_SRC_A" \
+            -filter_complex "$fc,tinterlace" \
+            -frames:v $WB_FRAMES -pix_fmt yuv420p "$tint" \
+            || die "failed to synthesize $tint"
+    fi
+}
+
+# C3: grained synthetic crossfade, both variants (args: prog tint W H).
+make_wb2_c3() {
+    local prog=$1 tint=$2 w=$3 h=$4
+    if [ ! -f "$prog" ]; then
+        ffmpeg -y -loglevel error \
+            -f lavfi -i "testsrc2=size=${w}x${h}:rate=50:duration=4" \
+            -f lavfi -i "smptehdbars=size=${w}x${h}:rate=50:duration=4" \
+            -filter_complex "xfade=transition=fade:duration=1.5:offset=0.5,noise=alls=10:allf=t+u:all_seed=42" \
+            -frames:v $WB2_PROG_FRAMES -pix_fmt yuv420p "$prog" \
+            || die "failed to synthesize $prog"
+    fi
+    if [ ! -f "$tint" ]; then
+        ffmpeg -y -loglevel error \
+            -f lavfi -i "testsrc2=size=${w}x${h}:rate=50:duration=4" \
+            -f lavfi -i "smptehdbars=size=${w}x${h}:rate=50:duration=4" \
+            -filter_complex "xfade=transition=fade:duration=1.5:offset=0.5,noise=alls=10:allf=t+u:all_seed=42,tinterlace" \
+            -frames:v $WB_FRAMES -pix_fmt yuv420p "$tint" \
+            || die "failed to synthesize $tint"
+    fi
+}
+
+# C4 progressive variant: the pre-tinterlace make_dissolve_clip stream
+# (the tinterlaced variant is make_dissolve_clip itself).
+make_wb2_c4_prog() {
+    local prog=$1
+    if [ ! -f "$prog" ]; then
+        ffmpeg -y -loglevel error \
+            -f lavfi -i "testsrc2=size=${WIDTH}x${HEIGHT}:rate=50:duration=4" \
+            -f lavfi -i "smptehdbars=size=${WIDTH}x${HEIGHT}:rate=50:duration=4" \
+            -filter_complex "xfade=transition=fade:duration=1.5:offset=0.5" \
+            -frames:v $WB2_PROG_FRAMES -pix_fmt yuv420p "$prog" \
+            || die "failed to synthesize $prog"
+    fi
+}
+
+# C5: non-dissolve control, both variants (args: prog tint W H).
+# Sets WB2_C5_VARIANT=real|lavfi for the results provenance.
+make_wb2_c5() {
+    local prog=$1 tint=$2 w=$3 h=$4
+    if have_wb2_source_a; then
+        local fa
+        fa=$(wb2_src_filter $w $h)
+        if [ ! -f "$prog" ]; then
+            ffmpeg -y -loglevel error -t 4 -i "$WB2_SRC_A" \
+                -vf "$fa" -frames:v $WB2_PROG_FRAMES -pix_fmt yuv420p "$prog" \
+                || die "failed to synthesize $prog"
+        fi
+        if [ ! -f "$tint" ]; then
+            ffmpeg -y -loglevel error -t 4 -i "$WB2_SRC_A" \
+                -vf "$fa,tinterlace" -frames:v $WB_FRAMES -pix_fmt yuv420p "$tint" \
+                || die "failed to synthesize $tint"
+        fi
+        WB2_C5_VARIANT=real
+    else
+        if [ ! -f "$prog" ]; then
+            ffmpeg -y -loglevel error \
+                -f lavfi -i "testsrc2=size=${w}x${h}:rate=50:duration=4" \
+                -frames:v $WB2_PROG_FRAMES -pix_fmt yuv420p "$prog" \
+                || die "failed to synthesize $prog"
+        fi
+        make_control_clip "$tint"
+        WB2_C5_VARIANT=lavfi
+    fi
+}
+
+# md5 of one decoded frame (args: file WxH frame_idx).
+wb2_frame_md5() {
+    ffmpeg -v error -f rawvideo -pix_fmt yuv420p -video_size "$2" -i "$1" \
+        -vf "select=eq(n\\,$3)" -frames:v 1 -f md5 - 2>/dev/null | sed 's/MD5=//'
+}
+
+# C1 generation gate (task 1.1): the blend must provably sit inside the
+# coded window -- a mid-blend frame (3/8 into the window) is a real blend,
+# i.e. matches neither the early (pure A) nor the late (pure/~pure B)
+# frame, and the two endpoint frames differ (distinct scenes).
+wb2_check_c1() {
+    local prog=$1 w=$2 h=$3 tag=$4
+    local e=$((WB2_PROG_FRAMES / 10)) m=$((WB2_PROG_FRAMES * 3 / 8)) l=$((WB2_PROG_FRAMES * 98 / 100))
+    local me mm ml
+    me=$(wb2_frame_md5 "$prog" ${w}x${h} $e)
+    mm=$(wb2_frame_md5 "$prog" ${w}x${h} $m)
+    ml=$(wb2_frame_md5 "$prog" ${w}x${h} $l)
+    if [ -n "$me" ] && [ -n "$mm" ] && [ -n "$ml" ] \
+       && [ "$me" != "$mm" ] && [ "$mm" != "$ml" ] && [ "$me" != "$ml" ]; then
+        ok "$tag: blend provably inside the coded window (frames $e/$m/$l all differ)"
+    else
+        bad "$tag: mid-window frame is not a real blend (md5 $e=$me $m=$mm $l=$ml)"
+    fi
+}
+
+# C2 generation gate (task 1.2): the plateau frame (t=1.86 s, frame 93 at
+# 50 fps) must sit near the limited-range black floor (Y=16) and be clearly
+# darker than a pre-fade frame (t=0.1 s).  blackdetect is unusable for this:
+# dark real content trips its luma threshold before the dip even starts.
+wb2_check_c2() {
+    local prog=$1 w=$2 h=$3
+    local y0 ydip
+    y0=$(ffmpeg -v info -f rawvideo -pix_fmt yuv420p -video_size "$2x$3" -i "$1" \
+        -vf "select=eq(n\,5),signalstats,metadata=print" -f null - 2>&1 \
+        | sed -n 's/.*lavfi.signalstats.YAVG=\([0-9.]*\).*/\1/p' | head -1)
+    ydip=$(ffmpeg -v info -f rawvideo -pix_fmt yuv420p -video_size "$2x$3" -i "$1" \
+        -vf "select=eq(n\,93),signalstats,metadata=print" -f null - 2>&1 \
+        | sed -n 's/.*lavfi.signalstats.YAVG=\([0-9.]*\).*/\1/p' | head -1)
+    if [ -n "$y0" ] && [ -n "$ydip" ] \
+       && awk "BEGIN{exit !($ydip <= 18 && $ydip < $y0 - 5)}"; then
+        ok "c2: dip-to-black verified (YAVG pre-fade $y0, plateau $ydip)"
+    else
+        bad "c2: dip missing (YAVG pre-fade '$y0', plateau '$ydip')"
+    fi
+}
+
+# Generation gate for every weightb2 clip (task 1.1/1.4 verify): the
+# progressive variant holds exactly the window's frame count at the cell
+# geometry, and the tinterlaced variant holds at least $WB_FRAMES coded
+# frames.
+wb2_check_clip() {
+    local tag=$1 prog=$2 tint=$3 w=$4 h=$5
+    local fsz=$((w * h * 3 / 2)) np nt
+    np=$(( $(stat -c%s "$prog") / fsz ))
+    nt=$(( $(stat -c%s "$tint") / fsz ))
+    if [ "$np" = "$WB2_PROG_FRAMES" ] && [ "$nt" -ge "$WB_FRAMES" ]; then
+        ok "$tag: clips OK (prog $np frames, tint $nt coded frames, ${w}x${h})"
+    else
+        bad "$tag: frame count wrong (prog $np != $WB2_PROG_FRAMES or tint $nt < $WB_FRAMES)"
     fi
 }
 
@@ -820,6 +1067,136 @@ cmd_weightb() {
     done
 }
 
+# weightb2 re-measurement (paff-weightb-remeasure, design D1/D2): the
+# two-stage pre-registered protocol.  Stage 1 (mode "prog") is the
+# progressive positive control on the pre-tinterlace streams; stage 2
+# (modes "tff"/"bff") is the PAFF measurement on the tinterlaced variants.
+# Per clip x mode: CRF 18/23/28/33, --threads 1, weightb on vs off, PSNR-Y
+# and kbps from the encoder's own --psnr summary, BD-rate via bdrate().
+#
+# Stage-2 prerequisite (task 2.3): the PAFF validation force-off must be
+# reverted LOCALLY (never committed on the kill path).  The hunk, applied
+# to encoder/encoder.c in validate_parameters():
+#
+#  --- a/encoder/encoder.c
+#  +++ b/encoder/encoder.c
+#  @@ validate_parameters(), inside if( h->param.b_paff )
+#  -        if( h->param.analyse.b_weighted_bipred )
+#  -        {
+#  -            x264_log( h, X264_LOG_WARNING, "PAFF does not support weighted biprediction (measured: no gain): disabling\n" );
+#  -            h->param.analyse.b_weighted_bipred = 0;
+#  -        }
+#
+# (i.e. delete the warn-and-disable block; the comment above it can stay).
+# The force-off guard (task 2.2) greps every weightb-on PAFF log for the
+# warning and aborts the run when it appears -- without the revert the
+# on-rows would silently encode weightb-off and measure nothing.
+cmd_weightb2() {
+    wb2_detect_window
+    local clips="" spec prog tint w h
+
+    echo "weightb2: ffmpeg $(ffmpeg -version | sed -n 's/^ffmpeg version //p' | head -1), window $WB2_PROG_FRAMES progressive frames"
+    if have_wb2_sources; then
+        echo "weightb2: C1/C2 sources A=$WB2_SRC_A B=$WB2_SRC_B"
+    else
+        echo "weightb2: PAFF_WB_SRC_A/PAFF_WB_SRC_B unset or unreadable -- C1/C2 skipped (lavfi-only fallback; record with the results)"
+    fi
+
+    if have_wb2_sources; then
+        make_wb2_c1 $WORKDIR/wb2_c1_${WIDTH}x${HEIGHT}_prog.yuv $WORKDIR/wb2_c1_${WIDTH}x${HEIGHT}.yuv $WIDTH $HEIGHT
+        make_wb2_c1 $WORKDIR/wb2_c1_720x576_prog.yuv         $WORKDIR/wb2_c1_720x576.yuv         720 576
+        clips="$clips c1 c1_576"
+    fi
+    if have_wb2_source_a; then
+        make_wb2_c2 $WORKDIR/wb2_c2_${WIDTH}x${HEIGHT}_prog.yuv $WORKDIR/wb2_c2_${WIDTH}x${HEIGHT}.yuv $WIDTH $HEIGHT
+        clips="$clips c2"
+    fi
+    make_wb2_c3      $WORKDIR/wb2_c3_${WIDTH}x${HEIGHT}_prog.yuv $WORKDIR/wb2_c3_${WIDTH}x${HEIGHT}.yuv $WIDTH $HEIGHT
+    make_dissolve_clip $WORKDIR/wb2_c4_${WIDTH}x${HEIGHT}.yuv
+    make_wb2_c4_prog $WORKDIR/wb2_c4_${WIDTH}x${HEIGHT}_prog.yuv
+    make_wb2_c5      $WORKDIR/wb2_c5_${WIDTH}x${HEIGHT}_prog.yuv $WORKDIR/wb2_c5_${WIDTH}x${HEIGHT}.yuv $WIDTH $HEIGHT
+    clips="$clips c3 c4 c5"
+    echo "weightb2: C5 variant = $WB2_C5_VARIANT"
+
+    # Generation gates (tasks 1.1-1.4 verify).
+    for spec in $clips; do
+        wb2_clip_spec $spec
+        wb2_check_clip "$spec" "$WB2_PROG" "$WB2_TINT" $WB2_W $WB2_H
+    done
+    if have_wb2_sources; then
+        wb2_check_c1 $WORKDIR/wb2_c1_${WIDTH}x${HEIGHT}_prog.yuv $WIDTH $HEIGHT c1
+        wb2_check_c1 $WORKDIR/wb2_c1_720x576_prog.yuv 720 576 c1_576
+        wb2_check_c2 $WORKDIR/wb2_c2_${WIDTH}x${HEIGHT}_prog.yuv $WIDTH $HEIGHT
+    fi
+    # C3 must differ from C4 (the grain must actually be there).
+    if [ "$(md5sum < $WORKDIR/wb2_c3_${WIDTH}x${HEIGHT}.yuv)" != "$(md5sum < $WORKDIR/wb2_c4_${WIDTH}x${HEIGHT}.yuv)" ]; then
+        ok "c3: grained clip differs from the legacy C4 clip"
+    else
+        bad "c3: identical to C4 (grain missing?)"
+    fi
+
+    local clip mode wt crf name log src frames opts psnr kbps args_on args_off bd
+    for clip in $clips; do
+        wb2_clip_spec $clip
+        prog=$WB2_PROG; tint=$WB2_TINT; w=$WB2_W; h=$WB2_H
+        for mode in $WB2_MODES; do
+            case $mode in
+                prog) src=$prog; frames=$WB2_PROG_FRAMES; opts="" ;;
+                tff)  src=$tint; frames=$WB_FRAMES;       opts="--paff --tff" ;;
+                bff)  src=$tint; frames=$WB_FRAMES;       opts="--paff --bff" ;;
+                *)    die "wb2: unknown mode $mode (WB2_MODES)" ;;
+            esac
+            args_on=""; args_off=""
+            printf "%-7s %-4s %6s %4s %12s %10s\n" "$clip" "$mode" weight crf kbps psnr_y
+            for wt in on off; do
+                for crf in 18 23 28 33; do
+                    name=wb2_${clip}_${mode}_${wt}_crf${crf}
+                    log=$WORKDIR/$name.log
+                    "$X264" "$src" --input-res ${w}x${h} --frames $frames \
+                        --threads 1 $opts --crf $crf --psnr --$([ $wt = on ] && echo weightb || echo no-weightb) \
+                        -o $WORKDIR/$name.264 > "$log" 2>&1 \
+                        || { bad "$name: x264 encode failed"; continue; }
+                    # Force-off guard (task 2.2): a weightb-on PAFF row that
+                    # logged the validation warning encoded weightb-OFF.
+                    if [ $wt = on ] && [ $mode != prog ] \
+                       && grep -q "weighted biprediction (measured: no gain): disabling" "$log"; then
+                        die "wb2: $name: the PAFF force-off ate --weightb -- apply the local validation revert documented on cmd_weightb2, rebuild, re-run"
+                    fi
+                    psnr=$(sed -n 's/.*PSNR Mean Y:\([0-9.]*\).*/\1/p' "$log" | tail -1)
+                    kbps=$(sed -n 's/.*encoded.*frames.* \([0-9.]*\) kb\/s.*/\1/p' "$log" | tail -1)
+                    if [ -z "$psnr" ] || [ -z "$kbps" ]; then
+                        bad "$name: could not parse psnr/kbps from log"
+                        continue
+                    fi
+                    printf "%7s %4s %6s %4d %12s %10s\n" "" "" "$wt" "$crf" "$kbps" "$psnr"
+                    if [ $wt = on ]; then args_on="$args_on $kbps $psnr"; else args_off="$args_off $kbps $psnr"; fi
+                done
+            done
+            bd=$(bdrate $args_on $args_off)
+            echo "$clip/$mode: BD-rate saving of weightb-on vs off = ${bd}%"
+            if [ "$bd" = nan ]; then
+                bad "$clip/$mode: weightb BD-rate could not be computed (see table above)"
+            else
+                ok "$clip/$mode: weightb BD-rate ${bd}%"
+            fi
+        done
+    done
+}
+
+# Map a weightb2 clip id to its files/geometry; sets WB2_PROG, WB2_TINT,
+# WB2_W, WB2_H.
+wb2_clip_spec() {
+    case $1 in
+        c1)     WB2_PROG=$WORKDIR/wb2_c1_${WIDTH}x${HEIGHT}_prog.yuv; WB2_TINT=$WORKDIR/wb2_c1_${WIDTH}x${HEIGHT}.yuv; WB2_W=$WIDTH;  WB2_H=$HEIGHT ;;
+        c1_576) WB2_PROG=$WORKDIR/wb2_c1_720x576_prog.yuv;          WB2_TINT=$WORKDIR/wb2_c1_720x576.yuv;          WB2_W=720; WB2_H=576 ;;
+        c2)     WB2_PROG=$WORKDIR/wb2_c2_${WIDTH}x${HEIGHT}_prog.yuv; WB2_TINT=$WORKDIR/wb2_c2_${WIDTH}x${HEIGHT}.yuv; WB2_W=$WIDTH;  WB2_H=$HEIGHT ;;
+        c3)     WB2_PROG=$WORKDIR/wb2_c3_${WIDTH}x${HEIGHT}_prog.yuv; WB2_TINT=$WORKDIR/wb2_c3_${WIDTH}x${HEIGHT}.yuv; WB2_W=$WIDTH;  WB2_H=$HEIGHT ;;
+        c4)     WB2_PROG=$WORKDIR/wb2_c4_${WIDTH}x${HEIGHT}_prog.yuv; WB2_TINT=$WORKDIR/wb2_c4_${WIDTH}x${HEIGHT}.yuv; WB2_W=$WIDTH;  WB2_H=$HEIGHT ;;
+        c5)     WB2_PROG=$WORKDIR/wb2_c5_${WIDTH}x${HEIGHT}_prog.yuv; WB2_TINT=$WORKDIR/wb2_c5_${WIDTH}x${HEIGHT}.yuv; WB2_W=$WIDTH;  WB2_H=$HEIGHT ;;
+        *)      die "wb2: unknown clip $1" ;;
+    esac
+}
+
 # Lookahead-range parity with progressive (spec scenario, observable only
 # via the debug log, not the bitstream): the lookahead analyzes whole frames
 # under PAFF, so its lowres search range must equal the progressive run's.
@@ -867,6 +1244,7 @@ for cmd in $cmds; do
         wide_range)     cmd_wide_range ;;
         motion)         cmd_motion ;;
         weightb)        cmd_weightb ;;
+        weightb2)       cmd_weightb2 ;;
         opengop)        cmd_opengop ;;
         all)            cmd_baseline_check; cmd_paff; cmd_matrix; cmd_rc; cmd_sliced; cmd_la_range; cmd_wide_range; cmd_motion; cmd_opengop ;;
         *)              die "unknown command: $cmd" ;;

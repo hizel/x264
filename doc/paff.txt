@@ -77,25 +77,54 @@ Practical RC notes:
 
 Weighted prediction (--weightp) is supported for P fields (it reuses the MBAFF
 weight path on the field-layout planes).  Weighted biprediction (--weightb) is
-force-disabled with a warning: measured and rejected.  x264 only ever signals
-weighted_bipred_idc = 2 (implicit -- the decoder derives bipred weights from
-POC distances per 8.4.3; there are no explicit weights in the bitstream), and
-the per-pass bipred tables mirror that derivation with field POCs.  During
-evaluation the implicit derivation proved conformance-correct (full B-field
-matrix with weightb forced on, 28/28 bit-exact against JM, plus ffmpeg, NVDEC
-and VAAPI pixel-exact) once two latent bugs were fixed: bipred_weight_buf was
-int8_t and could not hold the boundary weight 128, and the signed-byte-multiply
-pixel_avg asm (8-bit x86 SSSE3/AVX2/AVX-512, LoongArch LSX/LASX) cannot
-represent the -64/128 extrema -- both reachable only by field pictures, whose
-expanded reference lists can put both bipred references on the same POC side
-of the current field.  But a CRF 18/23/28/33 sweep on a synthetic dissolve
-clip (the content implicit weights exist for) gained only 0.272% BD-rate
-(PSNR-Y) -- below the 0.5% acceptance floor fixed before measuring -- and a
-progressive encode of the same clip showed the same ~0% gain, so the feature
-is not worth its RD churn.  The measurement setup is kept in
-"tools/test_paff.sh weightb"; with the force-off in place its on-rows warn
-and encode weightb-off, so reproducing the numbers requires locally
-reverting the validation block in x264_encoder_open first.
+force-disabled with a warning: measured and rejected, twice.  x264 only ever
+signals weighted_bipred_idc = 2 (implicit -- the decoder derives bipred
+weights from POC distances per 8.4.3; there are no explicit weights in the
+bitstream), and the per-pass bipred tables mirror that derivation with field
+POCs.  During evaluation the implicit derivation proved conformance-correct
+(full B-field matrix with weightb forced on, 28/28 bit-exact against JM,
+plus ffmpeg, NVDEC and VAAPI pixel-exact) once two latent bugs were fixed:
+bipred_weight_buf was int8_t and could not hold the boundary weight 128, and
+the signed-byte-multiply pixel_avg asm (8-bit x86 SSSE3/AVX2/AVX-512,
+LoongArch LSX/LASX) cannot represent the -64/128 extrema -- both reachable
+only by field pictures, whose expanded reference lists can put both bipred
+references on the same POC side of the current field.
+
+The quality side failed twice, with a positive control the second time.
+First measurement (paff-weightb): a CRF 18/23/28/33 sweep on a synthetic
+dissolve clip (the content implicit weights exist for) gained only 0.272%
+BD-rate (PSNR-Y), below the 0.5% acceptance floor fixed before measuring --
+but that clip never proved it exercises the feature (its progressive encode
+gained ~0% too).  Re-measurement (paff-weightb-remeasure) with a
+pre-registered positive control: the same sweep on PROGRESSIVE encodes of
+realistic content first, and PAFF only if some clip gains >= 1.0%
+progressively.  On a real-scene crossfade (two distinct broadcast clips,
+xfade, at both 176x144 and 720x576) weightb gained +0.457% / +0.275%, on a
+grained synthetic crossfade -0.339%, on the legacy synthetic clip +0.526%,
+on a dip-to-black -0.288%, non-dissolve control -0.242% -- no clip reached
+1.0%, so the gate failed on all tested content including progressive and
+the PAFF question was moot.  The feature is dead, not merely field-broken,
+and the disable is permanent.
+
+External evidence points the same way.  Implicit bipred weighting entered
+x264 in February 2005 (svn r134) with no published measurement behind it.
+The celebrated weighted-prediction gains in the literature are all about
+EXPLICIT weights on fades to/from black (up to 67% bitrate reduction,
+Boyce, ISCAS 2004) -- weightp territory, not weightb.  And HEVC dropped
+the implicit mode from the standard entirely: "in HEVC only explicit
+weighted prediction is applied" (Sullivan et al., HEVC overview, IEEE
+TCSVT 2012); VVC likewise has no POC-distance-derived bipred weights.
+Twenty years without a single published implicit-weightb gain
+measurement, and silent removal from both successor standards, is
+consistent with what we measured.
+
+The measurement stands are kept in
+"tools/test_paff.sh weightb" (archived synthetic cell) and
+"tools/test_paff.sh weightb2" (the re-measurement matrix; clip set and
+thresholds in the paff-weightb-remeasure change); with the force-off
+in place the PAFF on-rows warn and encode weightb-off, so reproducing PAFF
+numbers requires locally reverting the validation block in
+x264_encoder_open first (the exact hunk is documented on cmd_weightb2).
 
 
 Threading

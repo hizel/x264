@@ -201,9 +201,12 @@ They overflow when L1 is field-doubled (≥6 entries); under PAFF the
 Bipred weighting for B slices (`--weightb`, PPS `weighted_bipred_idc`).
 x264 only signals idc = 2 (implicit): no weights in the bitstream, the
 decoder derives them from POC distances (§8.4.3). Under PAFF it is
-force-disabled with a warning -- measured and rejected: conformance-correct
-but ~0.3% BD-rate gain on dissolve content, below the 0.5% floor
-(doc/paff.txt). Not to be confused with weightp (P slices, explicit
+force-disabled with a warning -- measured and rejected twice:
+conformance-correct but gainless; the re-measurement
+(paff-weightb-remeasure) added a progressive positive control on
+real-scene crossfade content and no clip reached the 1.0% gate, so the
+feature is dead even outside PAFF on the tested content (doc/paff.txt).
+Not to be confused with weightp (P slices, explicit
 weights in the slice header).
 _Avoid_: explicit bipred weights
 
