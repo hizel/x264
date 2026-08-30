@@ -231,7 +231,26 @@ _Avoid_: milestone
 **Checkpoint**:
 The verification at the end of a milestone: usually a byte-exact
 comparison of x264 output against the JM reference decoder.
-_Avoid_: gate
+_Avoid_: gate as a synonym for checkpoint (a **Quality gate** is a
+different thing, see below)
+
+**Quality gate**:
+A numeric threshold in a measurement stand, fixed BEFORE measuring
+(pre-registered), so the threshold cannot be fitted to the result:
+G0/Q1/Q2 in the mbtree stand, the 1.0% floor in the weightb stands.
+Answers "did the hypothesis hold?", not "is the code broken?" -- that
+is Checkpoint's job.
+_Avoid_: acceptance criterion (too broad)
+
+**Measurement stand**:
+A kept, re-runnable quality-measurement setup: a cell of
+`tools/test_paff.sh` (weightb2, mbtree, ...) together with its
+pre-registered quality gates and clip recipes (real clips via env
+vars, missing clip = skipped; synthetic smoke clip = pipeline
+self-check only, no gates asserted).  Stands are evidence-on-demand,
+not CI: quality gates report PASS/FAIL, only validity checks (rig
+controls like G0) abort non-zero.
+_Avoid_: benchmark (implies performance, not quality)
 
 **JM / ldecod**:
 The ITU reference H.264 decoder. The correctness criterion: its output

@@ -125,6 +125,9 @@ thresholds in the paff-weightb-remeasure change); with the force-off
 in place the PAFF on-rows warn and encode weightb-off, so reproducing PAFF
 numbers requires locally reverting the validation block in
 x264_encoder_open first (the exact hunk is documented on cmd_weightb2).
+The per-field mbtree future-work item closed the same way -- measured on
+real content, no deficit, nothing to fix; see "Measured and closed" under
+Quality.
 
 
 Threading
@@ -294,11 +297,6 @@ Future work
     CBR+VBV byte-deterministic under sliced threads (an inherited
     upstream exception, not PAFF-specific).
   * Full II-pair AVC-Intra support (rejected at validation).
-  * Per-field mbtree propagation: lookahead/mbtree analyze whole frames, so
-    per-field propagate weights are ~2x off (quality-only).  Gated on a
-    PSNR/SSIM bound the PAFF series verified as passing -- do NOT touch
-    unless that bound fails (see macroblock_tree_propagate in
-    encoder/slicetype.c).
 
 
 Unsupported combinations (rejected at validation)
@@ -380,6 +378,63 @@ parallelization listed under Future work is not needed at these sizes.
 
 Progressive and MBAFF outputs are bit-identical to the pre-PAFF encoder: the
 PAFF paths are gated on param.b_paff and never run otherwise.
+
+Measured and closed: per-field mbtree propagation (paff-mbtree-remeasure)
+-------------------------------------------------------------------------
+
+The lookahead and mbtree analyze whole frames, so under PAFF (where one
+"frame" is a field pair) the pair-level propagate weights are ~2x off per
+field: both fields consume the single frame-level f_qp_offset that
+macroblock_tree_propagate produces.  The open question was whether
+per-field propagation would buy measurable quality.  Pre-registered
+measurement (2026-08-30, weightb-style protocol, real content): three
+clips (hall 720p25, relax 1080p50, amv 720p29.97 cut-heavy), interlaced
+variants synthesized by field-merging adjacent progressive frames
+(tinterlace), prog/MBAFF/PAFF x mbtree on/off x CRF 18/23/28/33, BD-rate
+(PSNR-Y, 4-point cubic).  Gates fixed before measuring:
+
+  * G0 (validity): mbtree on-vs-off on the progressive control must gain
+    >= 3% BD-rate, else the stand cannot see mbtree and results are void.
+  * Q1 (the paff-b-frames 4.2 bound on real content): PAFF vs MBAFF,
+    mbtree on; PAFF must not be worse than MBAFF by > 1% BD-rate.
+  * Q2 (the actual question): PAFF's mbtree gain must be >= 50% of the
+    progressive gain on the same interlaced clip.  If |prog gain| < 1%
+    on a clip, that clip is inconclusive (the ratio is noise when mbtree
+    does nothing in weave mode anyway).
+
+Results (BD-rate, negative = saving):
+
+  gate                hall      relax     amv
+  G0  prog control    -13.2%    -12.0%    -16.7%
+  Q1  mbtree on       -16.6%    -11.0%    -12.7%
+  Q1  mbtree off (*)  -15.5%    -10.5%    -10.7%
+  Q2  prog gain        -5.26%   -10.00%    -4.36%
+  Q2  MBAFF gain       -8.86%    -9.73%    -8.30%
+  Q2  PAFF gain       -10.37%    -9.76%   -10.61%
+  Q2  ratio PAFF/prog   1.97      0.98      2.43
+
+  (*) informational: checks the PAFF/MBAFF gap is not an mbtree artifact.
+
+All gates pass on all three clips.  PAFF's mbtree gain is never below
+progressive's; on cut-heavy content it is 2.4x progressive's.  The ~2x
+per-field weight error is arithmetically real but buys no measurable
+deficit, and implementing per-field propagation would change every PAFF
+bitstream and invalidate the regression corpus in exchange for a gain the
+measurement says does not exist -- so the item is closed, permanently out
+of scope unless a future regression makes the bound fail.
+
+Measurement pitfall (why the stand is shaped this way): PSNR must be
+measured through rawvideo pipes.  ffmpeg's dual-input psnr/ssim filters
+pair frames by PTS; a 30000/1001 y4m round-tripped through mkv (1/1000
+timebase) mis-pairs every few frames, and on cut-heavy content each
+mis-pair dominates the mean (first amv run: flat ~17.9 dB garbage on a
+bit-exact stream).  Decode both sides to rawvideo first, then compare.
+
+Stand: "tools/test_paff.sh mbtree" (clip sources via PAFF_MB_SRC_HALL /
+PAFF_MB_SRC_RELAX / PAFF_MB_SRC_AMV, missing clip = skipped, lavfi smoke
+fallback always runs); BD-rate via tools/bdrate.py.  Raw point sets and
+the session's reference scripts are archived in the
+paff-mbtree-remeasure change's measurement/ directory.
 
 
 Known decoder quirks

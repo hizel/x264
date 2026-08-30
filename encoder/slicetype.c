@@ -1060,14 +1060,18 @@ static void macroblock_tree_finish( x264_t *h, x264_frame_t *frame, float averag
 
 static void macroblock_tree_propagate( x264_t *h, x264_frame_t **frames, float average_duration, int p0, int p1, int b, int referenced )
 {
-    /* PAFF/mbtree caveat (design D3): lookahead and mbtree analyze whole
-     * frames, and under PAFF one "frame" is a field pair, so average_duration
-     * and fps_factor here are pair-level.  Both fields of the pair consume the
+    /* PAFF/mbtree caveat: lookahead and mbtree analyze whole frames, and
+     * under PAFF one "frame" is a field pair, so average_duration and
+     * fps_factor here are pair-level.  Both fields of the pair consume the
      * single frame-level f_qp_offset this produces, so per-field propagation
-     * weights are systematically ~2x off.  Correctness (JM bit-exactness) does
-     * NOT depend on this -- only quality.  Per-field lowres work is gated on
-     * checkpoint 4.2 failing its PSNR/SSIM bound vs MBAFF; do nothing here
-     * unless that bound fails. */
+     * weights are systematically ~2x off.  Correctness (JM bit-exactness)
+     * does NOT depend on this -- only quality.  Measured 2026-08
+     * (paff-mbtree-remeasure): no quality deficit vs progressive/MBAFF on
+     * three real clips (pre-registered G0/Q1/Q2 gates all pass; PAFF's
+     * mbtree gain was never below progressive's), so the per-field rework
+     * is permanently out of scope unless a future regression fails the
+     * bound.  Protocol and numbers: doc/paff.txt "Measured and closed";
+     * re-runnable stand: tools/test_paff.sh mbtree. */
     uint16_t *ref_costs[2] = {frames[p0]->i_propagate_cost,frames[p1]->i_propagate_cost};
     int dist_scale_factor = ( ((b-p0) << 8) + ((p1-p0) >> 1) ) / (p1-p0);
     int i_bipred_weight = h->param.analyse.b_weighted_bipred ? 64 - (dist_scale_factor>>2) : 32;

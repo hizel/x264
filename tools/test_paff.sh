@@ -45,6 +45,18 @@
 #                   (PSNR-Y).  The PAFF weightb-on rows need the local
 #                   validation revert documented on cmd_weightb2; the command
 #                   aborts if the force-off warning shows up in an on-row log.
+#   mbtree          mbtree-under-PAFF re-measurement (paff-mbtree-remeasure,
+#                   design D1/D5): clips hall/relax/amv (real content,
+#                   tinterlace-synthesized interlaced variants + progressive
+#                   controls) x modes (prog/--interlaced/--paff) x mbtree
+#                   on/off x CRF 18/23/28/33, BD-rate (PSNR-Y) via
+#                   tools/bdrate.py, gates G0/Q1/Q2.  Encodes go through the
+#                   x264 CLI at preset medium and DEFAULT threads, so numbers
+#                   are machine-dependent; the gates carry wide margins.
+#                   Clips without a source are skipped; a lavfi testsrc2
+#                   smoke clip always runs (pipeline self-check only, no
+#                   gates asserted).  Outcome: future-work item closed, no
+#                   deficit anywhere (doc/paff.txt "Measured and closed").
 #   opengop         open-GOP round-trips vs JM: non-IDR Ip keyframe pairs
 #                   plus a hard-scene-cut clip whose GOP-tail B pairs MUST
 #                   reference across the I pair to decode correctly
@@ -67,6 +79,11 @@
 #             (lavf-readable, >= 4 s each; C1/C2 skip when unset, C5 falls
 #             back to the lavfi control recipe -- the skip/fallback is
 #             recorded with the results)
+#   PAFF_MB_SRC_HALL / PAFF_MB_SRC_RELAX / PAFF_MB_SRC_AMV
+#             real source clips for the mbtree cells (lavf-readable; hall:
+#             720p25 >= 32 s, relax: 1080p50 >= 316 s, amv: 720p29.97 >= 87 s).
+#             A clip whose env var is unset or unreadable is skipped; the
+#             lavfi smoke clip always runs.
 #   WB2_MODES mode subset for weightb2 (default: "prog tff bff"); use
 #             "prog" for the stage-1 positive control, which needs no
 #             local validation revert
@@ -106,7 +123,8 @@ bad()  { FAIL=$((FAIL+1)); echo "FAIL: $*"; }
 die()  { echo "ERROR: $*" >&2; exit 2; }
 
 # Args: the commands to run; JM ldecod is required unless every command is
-# weightb/weightb2 (the only commands that never round-trip through JM).
+# weightb/weightb2/mbtree (the only commands that never round-trip through
+# JM).
 check_tools() {
     [ -x "$X264" ]   || die "x264 binary not found/executable: $X264"
     case " $* " in
@@ -208,6 +226,11 @@ make_control_clip() {
 WB2_SRC_A=${PAFF_WB_SRC_A:-}
 WB2_SRC_B=${PAFF_WB_SRC_B:-}
 WB2_MODES=${WB2_MODES:-"prog tff bff"}
+
+# mbtree re-measurement sources (paff-mbtree-remeasure, design D1).
+MB_SRC_HALL=${PAFF_MB_SRC_HALL:-}
+MB_SRC_RELAX=${PAFF_MB_SRC_RELAX:-}
+MB_SRC_AMV=${PAFF_MB_SRC_AMV:-}
 
 have_wb2_sources()  { [ -n "$WB2_SRC_A" ] && [ -n "$WB2_SRC_B" ] && [ -f "$WB2_SRC_A" ] && [ -f "$WB2_SRC_B" ]; }
 have_wb2_source_a() { [ -n "$WB2_SRC_A" ] && [ -f "$WB2_SRC_A" ]; }
@@ -1197,6 +1220,285 @@ wb2_clip_spec() {
     esac
 }
 
+# --------------------------------------------------------------------------
+# mbtree-under-PAFF re-measurement stand (paff-mbtree-remeasure, design
+# D1/D5).  Question (the closed "Per-field mbtree propagation" future-work
+# item): lookahead/mbtree analyze whole frames, so under PAFF the pair-level
+# propagate weights are ~2x off per field -- does per-field propagation buy
+# measurable quality?  Answer (2026-08-30): no, gates below passed on all
+# three clips; see doc/paff.txt "Measured and closed".
+#
+# Per clip: interlaced variant (tinterlace field-merge of adjacent
+# progressive frames) encoded prog/MBAFF/PAFF x mbtree on/off x CRF
+# 18/23/28/33, plus a progressive control (same segment, no tinterlace)
+# encoded prog-only for the G0 validity gate.  Encodes go through the x264
+# CLI (preset medium, DEFAULT threads -- the session protocol; thread count
+# changes the PAFF MV-range clamp, so absolute numbers are machine-dependent
+# and the gates carry wide margins).  PSNR-Y is measured EXTERNALLY through
+# rawvideo pipes (the D4 timestamp-free recipe; x264's own --psnr is a mean
+# of per-picture PSNRs -- per-FIELD pictures under PAFF -- and was rejected,
+# design D5).  kbps = output bytes * 8 / clip duration, with the session's
+# per-clip duration constants; BD-rate is invariant to a per-clip kbps
+# scale, so the constants move absolute bitrates only, not the gates.
+#
+# Gates (pre-registered, design D1/D5):
+#   G0  prog-control mbtree gain <= -3% BD-rate -- validity check, ABORTS
+#       non-zero on failure (a stand that cannot see mbtree must be loud).
+#   Q1  PAFF vs MBAFF on the interlaced clip, mbtree on: PAFF not worse by
+#       > 1% BD-rate.  Report-only PASS/FAIL, exit 0.
+#   Q2  PAFF mbtree gain >= 50% of the prog gain on the same interlaced
+#       clip.  Report-only.  Denominator guard: |prog gain| < 1% prints
+#       INCONCLUSIVE instead of a ratio (the ratio is noise when mbtree
+#       does nothing in weave mode anyway).
+
+# ffmpeg 8's tinterlace=merge doubles the frame height (both fields kept at
+# full vertical resolution); ffmpeg <= 7 keeps the height.  Probe once so
+# the synthesis below produces the design-D1 geometry on either line (the
+# reference numbers in doc/paff.txt were measured with the doubling
+# behaviour; on the old behaviour the field pixels differ slightly and the
+# wide gate margins absorb it).
+mb_detect_tinterlace() {
+    local probe=$WORKDIR/mb_tint_probe.y4m h
+    ffmpeg -y -loglevel error \
+        -f lavfi -i "color=red:size=64x32:rate=50:duration=0.16" \
+        -vf tinterlace=merge -frames:v 4 -pix_fmt yuv420p "$probe" \
+        || die "mbtree: tinterlace probe failed"
+    h=$(ffprobe -v error -select_streams v -show_entries stream=height \
+        -of csv=p=0 "$probe")
+    rm -f "$probe"
+    case $h in
+        32) MB_TINT_DOUBLES=0 ;;
+        64) MB_TINT_DOUBLES=1 ;;
+        *)  die "mbtree: unexpected tinterlace probe height '$h'" ;;
+    esac
+}
+
+# Clip table (design D1, window/frame-count details verified against the
+# archived session clips in openspec/changes/paff-mbtree-remeasure/
+# measurement/); sets MB_W MB_H MB_SRC MB_SS MB_FPS_P MB_SECS_I MB_SECS_P.
+# The interlaced variant holds 400 coded frames (800 source frames
+# field-merged into pairs, top field from the even frame); the progressive
+# control (used by G0 only) holds 200 source frames (at 25 fps for relax,
+# whose 50 fps native rate would otherwise double the control's frame
+# count).  MB_SS is the input seek in seconds (accurate seek: frames are
+# decoded and discarded up to the timestamp -- do NOT use a trim filter
+# here, a frame-dropping filter before tinterlace makes it duplicate its
+# first output frame).  MB_SECS_* are TRUE durations (frames/fps); the
+# session's constants assumed 200-frame interlaced clips but the archived
+# clips carry 400 -- harmless there (BD-rate is invariant to a per-clip
+# kbps scale), corrected here.
+mb_clip_spec() {
+    case $1 in
+        hall)  MB_W=1280; MB_H=720;  MB_SRC=$MB_SRC_HALL;  MB_SS=""; MB_FPS_P=""
+               MB_SECS_I=32.0;     MB_SECS_P=8.0 ;;
+        relax) MB_W=1920; MB_H=1080; MB_SRC=$MB_SRC_RELAX; MB_SS=300; MB_FPS_P=25
+               MB_SECS_I=16.0;     MB_SECS_P=8.0 ;;
+        amv)   MB_W=1280; MB_H=720;  MB_SRC=$MB_SRC_AMV;   MB_SS=60;  MB_FPS_P=""
+               MB_SECS_I=26.69333; MB_SECS_P=6.67333 ;;
+        smoke) MB_W=640;  MB_H=720;  MB_SRC="";           MB_SS=""; MB_FPS_P=""
+               MB_SECS_I=16.0;     MB_SECS_P=8.0 ;;
+        *)     die "mbtree: unknown clip $1" ;;
+    esac
+}
+
+# Synthesize the interlaced and progressive variants of one clip (design D1
+# recipes; <clip>_i.y4m and <clip>_p.y4m in $WORKDIR, cached across runs).
+mb_make_clip() {
+    local clip=$1 psh iv pv seek vf_i vf_p n v
+    mb_clip_spec $clip
+    psh=$MB_H; [ "$MB_TINT_DOUBLES" = 1 ] && psh=$((MB_H / 2))
+    iv=$WORKDIR/mb_${clip}_i.y4m
+    pv=$WORKDIR/mb_${clip}_p.y4m
+    seek=""
+    [ -n "$MB_SS" ] && seek="-ss $MB_SS"
+    if [ -n "$MB_SRC" ]; then
+        vf_i="scale=${MB_W}:${psh},tinterlace=merge"
+        vf_p="scale=${MB_W}:${MB_H}"
+        [ -n "$MB_FPS_P" ] && vf_p="fps=$MB_FPS_P,$vf_p"
+        [ -f "$iv" ] || ffmpeg -y -loglevel error $seek -i "$MB_SRC" -map 0:v:0 \
+            -vf "$vf_i" -frames:v 400 -pix_fmt yuv420p "$iv" \
+            || die "mbtree: failed to synthesize $iv"
+        [ -f "$pv" ] || ffmpeg -y -loglevel error $seek -i "$MB_SRC" -map 0:v:0 \
+            -vf "$vf_p" -frames:v 200 -pix_fmt yuv420p "$pv" \
+            || die "mbtree: failed to synthesize $pv"
+    else
+        # lavfi testsrc2 smoke clip (always runs; pipeline self-check only).
+        [ -f "$iv" ] || ffmpeg -y -loglevel error \
+            -f lavfi -i "testsrc2=size=${MB_W}x${psh}:rate=50:duration=16" \
+            -vf tinterlace=merge -frames:v 400 -pix_fmt yuv420p "$iv" \
+            || die "mbtree: failed to synthesize $iv"
+        [ -f "$pv" ] || ffmpeg -y -loglevel error \
+            -f lavfi -i "testsrc2=size=${MB_W}x${MB_H}:rate=25:duration=8" \
+            -frames:v 200 -pix_fmt yuv420p "$pv" \
+            || die "mbtree: failed to synthesize $pv"
+    fi
+    for v in i p; do
+        local want=400; [ $v = p ] && want=200
+        n=$(ffprobe -v error -count_packets -select_streams v \
+            -show_entries stream=nb_read_packets -of csv=p=0 \
+            "$WORKDIR/mb_${clip}_${v}.y4m")
+        [ "$n" = $want ] || die "mbtree: $clip/$v: expected $want frames, got '$n' (source segment too short?)"
+    done
+}
+
+# PSNR-Y of an encoded stream vs its y4m reference, paired through rawvideo
+# pipes (design D4: the dual-input psnr filter pairs by PTS and mis-pairs
+# 30000/1001 content round-tripped through mkv; decode both sides first,
+# then compare timestamp-free with the framerate forced equal).  The
+# decodes run with -fps_mode passthrough: without it ffmpeg's default
+# timestamp scaling duplicates frames when the VUI framerate differs from
+# the raw-stream default (e.g. 12.5 fps tinterlace output decodes to 2x
+# frames).
+mb_psnr() {
+    local out=$1 ref=$2 wh=$3
+    local dec=$WORKDIR/.mb_dec.yuv rfd=$WORKDIR/.mb_ref.yuv
+    ffmpeg -hide_banner -y -v error -i "$out" -fps_mode passthrough \
+           -c:v rawvideo -pix_fmt yuv420p -f rawvideo "$dec" \
+        && ffmpeg -hide_banner -y -v error -i "$ref" -fps_mode passthrough \
+           -c:v rawvideo -pix_fmt yuv420p -f rawvideo "$rfd" \
+        || { rm -f "$dec" "$rfd"; return 1; }
+    ffmpeg -hide_banner -s "$wh" -pix_fmt yuv420p -framerate 30 -i "$dec" \
+           -s "$wh" -pix_fmt yuv420p -framerate 30 -i "$rfd" \
+           -lavfi psnr -f null - 2>&1 \
+        | sed -n 's/.*PSNR y:\([0-9.inf]*\).*/\1/p' | tail -1
+    rm -f "$dec" "$rfd"
+}
+
+# BD-rate of the curve in $2 vs the curve in $1 (negative = $2 saves bits).
+# Prints the value; non-zero exit on error.  NOTE: callers must check the
+# exit status in the main shell (var=$(mb_bdrate ...) || die ...) -- a die
+# inside command substitution would only kill the subshell.
+mb_bdrate() {
+    python3 "$REPO_ROOT/tools/bdrate.py" "$1" "$2"
+}
+
+# Encode one matrix cell and measure it.  Appends "psnr kbps" to the point
+# file $9 and sets MB_LAST_PSNR.  Encodes are cached ($out exists => skip),
+# PSNR measurement always runs so re-runs regenerate the point files.
+# Args: name mode(prog|mbaff|paff) mb(0|1) crf src.y4m secs WxH frames ptsfile
+mb_cell() {
+    local name=$1 mode=$2 mb=$3 crf=$4 src=$5 secs=$6 wh=$7 frames=$8 pts=$9
+    local out=$WORKDIR/mb_${name}.264 log=$WORKDIR/mb_${name}.log
+    local opts psnr kbps bytes
+    case $mode in
+        prog)  opts="--no-interlaced" ;;   # y4m carries It; force the weave
+        mbaff) opts="--interlaced --tff" ;;
+        paff)  opts="--paff --tff" ;;
+        *)     die "mbtree: unknown mode $mode" ;;
+    esac
+    [ "$mb" = 0 ] && opts="$opts --no-mbtree"
+    if [ ! -s "$out" ]; then
+        "$X264" "$src" --frames $frames --preset medium --crf $crf $opts \
+            -o "$out" >"$log" 2>&1 \
+            || { bad "mbtree: $name: x264 encode failed (see $log)"; return 1; }
+    fi
+    psnr=$(mb_psnr "$out" "$src" "$wh") || { bad "mbtree: $name: PSNR measure failed"; return 1; }
+    [ -n "$psnr" ] || { bad "mbtree: $name: no PSNR line parsed"; return 1; }
+    bytes=$(stat -c%s "$out")
+    kbps=$(awk "BEGIN{printf \"%.3f\", $bytes * 8 / $secs / 1000}")
+    printf '%s %s\n' "$psnr" "$kbps" >> "$pts"
+    printf '  %-26s %4s %12s %10s\n' "$name" "$crf" "$kbps" "$psnr"
+    MB_LAST_PSNR=$psnr
+}
+
+# Run the full matrix on one clip; when $2=1 evaluate the gates (G0 aborts,
+# Q1/Q2 report-only), when $2=0 only the pipeline self-checks run (smoke).
+mb_run_clip() {
+    local clip=$1 gated=$2
+    mb_clip_spec $clip
+    local iv=$WORKDIR/mb_${clip}_i.y4m pv=$WORKDIR/mb_${clip}_p.y4m
+    local wh=${MB_W}x${MB_H}
+    local variant mode mb crf pts src secs modes nframes
+    printf '  %-26s %4s %12s %10s\n' cell crf kbps psnr_y
+    for variant in i p; do
+        src=$iv; secs=$MB_SECS_I; modes="prog mbaff paff"; nframes=400
+        if [ $variant = p ]; then src=$pv; secs=$MB_SECS_P; modes=prog; nframes=200; fi
+        for mode in $modes; do
+            for mb in 1 0; do
+                pts=$WORKDIR/mb_pts_${clip}_${variant}_${mode}_mb${mb}.txt
+                : > "$pts"
+                for crf in 18 23 28 33; do
+                    mb_cell ${clip}_${variant}_${mode}_mb${mb}_crf${crf} \
+                        $mode $mb $crf "$src" "$secs" "$wh" $nframes "$pts"
+                    # Pipeline self-check (task 2.2): CRF-18 progressive
+                    # rows must exceed 40 dB on every clip.
+                    if [ $mode = prog ] && [ $crf = 18 ]; then
+                        if [ -n "${MB_LAST_PSNR:-}" ] \
+                           && awk "BEGIN{exit !($MB_LAST_PSNR > 40)}"; then
+                            ok "mbtree $clip/$variant: CRF-18 prog PSNR-Y ${MB_LAST_PSNR} dB > 40"
+                        else
+                            bad "mbtree $clip/$variant: CRF-18 prog PSNR-Y '${MB_LAST_PSNR:-}' <= 40"
+                        fi
+                    fi
+                done
+            done
+        done
+    done
+    [ "$gated" = 1 ] || return 0
+
+    local g0 q1 q1off gp gm gf ratio st
+    # G0 (validity): prog-control mbtree gain (BD-rate on vs off) <= -3%.
+    g0=$(mb_bdrate $WORKDIR/mb_pts_${clip}_p_prog_mb0.txt $WORKDIR/mb_pts_${clip}_p_prog_mb1.txt) \
+        || die "mbtree: $clip: G0 BD-rate computation failed"
+    if awk "BEGIN{exit !($g0 <= -3.0)}"; then
+        echo "G0 $clip: prog-control mbtree gain ${g0}% (validity gate <= -3%) OK"
+    else
+        die "mbtree: $clip: G0 FAILED -- prog-control mbtree gain ${g0}% > -3%; the stand cannot see mbtree on this clip, results void"
+    fi
+    # Q1 (report-only): PAFF vs MBAFF, mbtree on, must not be worse by > 1%.
+    q1=$(mb_bdrate $WORKDIR/mb_pts_${clip}_i_mbaff_mb1.txt $WORKDIR/mb_pts_${clip}_i_paff_mb1.txt) \
+        || die "mbtree: $clip: Q1 BD-rate computation failed"
+    q1off=$(mb_bdrate $WORKDIR/mb_pts_${clip}_i_mbaff_mb0.txt $WORKDIR/mb_pts_${clip}_i_paff_mb0.txt) \
+        || die "mbtree: $clip: Q1(off) BD-rate computation failed"
+    st=FAIL; awk "BEGIN{exit !($q1 <= 1.0)}" && st=PASS
+    echo "Q1 $clip: PAFF vs MBAFF mbtree-on BD-rate ${q1}% (gate <= +1%) $st   [mbtree off: ${q1off}%, informational]"
+    # Q2 (report-only): PAFF mbtree gain >= 50% of the prog gain, same clip.
+    gp=$(mb_bdrate $WORKDIR/mb_pts_${clip}_i_prog_mb0.txt  $WORKDIR/mb_pts_${clip}_i_prog_mb1.txt) \
+        || die "mbtree: $clip: Q2 BD-rate computation failed"
+    gm=$(mb_bdrate $WORKDIR/mb_pts_${clip}_i_mbaff_mb0.txt $WORKDIR/mb_pts_${clip}_i_mbaff_mb1.txt) \
+        || die "mbtree: $clip: Q2 BD-rate computation failed"
+    gf=$(mb_bdrate $WORKDIR/mb_pts_${clip}_i_paff_mb0.txt  $WORKDIR/mb_pts_${clip}_i_paff_mb1.txt) \
+        || die "mbtree: $clip: Q2 BD-rate computation failed"
+    echo "Q2 $clip: mbtree gains (BD-rate on vs off): prog ${gp}%  MBAFF ${gm}%  PAFF ${gf}%"
+    if awk "BEGIN{exit !($gp > -1.0 && $gp < 1.0)}"; then
+        echo "Q2 $clip: INCONCLUSIVE -- |prog gain| ${gp}% < 1% (denominator guard)"
+    else
+        ratio=$(awk "BEGIN{printf \"%.3f\", $gf / $gp}")
+        st=FAIL; awk "BEGIN{exit !($ratio >= 0.50)}" && st=PASS
+        echo "Q2 $clip: PAFF/prog gain ratio $ratio (gate >= 0.50) $st"
+    fi
+}
+
+cmd_mbtree() {
+    command -v python3 >/dev/null || die "mbtree: python3 needed for tools/bdrate.py"
+    mb_detect_tinterlace
+    echo "mbtree: ffmpeg $(ffmpeg -version | sed -n 's/^ffmpeg version //p' | head -1), tinterlace height-$([ "$MB_TINT_DOUBLES" = 1 ] && echo doubling || echo keeping)"
+    echo "mbtree: encodes via $X264, preset medium, default threads -- numbers are machine-dependent (design D5)"
+    local clips="" c
+    for c in hall relax amv; do
+        mb_clip_spec $c
+        if [ -n "$MB_SRC" ] && [ -f "$MB_SRC" ]; then
+            clips="$clips $c"
+            echo "mbtree: clip $c source $MB_SRC"
+        else
+            echo "mbtree: PAFF_MB_SRC_$(echo $c | tr '[a-z]' '[A-Z]') unset or unreadable -- clip $c skipped"
+        fi
+    done
+    clips="$clips smoke"
+    for c in $clips; do
+        mb_make_clip $c
+    done
+    for c in $clips; do
+        echo "===== $c ====="
+        if [ $c = smoke ]; then
+            echo "SMOKE (synthetic) -- gates not asserted"
+            mb_run_clip $c 0
+        else
+            mb_run_clip $c 1
+        fi
+    done
+}
+
 # Lookahead-range parity with progressive (spec scenario, observable only
 # via the debug log, not the bitstream): the lookahead analyzes whole frames
 # under PAFF, so its lowres search range must equal the progressive run's.
@@ -1245,6 +1547,7 @@ for cmd in $cmds; do
         motion)         cmd_motion ;;
         weightb)        cmd_weightb ;;
         weightb2)       cmd_weightb2 ;;
+        mbtree)         cmd_mbtree ;;
         opengop)        cmd_opengop ;;
         all)            cmd_baseline_check; cmd_paff; cmd_matrix; cmd_rc; cmd_sliced; cmd_la_range; cmd_wide_range; cmd_motion; cmd_opengop ;;
         *)              die "unknown command: $cmd" ;;
