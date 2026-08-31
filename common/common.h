@@ -460,6 +460,9 @@ struct x264_t
      * halving the X264_REF_MAX opcode budget; once exhausted further
      * evictions are skipped rather than overflowing the buffer. */
     int b_paff_mmco_clamp_warned;
+    /* one-shot warning flag for the PAFF-B L1 field-entry clamp (bipred
+     * table capacity); same pattern as b_paff_mmco_clamp_warned */
+    int b_paff_l1_clamp_warned;
 
     /* cabac context */
     x264_cabac_t    cabac;

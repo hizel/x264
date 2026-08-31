@@ -219,6 +219,12 @@ Unsupported combinations (rejected at validation)
   * --paff with --interlaced (MBAFF) or fake interlacing.
   * --paff with an AVC-Intra class (i_avcintra_class).  Full II-pair AVC-Intra
     support is future work.
+  * --paff with --intra-refresh: untested combination (the recovery-point SEI
+    and the PIR column bookkeeping are frame-oriented; nobody has validated
+    them against per-field access units).
+  * --paff with --frame-packing: the packing SEI carries frame-picture
+    semantics (frame0/frame1 arrangement) that conflict with the forced
+    per-field pic_struct of a complementary field pair.
   * --paff with --sliced-threads (see Threading).
   * --paff with --weightb: force-disabled with a warning (measured and
     rejected: no quality gain, see Rate control and VBV).
@@ -254,7 +260,11 @@ These are content-dependent; the ordering (PAFF >= progressive > MBAFF) holds
 across the tested clips but the gaps shrink on nearly-progressive material.
 
 Progressive and MBAFF outputs are bit-identical to the pre-PAFF encoder: the
-PAFF paths are gated on param.b_paff and never run otherwise.
+PAFF paths are gated on param.b_paff and never run otherwise.  (The one
+exception anywhere in the stream is the version SEI's encoder identification
+-- X264_BUILD/X264_VERSION necessarily differ between builds.  Measured: 9/9
+configs byte-identical against the pre-PAFF tree with equalized version
+strings; threaded CBR+VBV differs by design, see doc/threads.txt.)
 
 
 Known decoder quirks

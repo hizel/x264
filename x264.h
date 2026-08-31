@@ -47,8 +47,9 @@ extern "C" {
 
 #define X264_BUILD 166
 
-/* This build supports PAFF field-picture encoding (x264_param_t.b_paff). */
-#define X264_HAVE_PAFF 1
+/* This build supports PAFF field-picture encoding (x264_param_t.b_paff).
+ * PAFF needs interlaced support, so this mirrors X264_INTERLACED. */
+#define X264_HAVE_PAFF X264_INTERLACED
 
 #ifdef _WIN32
 #   define X264_DLL_IMPORT __declspec(dllimport)
@@ -394,9 +395,10 @@ typedef struct x264_param_t
     int         b_interlaced;
     /* PAFF: code each frame as a complementary field pair (field_pic_flag=1).
      * Field order (top/bottom first) follows b_tff.  Mutually exclusive with
-     * b_interlaced; sliced threads and AVC-Intra are rejected; weighted
-     * biprediction is force-disabled.  B-frames and frame threading (one
-     * field pair per thread slot) are supported. */
+     * b_interlaced; sliced threads, AVC-Intra, intra refresh and frame
+     * packing are rejected; weighted biprediction is force-disabled.
+     * B-frames and frame threading (a pair occupies two consecutive thread
+     * slots) are supported. */
     int         b_paff;
     int         b_constrained_intra;
 

@@ -483,6 +483,22 @@ static int validate_parameters( x264_t *h, int b_open )
             x264_log( h, X264_LOG_ERROR, "PAFF is not supported with AVC-Intra\n" );
             return -1;
         }
+        if( h->param.b_intra_refresh )
+        {
+            /* Untested combination: the recovery-point SEI and the PIR
+             * column bookkeeping are frame-oriented, and nobody has
+             * validated them against per-field access units. */
+            x264_log( h, X264_LOG_ERROR, "PAFF is not supported with intra refresh\n" );
+            return -1;
+        }
+        if( h->param.i_frame_packing >= 0 )
+        {
+            /* The frame-packing SEI carries frame-picture semantics
+             * (frame0/frame1 arrangement) that conflict with the forced
+             * per-field pic_struct of a complementary field pair. */
+            x264_log( h, X264_LOG_ERROR, "PAFF is not supported with frame packing\n" );
+            return -1;
+        }
         /* Weighted prediction (weightp) on P fields: pair-level estimated
          * weights are mapped onto field-entry references in
          * weighted_pred_init.  Weighted biprediction (weightb):
@@ -3361,7 +3377,11 @@ static void paff_expand_field_list( x264_t *h, int i_list, int parity, int b_com
      * conformant via num_ref_idx_l1_active (signalled below), just fewer refs. */
     if( i_list && out > 4 )
     {
-        x264_log( h, X264_LOG_WARNING, "PAFF B L1 clamped to 4 field references (bipred table cap)\n" );
+        if( !h->b_paff_l1_clamp_warned )
+        {
+            h->b_paff_l1_clamp_warned = 1;
+            x264_log( h, X264_LOG_WARNING, "PAFF B L1 clamped to 4 field references (bipred table cap)\n" );
+        }
         out = 4;
     }
 
@@ -3771,8 +3791,17 @@ cont:
             }
         }
 
-        /* Free mb info after the last thread's done using it */
-        if( h->fdec->mb_info_free && (!h->param.b_sliced_threads || h->i_thread_idx == (h->param.i_threads-1)) )
+        /* Free mb info after the last thread's done using it.
+         * PAFF: NO per-pass free -- both passes of a pair share
+         * fdec->mb_info and pass 1's analysis still reads it after pass 0
+         * ends (analyse.c fast-skip/CONSTANT-flag reset).  Under frame
+         * threading the two passes run CONCURRENTLY on two slots, so a
+         * pass-0 free is a use-after-free against the app-owned buffer and
+         * can call the app's free callback twice.  The pair-level drivers
+         * free it once per pair instead: paff_pair_write (t1) and
+         * paff_merge_pass (frame threading). */
+        if( h->fdec->mb_info_free && !(FIELD_PIC && h->param.b_paff)
+         && (!h->param.b_sliced_threads || h->i_thread_idx == (h->param.i_threads-1)) )
         {
             h->fdec->mb_info_free( h->fdec->mb_info );
             h->fdec->mb_info = NULL;
@@ -4210,6 +4239,16 @@ static void *paff_pair_write( x264_t *h )
     /* All entries in stat.frame are ints except for ssd/ssim. */
     for( size_t j = 0; j < (offsetof(x264_t,stat.frame.i_ssd) - offsetof(x264_t,stat.frame.i_mv_bits)) / sizeof(int); j++ )
         ((int*)&h->stat.frame)[j] += ((int*)&stat_first)[j];
+    /* PAFF: no pass freed the pair-shared fdec->mb_info (pass 1's
+     * analysis still reads it after pass 0 ends); free it now, once per
+     * pair -- the app callback fires once per pair, matching the
+     * progressive driver.  Frame threading frees in paff_merge_pass. */
+    if( h->fdec->mb_info_free )
+    {
+        h->fdec->mb_info_free( h->fdec->mb_info );
+        h->fdec->mb_info = NULL;
+        h->fdec->mb_info_free = NULL;
+    }
     paff_frame_finish( h );
     return (void*)(intptr_t)0;
 }
@@ -4294,6 +4333,16 @@ static int paff_merge_pass( x264_t *h, x264_t *h1 )
     h->out.i_paff_au_boundary = h->out.i_nal;
     for( int i = 0; i < h1->out.i_nal; i++ )
         h->out.nal[h->out.i_nal++] = h1->out.nal[i];
+
+    /* Free the pair-shared fdec->mb_info once, now that both pass jobs
+     * are complete (the slice_write tail suppresses the per-pass free
+     * under PAFF: pass 1's analysis reads it past pass 0's job end). */
+    if( h->fdec->mb_info_free )
+    {
+        h->fdec->mb_info_free( h->fdec->mb_info );
+        h->fdec->mb_info = NULL;
+        h->fdec->mb_info_free = NULL;
+    }
 
     /* The pair is complete: the full-frame quality measurement runs here,
      * not in a job -- a non-reference pair's passes never wait on each
@@ -5407,6 +5456,12 @@ static int encoder_frame_end( x264_t *h, x264_t *thread_current, x264_t *thread_
         x264_nal_t nal_tmp = h->out.nal[h->out.i_nal-1];
         memmove( &h->out.nal[idx+1], &h->out.nal[idx], (h->out.i_nal-idx-1)*sizeof(x264_nal_t) );
         h->out.nal[idx] = nal_tmp;
+        /* PAFF: the insertion shifts every later NAL right by one, so move
+         * the pair's second-field AU boundary with them -- encapsulation
+         * puts the 4-byte startcode on it (Annex B zero_byte for the second
+         * field's AU) and ratecontrol splits the per-field VBV bits there. */
+        if( h->param.b_paff && idx <= h->out.i_paff_au_boundary )
+            h->out.i_paff_au_boundary++;
     }
 
     int frame_size = encoder_encapsulate_nals( h, 0 );
@@ -6088,6 +6143,10 @@ int x264_encoder_delayed_frames( x264_t *h )
     {
         for( int i = 0; i < h->i_thread_frames; i++ )
             delayed_frames += h->thread[i]->b_thread_active;
+        /* PAFF: a complementary pair is coded as two pass jobs on two
+         * slots, but it is one delayed frame to the caller. */
+        if( h->param.b_paff )
+            delayed_frames >>= 1;
         h = h->thread[h->i_thread_phase];
     }
     for( int i = 0; h->frames.current[i]; i++ )
