@@ -3031,8 +3031,13 @@ intra_analysis:
         }
         else
         {
-            /* Special fast-skip logic using information from mb_info. */
-            if( h->fdec->mb_info && (h->fdec->mb_info[h->mb.i_mb_xy]&X264_MBINFO_CONSTANT) )
+            /* Special fast-skip logic using information from mb_info.
+             * PAFF: the bottom MB row can be the even-padding added to
+             * i_mb_height for field coding (set.c) -- it lies outside the
+             * caller's mb_info array, which has one byte per MB of the
+             * unpadded frame grid. */
+            if( h->fdec->mb_info && !(h->param.b_paff && h->mb.i_mb_y*16 >= h->param.i_height)
+                && (h->fdec->mb_info[h->mb.i_mb_xy]&X264_MBINFO_CONSTANT) )
             {
                 if( !SLICE_MBAFF && (h->fdec->i_frame - h->fref[0][0]->i_frame) == 1 && !h->sh.b_weighted_pred &&
                     h->fref[0][0]->effective_qp[h->mb.i_mb_xy] <= h->mb.i_qp )

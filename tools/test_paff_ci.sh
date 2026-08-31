@@ -18,7 +18,8 @@
 #     fixed-N byte repeatability, and a sliced CBR+VBV CPB check;
 #   - unsupported combinations are rejected at validation (non-zero exit):
 #     PAFF+sliced with explicit sub-slicing, PAFF+slice-max-mbs/--slices at
-#     any thread count, --pulldown, --avcintra-class.
+#     any thread count, --pulldown, --avcintra-class, --intra-refresh,
+#     --frame-packing.
 #
 # It uses raw YUV input (--input-res) and raw Annex-B output, so it needs no
 # lavf/swscale linkage and no ffmpeg.  The clip is synthesized with python3.
@@ -182,6 +183,8 @@ encode_fail "--paff --slice-max-mbs (any threads)"      --paff --slice-max-mbs 3
 encode_fail "--paff --slices (any threads)"             --paff --slices 2
 encode_fail "--paff --pulldown"         --paff --pulldown 1
 encode_fail "--paff --avcintra-class"   --paff --avcintra-class 50
+encode_fail "--paff --intra-refresh"    --paff --intra-refresh
+encode_fail "--paff --frame-packing"    --paff --frame-packing 3
 
 # 5. B-field matrix (14 configs from paff-b-frames/checkpoint-4.1-4.3.md):
 #    encode-only smoke -- CI has no JM/ffmpeg oracle, so this only checks that

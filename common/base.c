@@ -1488,7 +1488,11 @@ char *x264_param2string( x264_param_t *p, int b_res )
     s += sprintf( s, " nr=%d", p->analyse.i_noise_reduction );
     s += sprintf( s, " decimate=%d", p->analyse.b_dct_decimate );
     s += sprintf( s, " interlaced=%s", p->b_interlaced ? p->b_tff ? "tff" : "bff" : p->b_fake_interlaced ? "fake" : "0" );
-    s += sprintf( s, " paff=%d", p->b_paff );
+    /* printed only when enabled: this string lands in the version SEI and
+     * the 2-pass stats header, and non-PAFF output must stay byte-identical
+     * to the pre-PAFF encoder */
+    if( p->b_paff )
+        s += sprintf( s, " paff=%d", p->b_paff );
     s += sprintf( s, " bluray_compat=%d", p->b_bluray_compat );
     if( p->b_stitchable )
         s += sprintf( s, " stitchable=%d", p->b_stitchable );

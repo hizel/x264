@@ -281,10 +281,11 @@ test-aarch64-qemu:
         done
 
 # PAFF internal conformance smoke test (JM-free, ffmpeg-free).  Runs the
-# forced-single-thread PAFF encoder through a config matrix, checks thread
-# determinism, verifies an --nal-hrd cbr stream against the Annex C CPB
-# simulator (tools/check_hrd.py), and asserts that unsupported combinations
-# are rejected.  See tools/test_paff_ci.sh and doc/paff.txt.
+# PAFF encoder through a config matrix (single-threaded, frame-threaded and
+# sliced-threaded), checks fixed-N determinism, verifies an --nal-hrd cbr
+# stream against the Annex C CPB simulator (tools/check_hrd.py), and asserts
+# that unsupported combinations are rejected.  See tools/test_paff_ci.sh and
+# doc/paff.txt.
 test-paff-debian-amd64:
     stage: test
     image: registry.videolan.org/vlc-debian-unstable:20240212151604

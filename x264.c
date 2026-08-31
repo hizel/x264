@@ -716,9 +716,10 @@ static void help( x264_param_t *defaults, int longhelp )
     H0( "      --bff                   Enable interlaced mode (bottom field first)\n" );
     H2( "      --paff                  Enable PAFF interlaced mode (field pictures).\n"
         "                              Field order follows --tff/--bff. Each input frame is\n"
-        "                              coded as a complementary field pair. Incompatible with\n"
-        "                              MBAFF, AVC-Intra, sliced threads and pulldown; forces\n"
-        "                              single-threaded encoding. See doc/paff.txt.\n" );
+        "                              coded as a complementary field pair. Mutually exclusive\n"
+        "                              with MBAFF and AVC-Intra; incompatible with pulldown.\n"
+        "                              Frame threading and sliced threads are supported.\n"
+        "                              See doc/paff.txt.\n" );
     H2( "      --constrained-intra     Enable constrained intra prediction.\n" );
     H0( "      --pulldown <string>     Use soft pulldown to change frame rate\n"
         "                                  - %s (requires cfr input)\n", stringify_names( buf, x264_pulldown_names ) );
@@ -1408,6 +1409,7 @@ static int parse( int argc, char **argv, x264_param_t *param, cli_opt_t *opt )
     int b_user_ref = 0;
     int b_user_fps = 0;
     int b_user_interlaced = 0;
+    int b_user_mbaff = 0;
     cli_input_opt_t input_opt;
     cli_output_opt_t output_opt;
     char *preset = NULL;
@@ -1535,6 +1537,10 @@ static int parse( int argc, char **argv, x264_param_t *param, cli_opt_t *opt )
                 goto generic_option;
             case OPT_INTERLACED:
                 b_user_interlaced = 1;
+                /* tff/bff select field order (valid under --paff too);
+                 * only an explicit --interlaced is an MBAFF request */
+                if( !strcmp( long_options[long_options_index].name, "interlaced" ) )
+                    b_user_mbaff = 1;
                 goto generic_option;
             case OPT_TCFILE_IN:
                 tcfile_name = optarg;
@@ -1625,6 +1631,12 @@ generic_option:
     /* Apply profile restrictions. */
     if( x264_param_apply_profile( param, profile ) < 0 )
         return -1;
+
+    /* --tff/--bff select field order under --paff too; only an explicit
+     * --interlaced is an MBAFF request, which --paff silently overrides
+     * in encode() -- say so. */
+    if( param->b_paff && b_user_mbaff )
+        x264_cli_log( "x264", X264_LOG_WARNING, "--paff is mutually exclusive with --interlaced: ignoring MBAFF request, coding field pictures\n" );
 
     /* Get the file name */
     FAIL_IF_ERROR( optind > argc - 1 || !output_filename, "No %s file. Run x264 --help for a list of options.\n",

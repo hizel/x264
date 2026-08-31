@@ -3063,6 +3063,10 @@ void x264_paff_slice_restore_pair_plan( x264_t *h )
     {
         rc->frame_size_planned = h->paff_slice_pair_plan;
         rc->frame_size_maximum = h->paff_slice_pair_maximum;
+        /* consume the mark: the next pair's field budget may early-return
+         * (frame_size_planned <= 0) without setting it, and a stale mark
+         * would install the PREVIOUS pair's plan here */
+        h->paff_slice_pair_plan = 0;
     }
 }
 

@@ -305,6 +305,12 @@ Unsupported combinations (rejected at validation)
   * --paff with --interlaced (MBAFF) or fake interlacing.
   * --paff with an AVC-Intra class (i_avcintra_class).  Full II-pair AVC-Intra
     support is future work.
+  * --paff with --intra-refresh: untested combination (the recovery-point SEI
+    and the PIR column bookkeeping are frame-oriented; nobody has validated
+    them against per-field access units).
+  * --paff with --frame-packing: the packing SEI carries frame-picture
+    semantics (frame0/frame1 arrangement) that conflict with the forced
+    per-field pic_struct of a complementary field pair.
   * --paff with --sliced-threads plus any explicit sub-slicing
     (--slice-max-size, --slice-max-mbs, --slices): slice threads make one
     slice per band; slice-max-size row-recode restarts break the row
@@ -377,7 +383,11 @@ Speedup grows monotonically 2 -> 4 and clears the 1.3x-at-N=4 floor by
 parallelization listed under Future work is not needed at these sizes.
 
 Progressive and MBAFF outputs are bit-identical to the pre-PAFF encoder: the
-PAFF paths are gated on param.b_paff and never run otherwise.
+PAFF paths are gated on param.b_paff and never run otherwise.  (The one
+exception anywhere in the stream is the version SEI's encoder identification
+-- X264_BUILD/X264_VERSION necessarily differ between builds.  Measured:
+9/9 configs byte-identical against the pre-PAFF tree with equalized version
+strings; threaded CBR+VBV differs by design, see doc/threads.txt.)
 
 Measured and closed: per-field mbtree propagation (paff-mbtree-remeasure)
 -------------------------------------------------------------------------
