@@ -701,11 +701,11 @@ void x264_mc_init( uint32_t cpu, x264_mc_functions_t *pf, int cpu_independent )
     }
 }
 
-void x264_frame_filter( x264_t *h, x264_frame_t *frame, int mb_y, int b_end )
+void x264_frame_filter( x264_t *h, x264_frame_t *frame, int mb_y, int b_end, int i_parity )
 {
-    const int b_interlaced = PARAM_INTERLACED;
+    const int b_interlaced = PARAM_INTERLACED || FIELD_PIC;
     int start = mb_y*16 - 8; // buffer = 4 for deblock + 3 for 6tap, rounded to 8
-    int height = (b_end ? frame->i_lines[0] + 16*PARAM_INTERLACED : (mb_y+b_interlaced)*16) + 8;
+    int height = (b_end ? frame->i_lines[0] + 16*b_interlaced : (mb_y+b_interlaced)*16) + 8;
 
     if( mb_y & b_interlaced )
         return;
@@ -728,11 +728,13 @@ void x264_frame_filter( x264_t *h, x264_frame_t *frame, int mb_y, int b_end )
         if( b_interlaced )
         {
             /* MC must happen between pixels in the same field. */
+            int par0 = i_parity < 0 ? 0 : i_parity;
+            int par1 = i_parity < 0 ? 2 : i_parity + 1;
             stride = frame->i_stride[p] << 1;
             start = (mb_y*16 >> 1) - 8;
             int height_fld = ((b_end ? frame->i_lines[p] : mb_y*16) >> 1) + 8;
-            offs = start*stride - 8;
-            for( int i = 0; i < 2; i++, offs += frame->i_stride[p] )
+            offs = start*stride - 8 + par0*frame->i_stride[p];
+            for( int i = par0; i < par1; i++, offs += frame->i_stride[p] )
             {
                 h->mc.hpel_filter(
                     frame->filtered_fld[p][1] + offs,

@@ -1,0 +1,22 @@
+schema: spec-driven
+
+context: |
+  x264 — H.264/AVC encoder (VideoLAN), C89 + hand-written asm (NASM x86, GNU as ARM/ppc/loongarch).
+  Build: custom ./configure + Makefile. Tests: `make checkasm` (asm vs C), JM reference decoder round-trip (doc/regression_test.txt).
+  Core: common/ (codec primitives + per-arch), encoder/ (pipeline), input/output/filters (CLI only).
+  Bit-depth 8/10 multi-build via BIT_DEPTH macro. MBAFF field machinery exists (plane_fld, parity-in-refidx MC).
+  Conventions: 4-space indent, snake_case, x264_ prefix, no C99-isms in public headers.
+  Normative reference: T-REC-H.264-202606 PDF in repo root. See AGENTS.md.
+  PAFF work mode: internal fork, but written to upstream VideoLAN standards
+  (style, docs, small commits) so upstreaming stays possible; not gated on
+  upstream review.
+
+# Per-artifact rules (optional)
+# Add custom rules for specific artifacts.
+# Example:
+#   rules:
+#     proposal:
+#       - Keep proposals under 500 words
+#       - Always include a "Non-goals" section
+#     tasks:
+#       - Break tasks into chunks of max 2 hours

@@ -1,0 +1,497 @@
+PAFF (field-picture) interlaced coding
+======================================
+
+This document describes x264's PAFF mode: what it is, how to use it, and where
+it differs from the default progressive and from MBAFF (--interlaced) coding.
+For the bitstream-level rules see ITU-T H.264; this is an operator's reference.
+
+
+What PAFF is
+------------
+
+H.264 has two ways to code interlaced material:
+
+  * MBAFF (--interlaced): a whole frame is coded, but adjacent macroblock pairs
+    may be treated as two field macroblocks.  One coded picture per frame.
+  * PAFF (--paff): each field (top/bottom half of the frame) is coded as its
+    OWN coded picture with its own slice header.  Two coded pictures per input
+    frame, i.e. two access units per frame.
+
+PAFF generally wins on truly interlaced content (it never wastes bits mixing
+the two fields' motion in one macroblock pair) and loses on progressive-ish
+content encoded as interlaced.  See "Quality" below.
+
+PAFF is enabled with --paff.  Field order is set the same way as for MBAFF:
+--tff (top field first, the default) or --bff (bottom field first).  PAFF and
+MBAFF are mutually exclusive: --paff forces MBAFF off.
+
+
+Bitstream and timing
+--------------------
+
+Every input frame becomes one complementary field pair: two access units, each
+one field picture (field_pic_flag = 1).  Where the encoder used to emit things
+"once per frame" it now emits them "once per coded field":
+
+  * pic_timing SEI carries pic_struct = 1 (top field) / 2 (bottom field),
+    NumClockTS = 1, as required by Table D-1 for field pictures.
+  * buffering_period and pic_timing delays (cpb_removal_delay,
+    dpb_output_delay) are expressed per field access unit under --nal-hrd.
+  * dec_ref_pic_marking SEI carries the true original_field_pic_flag.
+
+A keyframe pair is coded in the QSV/libmfx-compatible "Ip" structure: the
+first field is an IDR access unit, the second field is a reference P field
+(nal_ref_idc != 0, as required by 7.4.3 for two fields of opposite parity
+sharing one frame_num) predicting from the first field of the pair.  The
+buffering_period SEI sits in the IDR access unit, satisfying D.2.2.
+
+VUI/HRD streams parse cleanly in JM and ffprobe; CPB underflow/overflow is
+checked at field granularity by the independent Annex C simulator
+tools/check_hrd.py (run it on any --nal-hrd cbr output).
+
+
+Rate control and VBV
+--------------------
+
+Rate control keeps frame-level QP decisions: one frame-level QP feeds both
+fields of a pair (v1 emits the same QP in both slice headers).  Bits are
+accounted per field, so ABR/CBR/CRF and 2-pass see field-granular bit usage.
+2-pass stats and MB-tree stay frame-based (one entry per pair).
+
+The VBV buffer model steps once per field access unit (not once per pair):
+each field's AU is removed one field tick apart, using the actual per-AU NAL
+sizes split at the pair's access-unit boundary.  This matches Annex C.1.2; a
+pair-level model provably misses first-field CPB underflow.
+
+Practical RC notes:
+
+  * 1-pass ABR and CRF land on target about as well as for progressive/MBAFF.
+  * For 2-pass, use --slow-firstpass.  The default turbo first pass still
+    undershoots the target ~10% under PAFF (its pass-1 model does not match
+    field motion estimation well); --slow-firstpass lands within ~1.5%.
+  * CBR/VBV has a startup overshoot transient on no-B streams (+~22% over the
+    first ~100 frames, decaying toward the target).  It is rooted in pair-level
+    QP planning and is unchanged by the per-field VBV model; it is not a
+    conformance problem (no CPB underflow/overflow) but shows up in average
+    rate over short windows.
+
+Weighted prediction (--weightp) is supported for P fields (it reuses the MBAFF
+weight path on the field-layout planes).  Weighted biprediction (--weightb) is
+force-disabled with a warning: measured and rejected, twice.  x264 only ever
+signals weighted_bipred_idc = 2 (implicit -- the decoder derives bipred
+weights from POC distances per 8.4.3; there are no explicit weights in the
+bitstream), and the per-pass bipred tables mirror that derivation with field
+POCs.  During evaluation the implicit derivation proved conformance-correct
+(full B-field matrix with weightb forced on, 28/28 bit-exact against JM,
+plus ffmpeg, NVDEC and VAAPI pixel-exact) once two latent bugs were fixed:
+bipred_weight_buf was int8_t and could not hold the boundary weight 128, and
+the signed-byte-multiply pixel_avg asm (8-bit x86 SSSE3/AVX2/AVX-512,
+LoongArch LSX/LASX) cannot represent the -64/128 extrema -- both reachable
+only by field pictures, whose expanded reference lists can put both bipred
+references on the same POC side of the current field.
+
+The quality side failed twice, with a positive control the second time.
+First measurement (paff-weightb): a CRF 18/23/28/33 sweep on a synthetic
+dissolve clip (the content implicit weights exist for) gained only 0.272%
+BD-rate (PSNR-Y), below the 0.5% acceptance floor fixed before measuring --
+but that clip never proved it exercises the feature (its progressive encode
+gained ~0% too).  Re-measurement (paff-weightb-remeasure) with a
+pre-registered positive control: the same sweep on PROGRESSIVE encodes of
+realistic content first, and PAFF only if some clip gains >= 1.0%
+progressively.  On a real-scene crossfade (two distinct broadcast clips,
+xfade, at both 176x144 and 720x576) weightb gained +0.457% / +0.275%, on a
+grained synthetic crossfade -0.339%, on the legacy synthetic clip +0.526%,
+on a dip-to-black -0.288%, non-dissolve control -0.242% -- no clip reached
+1.0%, so the gate failed on all tested content including progressive and
+the PAFF question was moot.  The feature is dead, not merely field-broken,
+and the disable is permanent.
+
+External evidence points the same way.  Implicit bipred weighting entered
+x264 in February 2005 (svn r134) with no published measurement behind it.
+The celebrated weighted-prediction gains in the literature are all about
+EXPLICIT weights on fades to/from black (up to 67% bitrate reduction,
+Boyce, ISCAS 2004) -- weightp territory, not weightb.  And HEVC dropped
+the implicit mode from the standard entirely: "in HEVC only explicit
+weighted prediction is applied" (Sullivan et al., HEVC overview, IEEE
+TCSVT 2012); VVC likewise has no POC-distance-derived bipred weights.
+Twenty years without a single published implicit-weightb gain
+measurement, and silent removal from both successor standards, is
+consistent with what we measured.
+
+The measurement stands are kept in
+"tools/test_paff.sh weightb" (archived synthetic cell) and
+"tools/test_paff.sh weightb2" (the re-measurement matrix; clip set and
+thresholds in the paff-weightb-remeasure change); with the force-off
+in place the PAFF on-rows warn and encode weightb-off, so reproducing PAFF
+numbers requires locally reverting the validation block in
+x264_encoder_open first (the exact hunk is documented on cmd_weightb2).
+The per-field mbtree future-work item closed the same way -- measured on
+real content, no deficit, nothing to fix; see "Measured and closed" under
+Quality.
+
+
+Threading
+---------
+
+PAFF supports frame-based threading and slice-based threading.
+
+Frame threads (--threads N, N > 1, no --sliced-threads):
+
+The two field passes of a complementary pair are coded as TWO separate
+frame-thread jobs: the caller dispatches pass 0 and pass 1 from the same
+prologue on two consecutive slots of the round-robin (the slot phase
+advances by two per PAFF encode call) and collects them together at the
+oldest pair's harvest (a rendezvous: both jobs must finish before the
+pair-level frame end runs).  N frame-thread slots therefore keep N/2
+PAIRS in flight, not N; the pipeline depth is passes, not pairs.  Pair
+jobs consume an even slot count (N & ~1): at an odd --threads value the
+last slot idles.
+
+Reference readiness is row-granular for BOTH fields of a pair: during
+its pass, each field row's reference band (field-layout copy, hpel,
+borders) is produced at row cadence, trailing the deblock by one field
+row -- the same per-row filter-completion model as progressive encoding.
+The intermediate full-frame sweep that older revisions ran between the
+two passes is gone.
+
+Dependent pairs gate through the standard frame-thread machinery: at
+each MB row start the encoder waits per reference field until its
+completed row count covers the search window (thresholds in field
+lines), then restricts the vertical MV range accordingly.  The pair's
+own first field (referenced by its second field) waits by the same
+rule, bounded to the pair's own rows.  With both passes of a pair
+overlapping this way, a P-chain scales like progressive frame threading
+(a per-pass diagonal staircase) instead of topping out at the old ~2x
+pair-ceiling.  See doc/threads.txt for measured numbers.
+
+Determinism contract: output is deterministic at a fixed thread count
+(two runs with identical parameters and N produce byte-identical
+output), matching progressive frame threading.  Output at N > 1 threads
+is NOT byte-identical to --threads 1: the MV-range clamp of frame
+threading applies as in progressive encoding.  --threads 1 output never
+broadcasts or waits and stays identical to the pre-threading
+implementation.  One inherited caveat: with VBV enabled, threaded
+output is not byte-deterministic even on pre-PAFF upstream
+(ratecontrol reads in-flight threads' state), so byte-repeat gates run
+on non-VBV configs.
+
+Sliced threads (--paff --sliced-threads --threads N): frame threading is
+off by construction (b_sliced_threads forces i_thread_frames == 1), so
+the pair is coded by the monolithic --threads 1 pair driver, and each
+field pass is split into N parity-interleaved slice bands -- one slice
+per band, coded in parallel by the slice threads (2N slice NALs per
+pair; that NAL-count asymmetry vs progressive sliced encoding is part
+of its overhead).  A band covers field rows [b0,b1) of the pass's
+parity, i.e. frame-coordinate MB rows parity+2*b0 .. parity+2*(b1-1);
+the thread count is capped so a band is never thinner than four field
+MB rows (half the progressive cap, computed from FIELD rows: a
+1080-line input caps at 8, 576-line at 4).  Cross-slice deblocking is
+disabled within each field picture (i_disable_deblocking_filter_idc=2,
+like progressive sliced encoding), so each thread deblocks its own
+band rows at its slice end, race-free.
+
+All reference-data work (field-layout copy, borders, hpel) runs AFTER
+the join, single-threaded on the main context, as a loop of
+paff_reference_band over every field row of the coding parity -- the
+same shape the pre-threading pipeline used between the passes, and
+byte-identical to the row-cadence result by construction.  No
+cross-thread pixel synchronization exists in this mode.  Measured on a
+Ryzen 7 9800X3D the serial sweep is ~1% of encode time at 1080i N=4
+(perf: hpel 0.4%, border expansion 0.3%, plane_fld copy ~0.2%), so the
+D3 estimate holds and the boundary-window parallelization below is not
+needed.
+
+Row-VBV budget granularity is per FIELD under sliced threads: pass 0
+receives the pair plan scaled by its parity's share of the row SATD,
+pass 1 receives the pair plan minus pass 0's actual coded bits, floored
+at 5% of the pair plan (an overshooting first field must not hand the
+sliced normalization a zero/negative plan).  The budgets are logged at
+X264_LOG_DEBUG ("paff field budget", one line per field) -- the test
+matrix asserts the sum from them.  Pair-level ratecontrol accumulators
+(qpa_rc/qpa_aq) are zeroed in each non-main worker at the pass-1
+distribute so the two distribute/merge cycles per pair count each pass
+exactly once.
+
+Determinism under sliced threads inherits the progressive sliced-threads
+exception -- CBR+VBV output is timing-dependent (cross-slice reads of
+live ratecontrol state), while CRF/CQP/ABR-without-VBV are
+byte-identical across repeat runs at a fixed thread count.  No sliced
+output is byte-identical to a non-sliced one (slice headers, CABAC
+reinit, disabled cross-slice deblock), same as progressive.
+Measured quality/speed (see Quality and Speed below): the sliced-PAFF
+BD-rate overhead is BELOW the progressive-sliced reference at the same
+operating point, and the speedup is 1.8x at N=2 and 3.2x at N=4 on
+1080i.
+
+Motion-vector limits
+--------------------
+
+Every PAFF coding pass is a field picture, so the vertical MV limits of
+the analysis pass are derived from the field MB grid (field row
+i_mb_y>>1 of i_mb_height>>1 rows; the SPS pads i_mb_height to even),
+not the frame grid.  The +/-24-field-line (96 qpel) margin of those
+limits stays inside the per-parity emulated edge (32 field lines;
+i_padv is doubled for field coding).  This covers the search limits AND
+the unclamped
+mv_min/mv_max that bound derived MVs (P skip, temporal B direct), so no
+motion decision can point outside the referenced field plus its edge.
+Before the fix the frame-grid limits were about 2x wider than a field
+needs: motion search could walk into the reference padding whenever the
+level-derived range exceeded the field border (high levels, large
+--mvrange, HD+ material), and derived MVs could be clipped into padding
+at default levels.  An explicit --mvrange is in FIELD LINES under PAFF,
+while the level-derived default is the halved level-table value (Annex A
+bounds the vertical MV component in frame samples, so a field-line
+limit is half the table value; one field line spans two frame lines).
+The horizontal range clamp shares the halved value (a field sample is a
+frame sample horizontally, so this is over-strict, but it matches the
+VUI max-MV signal and the MV cost-table sizing; left unchanged).
+
+The lookahead analyzes whole frames (lowres planes are full frames, one
+entry per input frame), so its lowres search range is in FRAME units:
+slicetype.c undoes the halving there, giving scenecut/mbtree the same
+vertical range progressive encoding gets.  The value is observable only
+via the debug-level log ("lookahead lowres mv_range = N"); the PAFF
+test script compares it between a --paff and a progressive run
+(test_paff.sh la_range).
+
+Measured impact (25-frame clips, 8-bit, pre-change vs D1-only vs
+D1+D2 attribution builds):
+
+  * Non-PAFF output (progressive, MBAFF) is bit-identical at every
+    tested config, resolution and thread count.
+  * Wide range (1080 lines, --mvrange 1024 --ref 4, where the field
+    border geometry limit is 552 field lines): bitrate -0.005%, PSNR-Y
+    +0.015 dB -- small but in the intended direction (search stops
+    feeding on padding).  With --me umh --merange 64 the pre-change
+    build segfaulted once (unreproducible; the old limits permit reads
+    far past the field planes), the fixed builds are stable.
+  * D1-only vs pre-change at default range: bit-identical on P-only
+    configs; small stream changes where derived MVs previously clipped
+    to the frame grid (temporal-direct B configs, HD clips), quality
+    effect <= 0.009 dB PSNR-Y (neutral).
+  * D1+D2 vs pre-change: the un-halved lookahead range retrains
+    scenecut and mbtree decisions; on 25-frame 176x144 matrix clips
+    this moves bitrate by -7.4%..+4.1% and PSNR-Y by -0.28..+0.20 dB
+    (one I-field/P-field flip dominates a 25-frame clip; present in
+    D1+D2, absent in D1-only -- accepted as lookahead-retraining
+    sensitivity per the change's acceptance rule).  At 1080 scale the
+    same comparison is within +/-0.04% bitrate and +/-0.02 dB PSNR-Y.
+    Every stream in the full matrix (39/39 incl. wide-range and
+    vertical-motion round-trips) is still JM bit-exact vs --dump-yuv,
+    and fixed-N determinism holds at N=1, 4 and 8.
+
+Future work
+-----------
+
+  * Sliced threads: parallelize the post-join reference sweep
+    (progressive-style pass-1/pass-2 boundary windows).  The serial
+    sweep measured at ~1% of encode time (1080i, N=4), so this only
+    matters if profiling at much higher thread counts or resolutions
+    shows otherwise.
+  * Sliced threads: stride-aware sub-slicing (--slice-max-size/
+    --slice-max-mbs/--slices within a field band) -- the current
+    boundary arithmetic assumes a contiguous raster.
+  * Sliced threads: deterministic stand-ins for the cross-slice live
+    ratecontrol reads (in the spirit of vbv_inflight_bits), making
+    CBR+VBV byte-deterministic under sliced threads (an inherited
+    upstream exception, not PAFF-specific).
+  * Full II-pair AVC-Intra support (rejected at validation).
+
+
+Unsupported combinations (rejected at validation)
+-------------------------------------------------
+
+  * --paff with --interlaced (MBAFF) or fake interlacing.
+  * --paff with an AVC-Intra class (i_avcintra_class).  Full II-pair AVC-Intra
+    support is future work.
+  * --paff with --intra-refresh: untested combination (the recovery-point SEI
+    and the PIR column bookkeeping are frame-oriented; nobody has validated
+    them against per-field access units).
+  * --paff with --frame-packing: the packing SEI carries frame-picture
+    semantics (frame0/frame1 arrangement) that conflict with the forced
+    per-field pic_struct of a complementary field pair.
+  * --paff with --sliced-threads plus any explicit sub-slicing
+    (--slice-max-size, --slice-max-mbs, --slices): slice threads make one
+    slice per band; slice-max-size row-recode restarts break the row
+    monotonicity the row ratecontrol assumes, and the slice-max-mbs/--slices
+    boundary arithmetic assumes a contiguous raster.
+  * --paff with --slice-max-mbs or --slices at ANY thread count (the same
+    contiguous-raster assumption; previously this silently produced EMPTY
+    output with exit code 0).  --slice-max-size without sliced threads stays
+    accepted.
+  * --paff with --weightb: force-disabled with a warning (measured and
+    rejected: no quality gain, see Rate control and VBV).
+  * --paff with --pulldown: pulldown patterns have no coded frame picture to
+    attach to (every frame is a field pair).  Timebase-only pulldown
+    (param.b_pulldown without a CLI pattern) is harmless and stays allowed.
+  * Library callers feeding pic.i_pic_struct != AUTO under PAFF: clamped to
+    AUTO with a one-shot warning (the pair resolves to TOP_BOTTOM/BOTTOM_TOP;
+    per-field pic_struct 1/2 is carried by the per-field pic_timing SEI).
+
+Working combinations include --tff/--bff, --tcfile-in/--tcfile-out, --timebase
+and VFR (handled at pair-level PTS), --weightp 0/1/2, B-frame pyramids,
+--sliced-threads --threads N (see Threading), and the full CRF/2-pass/CBR
+rate-control matrix.
+
+What works as in progressive: --csp (all chroma formats compiled in), both bit
+depths, CABAC/CAVLC, all intra prediction, open/closed GOP, B-pyramid.
+
+
+Quality
+-------
+
+On genuinely interlaced content PAFF is the best interlaced mode x264 has, and
+competitive with progressive coding of the same material.  Measured on
+tinterlace'd test clips at matched bitrate (CRF sweep, PSNR-Y):
+
+  * PAFF vs MBAFF: roughly +2.9 dB on detailed content, ~+3 dB on
+    blurred/"natural" content.
+  * PAFF vs progressive: about parity (+0.25 dB) -- PAFF's per-field motion
+    compensation recovers the cost of coding two slice headers.
+  * MBAFF vs progressive: -2.4 dB (MBAFF's mixed pairs hurt on this material).
+
+These are content-dependent; the ordering (PAFF >= progressive > MBAFF) holds
+across the tested clips but the gaps shrink on nearly-progressive material.
+
+Sliced-threads PAFF vs PAFF --threads 1 (BD-rate PSNR-Y, CRF 18/23/28/33,
+100-frame tinterlace'd hall clip, bframes 3, Ryzen 7 9800X3D):
+
+  * 1080i: N=2 +1.85%, N=4 +5.90%.
+  * 576i:  N=2 +3.77%, N=4 +12.61%.
+
+The acceptance reference is progressive sliced at the SAME N on a
+HALF-HEIGHT progressive clip (equal band height in MB rows AND equal
+slice count per picture -- 540p for 1080i, 288p for 576i):
+
+  * 540p: N=2 +8.67%, N=4 +10.49%  ->  ratios 0.21x / 0.56x.
+  * 288p: N=2 +7.21%, N=4 +13.02%  ->  ratios 0.52x / 0.97x.
+
+Every ratio is below the 1.5-2x acceptance ceiling: sliced-PAFF's
+overhead is at or below the sliced-progressive penalty at the same
+operating point.  The remaining overhead is slice-header/CABAC-reinit
+cost and the 2N-NALs-per-pair asymmetry, not the field budgets.
+
+Speed (same clip, bframes 0, wall-clock of 100 frames):
+
+  * 1080i: 1.84x at N=2, 3.21x at N=4, 4.73x at N=8 (cap 8).
+  * 576i:  1.85x at N=2, 3.03x at N=4 (N=8 clamps to 4: cap 4).
+
+Speedup grows monotonically 2 -> 4 and clears the 1.3x-at-N=4 floor by
+2.4x; the serial post-join reference sweep is ~1% of encode time
+(measured with perf at 1080i N=4), so the boundary-window
+parallelization listed under Future work is not needed at these sizes.
+
+Progressive and MBAFF outputs are bit-identical to the pre-PAFF encoder: the
+PAFF paths are gated on param.b_paff and never run otherwise.  (The one
+exception anywhere in the stream is the version SEI's encoder identification
+-- X264_BUILD/X264_VERSION necessarily differ between builds.  Measured:
+9/9 configs byte-identical against the pre-PAFF tree with equalized version
+strings; threaded CBR+VBV differs by design, see doc/threads.txt.)
+
+Measured and closed: per-field mbtree propagation (paff-mbtree-remeasure)
+-------------------------------------------------------------------------
+
+The lookahead and mbtree analyze whole frames, so under PAFF (where one
+"frame" is a field pair) the pair-level propagate weights are ~2x off per
+field: both fields consume the single frame-level f_qp_offset that
+macroblock_tree_propagate produces.  The open question was whether
+per-field propagation would buy measurable quality.  Pre-registered
+measurement (2026-08-30, weightb-style protocol, real content): three
+clips (hall 720p25, relax 1080p50, amv 720p29.97 cut-heavy), interlaced
+variants synthesized by field-merging adjacent progressive frames
+(tinterlace), prog/MBAFF/PAFF x mbtree on/off x CRF 18/23/28/33, BD-rate
+(PSNR-Y, 4-point cubic).  Gates fixed before measuring:
+
+  * G0 (validity): mbtree on-vs-off on the progressive control must gain
+    >= 3% BD-rate, else the stand cannot see mbtree and results are void.
+  * Q1 (the paff-b-frames 4.2 bound on real content): PAFF vs MBAFF,
+    mbtree on; PAFF must not be worse than MBAFF by > 1% BD-rate.
+  * Q2 (the actual question): PAFF's mbtree gain must be >= 50% of the
+    progressive gain on the same interlaced clip.  If |prog gain| < 1%
+    on a clip, that clip is inconclusive (the ratio is noise when mbtree
+    does nothing in weave mode anyway).
+
+Results (BD-rate, negative = saving):
+
+  gate                hall      relax     amv
+  G0  prog control    -13.2%    -12.0%    -16.7%
+  Q1  mbtree on       -16.6%    -11.0%    -12.7%
+  Q1  mbtree off (*)  -15.5%    -10.5%    -10.7%
+  Q2  prog gain        -5.26%   -10.00%    -4.36%
+  Q2  MBAFF gain       -8.86%    -9.73%    -8.30%
+  Q2  PAFF gain       -10.37%    -9.76%   -10.61%
+  Q2  ratio PAFF/prog   1.97      0.98      2.43
+
+  (*) informational: checks the PAFF/MBAFF gap is not an mbtree artifact.
+
+All gates pass on all three clips.  PAFF's mbtree gain is never below
+progressive's; on cut-heavy content it is 2.4x progressive's.  The ~2x
+per-field weight error is arithmetically real but buys no measurable
+deficit, and implementing per-field propagation would change every PAFF
+bitstream and invalidate the regression corpus in exchange for a gain the
+measurement says does not exist -- so the item is closed, permanently out
+of scope unless a future regression makes the bound fail.
+
+Measurement pitfall (why the stand is shaped this way): PSNR must be
+measured through rawvideo pipes.  ffmpeg's dual-input psnr/ssim filters
+pair frames by PTS; a 30000/1001 y4m round-tripped through mkv (1/1000
+timebase) mis-pairs every few frames, and on cut-heavy content each
+mis-pair dominates the mean (first amv run: flat ~17.9 dB garbage on a
+bit-exact stream).  Decode both sides to rawvideo first, then compare.
+
+Stand: "tools/test_paff.sh mbtree" (clip sources via PAFF_MB_SRC_HALL /
+PAFF_MB_SRC_RELAX / PAFF_MB_SRC_AMV, missing clip = skipped, lavfi smoke
+fallback always runs); BD-rate via tools/bdrate.py.  Raw point sets and
+the session's reference scripts are archived in the
+paff-mbtree-remeasure change's measurement/ directory.
+
+
+Known decoder quirks
+--------------------
+
+  * History: --keyint 1 PAFF streams (an IDR first field in EVERY pair)
+    used to fail on NVIDIA CUVID (silent wrong field pairing, stalled at
+    14/25 frames on raw Annex-B) and on AMD VA-API (vaEndPicture error,
+    zero frames), while JM, ffmpeg software, NVDEC-driven-by-libavcodec and
+    Intel VA-API were bit-exact.  Root cause was in x264, not the decoders:
+    the I-only optimisation zeroed max_num_ref_frames in the SPS for
+    --keyint 1, which is honest for all-intra PROGRESSIVE streams but a lie
+    under PAFF -- every keyframe pair's second field is a reference P field
+    predicting from the first.  The zero signalled value sized vendor DPBs
+    to zero (AMD refused to decode; NVIDIA's parser derailed) while the
+    lenient decoders derived the DPB from the level instead.  Fixed by
+    keeping num_ref_frames >= 1 under PAFF (the 8.2.5.1 "Max(num_ref,1)"
+    escape hatch had kept such streams barely spec-legal).  After the fix
+    every decoder is bit-exact on the whole stream set, keyint 1 included;
+    tools/test_paff_ci.sh carries an SPS regression check for this.
+  * The QSV API requires a Gen9+ Intel GPU and a oneVPL/libmfx runtime
+    (modern runtimes refuse to create a session on older chips); on Gen8
+    the same fixed-function decode is reachable through VA-API/iHD.
+
+
+Testing
+-------
+
+  * tools/test_paff.sh: scripted JM round-trip over a config matrix
+    (CRF/2-pass/CBR x TFF/BFF x I/P/B, plus progressive/MBAFF baselines).
+    The `sliced` command covers the sliced-threads cells (JM round-trips
+    TFF/BFF x I/I+P/I+P+B x N in {2,4}, weightp 1/2, CAVLC, band-geometry
+    edges, CBR+VBV, 2-pass, HRD, byte-repeat, the field-budget assertion,
+    an mb_info API cell and a 10-bit ffmpeg decode cell, on a 576i clip).
+  * tools/test_paff_hw.sh: hardware-decoder interop smoke (software,
+    NVDEC/cuvid, NVDEC/nvdec, QSV, VAAPI backends) with a pixel-exact
+    cross-check against ffmpeg's software decoder; includes the
+    multi-slice sliced-PAFF streams (TFF/BFF, I+P+B, CBR+VBV with filler).
+  * tools/test_paff_ci.sh: JM-free CI smoke; includes sliced-PAFF cells
+    (N=4 encode with the expected slice count, the field-row thread clamp,
+    fixed-N byte repeatability, sliced CBR+VBV CPB check).
+  * tools/check_hrd.py: Annex C CPB simulator for --nal-hrd cbr streams.
+  * tools/test_paff.sh opengop: open-GOP round-trips vs JM -- keyint-driven
+    non-IDR Ip keyframe pairs plus a hard-scene-cut clip whose GOP-tail B
+    pairs must reference across the I pair to decode correctly.
+  * make checkasm: unchanged; the PAFF deblock/strength fixes are gated on
+    field-picture B-slices and do not touch the shared DSP functions.
+
+JM round-trip procedure (bit-exactness via --dump-yuv vs JM ldecod) is in
+doc/regression_test.txt; PAFF streams are validated the same way.

@@ -105,7 +105,7 @@ void x264_sps_init( x264_sps_t *sps, int i_id, x264_param_t *param )
     sps->i_id = i_id;
     sps->i_mb_width = ( param->i_width + 15 ) / 16;
     sps->i_mb_height= ( param->i_height + 15 ) / 16;
-    sps->b_frame_mbs_only = !(param->b_interlaced || param->b_fake_interlaced);
+    sps->b_frame_mbs_only = !(param->b_interlaced || param->b_fake_interlaced || param->b_paff);
     if( !sps->b_frame_mbs_only )
         sps->i_mb_height = ( sps->i_mb_height + 1 ) & ~1;
     sps->i_chroma_format_idc = csp >= X264_CSP_I444 ? CHROMA_444 :
@@ -121,7 +121,7 @@ void x264_sps_init( x264_sps_t *sps, int i_id, x264_param_t *param )
         sps->i_profile_idc  = PROFILE_HIGH10;
     else if( param->analyse.b_transform_8x8 || param->i_cqm_preset != X264_CQM_FLAT || sps->i_chroma_format_idc == CHROMA_400 )
         sps->i_profile_idc  = PROFILE_HIGH;
-    else if( param->b_cabac || param->i_bframe > 0 || param->b_interlaced || param->b_fake_interlaced || param->analyse.i_weighted_pred > 0 )
+    else if( param->b_cabac || param->i_bframe > 0 || param->b_interlaced || param->b_fake_interlaced || param->b_paff || param->analyse.i_weighted_pred > 0 )
         sps->i_profile_idc  = PROFILE_MAIN;
     else
         sps->i_profile_idc  = PROFILE_BASELINE;
@@ -151,11 +151,34 @@ void x264_sps_init( x264_sps_t *sps, int i_id, x264_param_t *param )
     sps->i_num_ref_frames = X264_MIN(X264_REF_MAX, X264_MAX4(param->i_frame_reference, 1 + sps->vui.i_num_reorder_frames,
                             param->i_bframe_pyramid ? 4 : 1, param->i_dpb_size));
     sps->i_num_ref_frames -= param->i_bframe_pyramid == X264_B_PYRAMID_STRICT;
-    if( param->i_keyint_max == 1 )
+    if( param->i_keyint_max == 1 && !param->b_paff )
     {
         sps->i_num_ref_frames = 0;
         sps->vui.i_max_dec_frame_buffering = 0;
     }
+    /* The I-only zeroing above is a progressive-only optimisation: an
+     * all-keyframe PROGRESSIVE stream never references a past picture, so
+     * max_num_ref_frames = 0 is honest.  Under PAFF the second field of
+     * every keyframe pair is a reference P field predicting from the pair's
+     * first field (the Ip structure, task 7.1), so the stream DOES use one
+     * DPB reference slot.  Signalling max_num_ref_frames = 0 there is
+     * spec-survivable only through the Max( num_ref_frames, 1 ) escape
+     * hatch (8.2.5.1/8.2.5.3) and breaks vendor decoders that size their
+     * DPB from the signalled value: AMD VCN rejects the pictures outright
+     * (vaEndPicture "operation failed") and NVIDIA's CUVID parser derails
+     * its field pairing.  Keep >= 1 under PAFF.  (Found by the 8.3
+     * hardware-interop runs; Intel VA-API and JM derive the DPB from the
+     * level, which is why they were unaffected.) */
+    /* DPB accounting is in slot units (D5): one complementary field pair =
+     * one DPB slot = one x264_frame_t, so a PAFF reference pair counts the
+     * same as a progressive frame.  i_num_ref_frames therefore equals
+     * i_frame_reference (reference PAIRS) directly -- it is NOT field-doubled
+     * (the previous "*= 2" here was wrong) and NOT +1 padded.  The decoder
+     * transiently holds i_frame_reference+1 slots while a pair's first field
+     * is stored, but the D20 between-pass eviction in the PAFF driver mirrors
+     * the decoder's sliding window (8.2.5.1/8.2.5.3) by evicting the oldest
+     * pair before the second field is coded, so i_frame_reference slots
+     * suffice and no extra slot is reserved here. */
 
     /* number of refs + current frame */
     int max_frame_num = sps->vui.i_max_dec_frame_buffering * (!!param->i_bframe_pyramid+1) + 1;
@@ -170,7 +193,7 @@ void x264_sps_init( x264_sps_t *sps, int i_id, x264_param_t *param )
     while( (1 << sps->i_log2_max_frame_num) <= max_frame_num )
         sps->i_log2_max_frame_num++;
 
-    sps->i_poc_type = param->i_bframe || param->b_interlaced || param->i_avcintra_class ? 0 : 2;
+    sps->i_poc_type = param->i_bframe || param->b_interlaced || param->i_avcintra_class || param->b_paff ? 0 : 2;
     if( sps->i_poc_type == 0 )
     {
         int max_delta_poc = (param->i_bframe + 2) * (!!param->i_bframe_pyramid + 1) * 2;
@@ -644,7 +667,7 @@ void x264_sei_buffering_period_write( x264_t *h, bs_t *s )
     x264_sei_write( s, tmp_buf, bs_pos( &q ) / 8, SEI_BUFFERING_PERIOD );
 }
 
-void x264_sei_pic_timing_write( x264_t *h, bs_t *s )
+void x264_sei_pic_timing_write( x264_t *h, bs_t *s, int i_field_tick_offset )
 {
     x264_sps_t *sps = h->sps;
     bs_t q;
@@ -656,17 +679,34 @@ void x264_sei_pic_timing_write( x264_t *h, bs_t *s )
 
     if( sps->vui.b_nal_hrd_parameters_present || sps->vui.b_vcl_hrd_parameters_present )
     {
-        bs_write( &q, sps->vui.hrd.i_cpb_removal_delay_length, h->fenc->i_cpb_delay - h->i_cpb_delay_pir_offset );
+        /* PAFF (D1): each field is its own access unit, removed from the CPB
+         * one field tick after the previous AU (Annex C.1.2).  The pair-level
+         * i_cpb_delay counts the pair's first coded field, so the second
+         * field signals +1 (i_field_tick_offset = pass number).  The pair
+         * counter still advances by i_duration = 2 ticks, keeping delays
+         * monotonic across pairs.  dpb_output_delay needs no offset: the
+         * second field's removal AND output are both shifted one tick later
+         * (fields display at field rate), so the difference is identical for
+         * both fields of a complementary pair. */
+        bs_write( &q, sps->vui.hrd.i_cpb_removal_delay_length, h->fenc->i_cpb_delay - h->i_cpb_delay_pir_offset + i_field_tick_offset );
         bs_write( &q, sps->vui.hrd.i_dpb_output_delay_length, h->fenc->i_dpb_output_delay );
     }
 
     if( sps->vui.b_pic_struct_present )
     {
-        bs_write( &q, 4, h->fenc->i_pic_struct-1 ); // We use index 0 for "Auto"
+        int pic_struct = h->fenc->i_pic_struct;
+        if( h->param.b_paff )
+            /* PAFF (D1): emitted per coded field; the value comes from the
+             * field's parity (Table D-1: 1 = top field, 2 = bottom field),
+             * expressed as internal index (syntax value + 1).  num_clock_ts
+             * gives NumClockTS = 1 per field picture.  h->sh is current: the
+             * PAFF driver emits this SEI after slice_init. */
+            pic_struct = h->sh.b_bottom_field ? 3 : 2;
+        bs_write( &q, 4, pic_struct-1 ); // We use index 0 for "Auto"
 
         // These clock timestamps are not standardised so we don't set them
         // They could be time of origin, capture or alternative ideal display
-        for( int i = 0; i < num_clock_ts[h->fenc->i_pic_struct]; i++ )
+        for( int i = 0; i < num_clock_ts[pic_struct]; i++ )
             bs_write1( &q, 0 ); // clock_timestamp_flag
     }
 
@@ -800,7 +840,17 @@ void x264_sei_dec_ref_pic_marking_write( x264_t *h, bs_t *s )
     bs_write1( &q, 0 );                 //original_idr_flag
     bs_write_ue( &q, sh->i_frame_num ); //original_frame_num
     if( !h->sps->b_frame_mbs_only )
-        bs_write1( &q, 0 );             //original_field_pic_flag
+    {
+        /* PAFF (D1): the original picture is a field pair and the repeated
+         * marking commands came from the slice header of its FIRST coded
+         * field (pass 0 of the field-pair driver: top for TFF, bottom for
+         * BFF), so signal honest field flags instead of the hardcoded 0.
+         * sh_backup is the pair-level header (b_field_pic == 0), hence the
+         * parity is derived from b_tff. */
+        bs_write1( &q, h->param.b_paff );   //original_field_pic_flag
+        if( h->param.b_paff )
+            bs_write1( &q, !h->param.b_tff ); //original_bottom_field_flag
+    }
 
     bs_write1( &q, sh->i_mmco_command_count > 0 );
     if( sh->i_mmco_command_count > 0 )

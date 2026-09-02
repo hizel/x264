@@ -188,6 +188,7 @@ static const char * const opts_standalone[] =
     "--force-cfr",
     "--mbtree",
     "--mixed-refs",
+    "--paff",
     "--no-8x8dct",
     "--no-asm",
     "--no-cabac",

@@ -57,6 +57,10 @@ int  x264_macroblock_tree_read( x264_t *h, x264_frame_t *frame, float *quant_off
 int  x264_reference_build_list_optimal( x264_t *h );
 #define x264_thread_sync_ratecontrol x264_template(thread_sync_ratecontrol)
 void x264_thread_sync_ratecontrol( x264_t *cur, x264_t *prev, x264_t *next );
+#define x264_paff_sync_ratecontrol x264_template(paff_sync_ratecontrol)
+void x264_paff_sync_ratecontrol( x264_t *dst, x264_t *src );
+#define x264_paff_merge_ratecontrol x264_template(paff_merge_ratecontrol)
+void x264_paff_merge_ratecontrol( x264_t *h, x264_t *h1 );
 #define x264_ratecontrol_zone_init x264_template(ratecontrol_zone_init)
 void x264_ratecontrol_zone_init( x264_t * );
 #define x264_ratecontrol_start x264_template(ratecontrol_start)
@@ -79,6 +83,10 @@ void x264_ratecontrol_summary( x264_t * );
 int  x264_rc_analyse_slice( x264_t *h );
 #define x264_threads_distribute_ratecontrol x264_template(threads_distribute_ratecontrol)
 void x264_threads_distribute_ratecontrol( x264_t *h );
+#define x264_paff_slice_field_budget x264_template(paff_slice_field_budget)
+void x264_paff_slice_field_budget( x264_t *h, int pass );
+#define x264_paff_slice_restore_pair_plan x264_template(paff_slice_restore_pair_plan)
+void x264_paff_slice_restore_pair_plan( x264_t *h );
 #define x264_threads_merge_ratecontrol x264_template(threads_merge_ratecontrol)
 void x264_threads_merge_ratecontrol( x264_t *h );
 #define x264_hrd_fullness x264_template(hrd_fullness)

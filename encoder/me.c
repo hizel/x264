@@ -872,7 +872,11 @@ static void refine_subpel( x264_t *h, x264_me_t *m, int hpel_iters, int qpel_ite
     const int b_chroma_me = h->mb.b_chroma_me && (i_pixel <= PIXEL_8x8 || CHROMA444);
     int chromapix = h->luma2chroma_pixel[i_pixel];
     int chroma_v_shift = CHROMA_V_SHIFT;
-    int mvy_offset = chroma_v_shift & MB_INTERLACED & m->i_ref ? (h->mb.i_mb_y & 1)*4 - 2 : 0;
+    /* PAFF (2.2c): under FIELD_PIC pick the per-list parity map -- m->i_ref
+     * indexes the list this ME belongs to (set by LOAD_HPELS), so an L1 search
+     * must read i_fref_parity_l1, not the L0 map (the maps diverge once a
+     * list holds a single-field entry). */
+    int mvy_offset = chroma_v_shift & MB_INTERLACED & (FIELD_PIC ? ((m->i_list ? h->mb.pic.i_fref_parity_l1 : h->mb.pic.i_fref_parity)[m->i_ref] ^ h->sh.b_bottom_field) : m->i_ref) ? (h->mb.i_mb_y & 1)*4 - 2 : 0;
 
     ALIGNED_ARRAY_32( pixel, pix,[64*18] ); // really 17x17x2, but round up for alignment
     ALIGNED_ARRAY_16( int, costs,[4] );
@@ -1047,8 +1051,13 @@ static ALWAYS_INLINE void me_refine_bidir( x264_t *h, x264_me_t *m0, x264_me_t *
     pixel *pixv = CHROMA_FORMAT ? &h->mb.pic.p_fdec[2][chroma_x + chroma_y*FDEC_STRIDE] : NULL;
     int ref0 = h->mb.cache.ref[0][s8];
     int ref1 = h->mb.cache.ref[1][s8];
-    const int mv0y_offset = chroma_v_shift & MB_INTERLACED & ref0 ? (h->mb.i_mb_y & 1)*4 - 2 : 0;
-    const int mv1y_offset = chroma_v_shift & MB_INTERLACED & ref1 ? (h->mb.i_mb_y & 1)*4 - 2 : 0;
+    /* PAFF (2.2c): bipred chroma v-offset -- under FIELD_PIC key on the
+     * per-entry parity maps (i_fref_parity / i_fref_parity_l1), mirroring the
+     * single-ref site (me.c refine_subpel).  JM comparison note: JM applies
+     * the same (i_mb_y&1)*4-2 offset for field pictures, 4:2:0 only, when the
+     * reference field parity differs from the current picture's parity. */
+    const int mv0y_offset = chroma_v_shift & MB_INTERLACED & (FIELD_PIC ? (h->mb.pic.i_fref_parity[ref0] ^ h->sh.b_bottom_field) : ref0) ? (h->mb.i_mb_y & 1)*4 - 2 : 0;
+    const int mv1y_offset = chroma_v_shift & MB_INTERLACED & (FIELD_PIC ? (h->mb.pic.i_fref_parity_l1[ref1] ^ h->sh.b_bottom_field) : ref1) ? (h->mb.i_mb_y & 1)*4 - 2 : 0;
     intptr_t stride[3][2][9];
     int bm0x = m0->mv[0];
     int bm0y = m0->mv[1];
@@ -1238,7 +1247,9 @@ void x264_me_refine_qpel_rd( x264_t *h, x264_me_t *m, int i_lambda2, int i4, int
     const int bh = x264_pixel_size[m->i_pixel].h;
     const int i_pixel = m->i_pixel;
     int chroma_v_shift = CHROMA_V_SHIFT;
-    int mvy_offset = chroma_v_shift & MB_INTERLACED & m->i_ref ? (h->mb.i_mb_y & 1)*4 - 2 : 0;
+    /* PAFF (2.2c): under FIELD_PIC pick the per-list parity map (i_list is
+     * authoritative here). */
+    int mvy_offset = chroma_v_shift & MB_INTERLACED & (FIELD_PIC ? ((i_list ? h->mb.pic.i_fref_parity_l1 : h->mb.pic.i_fref_parity)[m->i_ref] ^ h->sh.b_bottom_field) : m->i_ref) ? (h->mb.i_mb_y & 1)*4 - 2 : 0;
 
     uint64_t bcost = COST_MAX64;
     int bmx = m->mv[0];

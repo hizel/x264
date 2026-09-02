@@ -223,18 +223,42 @@ void x264_analyse_weight_frame( x264_t *h, int end )
         if( h->sh.weight[j][0].weightfn )
         {
             x264_frame_t *frame = h->fref[0][j];
+            /* PAFF: the weighted plane is frame-layout (it covers rows of
+             * both parities), while the analyse wait loop only gated this
+             * entry's own parity -- the other parity of the same frame may
+             * have been truncated out of the field-expanded list, so gate
+             * both parities of the source frame here (end is in field lines).
+             * fdec never carries a weight (weighted_pred_init skips the
+             * complementary entry), so this never waits on the pair's own job.
+             * The i_thread_frames guard is load-bearing, not redundant with
+             * the caller's: the per-parity counters are never broadcast at
+             * i_thread_frames == 1, so an unguarded wait would block forever. */
+            if( h->param.b_paff && h->i_thread_frames > 1 )
+                for( int p = 0; p < 2; p++ )
+                    x264_frame_cond_wait_fld( frame->orig, p, end );
             int width = frame->i_width[0] + PADH2;
-            int i_padv = PADV << PARAM_INTERLACED;
-            int offset, height;
+            int i_padv = PADV << PARAM_FIELDCODE;
+            int offset, height, need;
+            /* PAFF: per-pass weighted-ref state lives in the slot's shadow
+             * (paff-pass-threads); the two pass jobs must not race the
+             * shared fenc counter. */
+            pixel **weighted = h->param.b_paff ? h->paff_weighted : h->fenc->weighted;
+            int *i_lines_weighted = h->param.b_paff ? &h->paff_i_lines_weighted : &h->fenc->i_lines_weighted;
             pixel *src = frame->filtered[0][0] - frame->i_stride[0]*i_padv - PADH_ALIGN;
-            height = X264_MIN( 16 + end + i_padv, h->fref[0][j]->i_lines[0] + i_padv*2 ) - h->fenc->i_lines_weighted;
-            offset = h->fenc->i_lines_weighted*frame->i_stride[0];
-            h->fenc->i_lines_weighted += height;
+            /* PAFF: end is in field lines, but the weighted plane is frame
+             * layout and MC reads it through the woven field view (one field
+             * line = 2 frame rows), so the extent -- including the 16-line
+             * block margin of the formula -- doubles; +1 covers the
+             * opposite-parity row of the last field line. */
+            need = h->param.b_paff ? 2*(16 + end) + 1 : 16 + end;
+            height = X264_MIN( need + i_padv, h->fref[0][j]->i_lines[0] + i_padv*2 ) - *i_lines_weighted;
+            offset = *i_lines_weighted*frame->i_stride[0];
+            *i_lines_weighted += height;
             if( height )
                 for( int k = j; k < h->i_ref[0]; k++ )
                     if( h->sh.weight[k][0].weightfn )
                     {
-                        pixel *dst = h->fenc->weighted[k] - h->fenc->i_stride[0]*i_padv - PADH_ALIGN;
+                        pixel *dst = weighted[k] - h->fenc->i_stride[0]*i_padv - PADH_ALIGN;
                         x264_weight_scale_plane( h, dst + offset, frame->i_stride[0],
                                                  src + offset, frame->i_stride[0],
                                                  width, height, &h->sh.weight[k][0] );
@@ -355,13 +379,39 @@ static void mb_analyse_init( x264_t *h, x264_mb_analysis_t *a, int qp )
             if( h->i_thread_frames > 1 )
             {
                 int pix_y = (h->mb.i_mb_y | PARAM_INTERLACED) * 16;
-                int thresh = pix_y + h->param.analyse.i_mv_range_thread;
-                for( int i = (h->sh.i_type == SLICE_TYPE_B); i >= 0; i-- )
-                    for( int j = 0; j < h->i_ref[i]; j++ )
+                if( h->param.b_paff )
+                {
+                    /* PAFF: wait per reference FIELD, in field lines of each
+                     * entry's own parity; the current MB's top field line is
+                     * 16*(i_mb_y>>1) (the field has i_lines/2 lines).  The
+                     * pair's own first field (fref == h->fdec, the
+                     * complementary entry) is coded by a DIFFERENT job under
+                     * pass-granular threading (paff-pass-threads D5): it
+                     * waits like every other entry, bounded by that field's
+                     * completed rows. */
+                    int thresh;
+                    pix_y = (h->mb.i_mb_y >> 1) * 16;
+                    thresh = pix_y + h->param.analyse.i_mv_range_thread;
+                    for( int i = (h->sh.i_type == SLICE_TYPE_B); i >= 0; i-- )
                     {
-                        int completed = x264_frame_cond_wait( h->fref[i][j]->orig, thresh );
-                        thread_mvy_range = X264_MIN( thread_mvy_range, completed - pix_y );
+                        int8_t *parity_map = i ? h->mb.pic.i_fref_parity_l1 : h->mb.pic.i_fref_parity;
+                        for( int j = 0; j < h->i_ref[i]; j++ )
+                        {
+                            int completed = x264_frame_cond_wait_fld( h->fref[i][j]->orig, parity_map[j], thresh );
+                            thread_mvy_range = X264_MIN( thread_mvy_range, completed - pix_y );
+                        }
                     }
+                }
+                else
+                {
+                    int thresh = pix_y + h->param.analyse.i_mv_range_thread;
+                    for( int i = (h->sh.i_type == SLICE_TYPE_B); i >= 0; i-- )
+                        for( int j = 0; j < h->i_ref[i]; j++ )
+                        {
+                            int completed = x264_frame_cond_wait( h->fref[i][j]->orig, thresh );
+                            thread_mvy_range = X264_MIN( thread_mvy_range, completed - pix_y );
+                        }
+                }
 
                 if( h->param.b_deterministic )
                     thread_mvy_range = h->param.analyse.i_mv_range_thread;
@@ -388,8 +438,21 @@ static void mb_analyse_init( x264_t *h, x264_mb_analysis_t *a, int qp )
             }
             else
             {
+                /* PAFF: this pass codes one field and references are field
+                 * stores (interleaved layout, read at doubled stride) with
+                 * per-field emulated edges, so the vertical search window
+                 * must come from the field MB grid: field row i_mb_y>>1 of
+                 * i_mb_height>>1 rows.  Both parities map the same way (a
+                 * pass codes every other frame MB row; the SPS rounds
+                 * i_mb_height up to even for field coding, so each field has
+                 * exactly i_mb_height/2 MB rows), and the +/-24-field-line
+                 * (96 qpel) margin stays inside the 32-field-line emulated
+                 * edge (i_padv=64 rows, halved by the doubled field stride).
+                 * The shifts are identity for progressive. */
+                int mb_height = h->mb.i_mb_height >> h->param.b_paff;
+                mb_y >>= h->param.b_paff;
                 h->mb.mv_min[1] = 4*( -16*mb_y - 24 );
-                h->mb.mv_max[1] = 4*( 16*( h->mb.i_mb_height - mb_y - 1 ) + 24 );
+                h->mb.mv_max[1] = 4*( 16*( mb_height - mb_y - 1 ) + 24 );
                 h->mb.mv_min_spel[1] = X264_MAX( h->mb.mv_min[1], -i_fmv_range );
                 h->mb.mv_max_spel[1] = X264_MIN3( h->mb.mv_max[1], i_fmv_range-1, 4*thread_mvy_range );
                 h->mb.mv_limit_fpel[0][1] = (h->mb.mv_min_spel[1]>>2) + i_fpel_border;
@@ -1243,6 +1306,7 @@ static void intra_rd_refine( x264_t *h, x264_mb_analysis_t *a )
         (m)->integral = &h->mb.pic.p_integral[list][ref][(xoff)+(yoff)*(m)->i_stride[0]]; \
     (m)->weight = x264_weight_none; \
     (m)->i_ref = ref; \
+    (m)->i_list = list; \
 }
 
 #define LOAD_WPELS(m, src, list, ref, xoff, yoff) \
@@ -1618,7 +1682,7 @@ static ALWAYS_INLINE int mb_analyse_inter_p4x4_chroma_internal( x264_t *h, x264_
     int chroma_v_shift = chroma == CHROMA_420;
     int or = 8*(i8x8&1) + (4>>chroma_v_shift)*(i8x8&2)*i_stride;
     int i_ref = a->l0.me8x8[i8x8].i_ref;
-    int mvy_offset = chroma_v_shift && MB_INTERLACED & i_ref ? (h->mb.i_mb_y & 1)*4 - 2 : 0;
+    int mvy_offset = chroma_v_shift && MB_INTERLACED & (FIELD_PIC ? (h->mb.pic.i_fref_parity[i_ref] ^ h->sh.b_bottom_field) : i_ref) ? (h->mb.i_mb_y & 1)*4 - 2 : 0;
     x264_weight_t *weight = h->sh.weight[i_ref];
 
     // FIXME weight can be done on 4x4 blocks even if mc is smaller
@@ -1816,8 +1880,8 @@ static ALWAYS_INLINE int analyse_bi_chroma( x264_t *h, x264_mb_analysis_t *a, in
     else \
     { \
         int v_shift = CHROMA_V_SHIFT; \
-        int l0_mvy_offset = v_shift & MB_INTERLACED & m0.i_ref ? (h->mb.i_mb_y & 1)*4 - 2 : 0; \
-        int l1_mvy_offset = v_shift & MB_INTERLACED & m1.i_ref ? (h->mb.i_mb_y & 1)*4 - 2 : 0; \
+        int l0_mvy_offset = v_shift & MB_INTERLACED & (FIELD_PIC ? (h->mb.pic.i_fref_parity[m0.i_ref] ^ h->sh.b_bottom_field) : m0.i_ref) ? (h->mb.i_mb_y & 1)*4 - 2 : 0; \
+        int l1_mvy_offset = v_shift & MB_INTERLACED & (FIELD_PIC ? (h->mb.pic.i_fref_parity_l1[m1.i_ref] ^ h->sh.b_bottom_field) : m1.i_ref) ? (h->mb.i_mb_y & 1)*4 - 2 : 0; \
         h->mc.mc_chroma( pix[0], pix[1], 16, m0.p_fref[4], m0.i_stride[1], \
                          m0.mv[0], 2*(m0.mv[1]+l0_mvy_offset)>>v_shift, width>>1, height>>v_shift ); \
         h->mc.mc_chroma( pix[2], pix[3], 16, m1.p_fref[4], m1.i_stride[1], \
@@ -2027,7 +2091,7 @@ static void mb_analyse_inter_b16x16( x264_t *h, x264_mb_analysis_t *a )
                 int chromapix = h->luma2chroma_pixel[PIXEL_16x16];
                 int v_shift = CHROMA_V_SHIFT;
 
-                if( v_shift & MB_INTERLACED & a->l0.bi16x16.i_ref )
+                if( v_shift & MB_INTERLACED & (FIELD_PIC ? (h->mb.pic.i_fref_parity[a->l0.bi16x16.i_ref] ^ h->sh.b_bottom_field) : a->l0.bi16x16.i_ref) )
                 {
                     int l0_mvy_offset = (h->mb.i_mb_y & 1)*4 - 2;
                     h->mc.mc_chroma( pixuv[0], pixuv[0]+8, FENC_STRIDE, h->mb.pic.p_fref[0][a->l0.bi16x16.i_ref][4],
@@ -2037,7 +2101,7 @@ static void mb_analyse_inter_b16x16( x264_t *h, x264_mb_analysis_t *a )
                     h->mc.load_deinterleave_chroma_fenc( pixuv[0], h->mb.pic.p_fref[0][a->l0.bi16x16.i_ref][4],
                                                          h->mb.pic.i_stride[1], 16>>v_shift );
 
-                if( v_shift & MB_INTERLACED & a->l1.bi16x16.i_ref )
+                if( v_shift & MB_INTERLACED & (FIELD_PIC ? (h->mb.pic.i_fref_parity_l1[a->l1.bi16x16.i_ref] ^ h->sh.b_bottom_field) : a->l1.bi16x16.i_ref) )
                 {
                     int l1_mvy_offset = (h->mb.i_mb_y & 1)*4 - 2;
                     h->mc.mc_chroma( pixuv[1], pixuv[1]+8, FENC_STRIDE, h->mb.pic.p_fref[1][a->l1.bi16x16.i_ref][4],
@@ -2967,8 +3031,13 @@ intra_analysis:
         }
         else
         {
-            /* Special fast-skip logic using information from mb_info. */
-            if( h->fdec->mb_info && (h->fdec->mb_info[h->mb.i_mb_xy]&X264_MBINFO_CONSTANT) )
+            /* Special fast-skip logic using information from mb_info.
+             * PAFF: the bottom MB row can be the even-padding added to
+             * i_mb_height for field coding (set.c) -- it lies outside the
+             * caller's mb_info array, which has one byte per MB of the
+             * unpadded frame grid. */
+            if( h->fdec->mb_info && !(h->param.b_paff && h->mb.i_mb_y*16 >= h->param.i_height)
+                && (h->fdec->mb_info[h->mb.i_mb_xy]&X264_MBINFO_CONSTANT) )
             {
                 if( !SLICE_MBAFF && (h->fdec->i_frame - h->fref[0][0]->i_frame) == 1 && !h->sh.b_weighted_pred &&
                     h->fref[0][0]->effective_qp[h->mb.i_mb_xy] <= h->mb.i_qp )
@@ -3869,8 +3938,25 @@ static void analyse_update_cache( x264_t *h, x264_mb_analysis_t *a  )
             int ref = h->mb.cache.ref[l][x264_scan8[0]];
             if( ref < 0 )
                 continue;
-            completed = x264_frame_cond_wait( h->fref[l][ ref >> MB_INTERLACED ]->orig, -1 );
-            if( (h->mb.cache.mv[l][x264_scan8[15]][1] >> (2 - MB_INTERLACED)) + h->mb.i_mb_y*16 > completed )
+            int mvy_limit;
+            if( h->param.b_paff )
+            {
+                /* PAFF: ref indexes the field-expanded list directly (no
+                 * MBAFF-style ref>>1); the MV is in field units and the
+                 * per-parity counter is in field lines.  The pair's own
+                 * complementary field is coded by a different job and waits
+                 * like every other entry (paff-pass-threads D5), so the
+                 * check covers it too. */
+                int8_t *parity_map = l ? h->mb.pic.i_fref_parity_l1 : h->mb.pic.i_fref_parity;
+                completed = x264_frame_cond_wait_fld( h->fref[l][ref]->orig, parity_map[ref], -1 );
+                mvy_limit = (h->mb.cache.mv[l][x264_scan8[15]][1] >> 2) + (h->mb.i_mb_y >> 1)*16;
+            }
+            else
+            {
+                completed = x264_frame_cond_wait( h->fref[l][ ref >> MB_INTERLACED ]->orig, -1 );
+                mvy_limit = (h->mb.cache.mv[l][x264_scan8[15]][1] >> (2 - MB_INTERLACED)) + h->mb.i_mb_y*16;
+            }
+            if( mvy_limit > completed )
             {
                 x264_log( h, X264_LOG_WARNING, "internal error (MV out of thread range)\n");
                 x264_log( h, X264_LOG_DEBUG, "mb type: %d \n", h->mb.i_type);

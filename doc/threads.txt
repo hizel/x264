@@ -93,3 +93,145 @@ x264 --preset slower --tune psnr --crf 30
 10:         6.24x         +0.001
 11:         6.55x         -0.001
 12:         6.89x         -0.001
+
+
+PAFF (field pictures) and threads:
+Under --paff, the two field passes of a complementary pair are coded as
+two separate frame-thread jobs on consecutive slots (the slot rotation
+advances by two per pair); the caller collects both jobs of the oldest
+pair together (a rendezvous) before running the pair-level frame end.
+Reference readiness is row-granular for BOTH fields: each pass produces
+its parity's reference band (field-layout copy, hpel, borders) at row
+cadence trailing the deblock, and dependent passes restrict their
+vertical MV range to the completed field rows, exactly as progressive
+frame threads do (thresholds in field lines; --non-deterministic keeps
+the clamped range, the default deterministic mode uses the fixed
+i_mv_range_thread).  A pair's second field waits on its own first field
+by the same row rule.  The chain is therefore the per-pass diagonal
+staircase of progressive threading; the old pair-job model (one job per
+pair, first field gated on an intermediate-sweep phase) topped out at
+~2x on P-chains.  N slots keep N/2 PAIRS in flight; pair jobs consume an
+even slot count, so at an odd thread count the last slot idles.  Output
+is deterministic at a fixed thread count, but not byte-identical to
+--threads 1 (the MV-range clamp applies as in progressive).  This now
+holds with VBV enabled too (see "Threaded VBV determinism" below).
+Slice-based threading under PAFF is supported (paff-sliced-threads):
+frame threading is off by construction (one pair in flight, monolithic
+pair driver) and each field pass is split into N parity-interleaved
+slice bands, one slice per band, coded in parallel.  Each thread
+deblocks its own band rows at its slice end (cross-slice deblock off,
+idc=2), and all reference-data work (field-layout copy, borders, hpel)
+runs in a serial post-join sweep on the main context -- no cross-thread
+pixel synchronization.  The thread count is capped at four field MB
+rows per band (half the progressive cap: a field has half the frame's
+MB rows).  Row-VBV budgets are per field: pass 0 gets the pair plan
+scaled by its parity's SATD share, pass 1 the exact leftover floored at
+5% of the pair plan.  Non-VBV modes (CRF/CQP/ABR) are byte-repeatable
+at a fixed thread count; CBR+VBV inherits the sliced-threads timing
+exception (below).  Measured on the same machine: 1.84x at N=2 and
+3.21x at N=4 on 1080i; BD-rate overhead at or below the sliced-
+progressive penalty at the same operating point (numbers in
+doc/paff.txt).  See doc/paff.txt.
+
+Measured (AMD Ryzen 7 9800X3D, 8C/16T; best of 3 runs; --paff --tff,
+CBR+VBV, --aud for the drift metrics; "pair-job" is the pre-split
+implementation at commit 5fe86884):
+
+hall.ts 720x576i25, 400 frames, --bitrate 4000 --vbv-maxrate 4000
+--vbv-bufsize 4000 (VBV buffer = 4.0 Mbit):
+
+            pass-jobs              pair-job     VBV drift vs t1
+threads:  fps     speedup        fps     ratio  filler  max dev  rms dev
+1:        21.3    1.00x          -       -     0       -        -
+2:        33.2    1.56x          36.0    0.92x 0       42 kbit   13 kbit
+4:        61.1    2.87x          54.3    1.13x 0      511 kbit  273 kbit
+6:        88.3    4.15x          56.5    1.56x 0      805 kbit  455 kbit
+8:        99.1    4.65x          -       -     0     1118 kbit  521 kbit
+16:       133.6   6.27x          60.7    2.20x 0     2407 kbit 1246 kbit
+
+(pair-job's own drift vs its t1: 1099 kbit max at t6, 3319 kbit at t16
+-- the split does not add VBV drift; it slightly reduces it here.)
+
+1920x1080i25 testsrc2 (tinterlaced), 100 frames, --bitrate 8000
+--vbv-maxrate 8000 --vbv-bufsize 8000 (VBV buffer = 8.0 Mbit):
+
+            pass-jobs              VBV drift vs t1
+threads:  fps     speedup        filler  max dev  rms dev
+1:        13.0    1.00x          0       -        -
+2:        19.5    1.50x          0       26 kbit    6 kbit
+4:        37.4    2.88x          0      257 kbit  164 kbit
+6:        55.5    4.28x          0      439 kbit  227 kbit
+8:        63.3    4.87x          0      609 kbit  394 kbit
+16:       64.8    5.00x          0     1332 kbit 1092 kbit
+
+Notes on the drift columns: pass 1's row VBV runs on predicted pass-0
+bits (progressive-threading semantics), so the threaded VBV trajectory
+diverges from the t1 run.  "filler" is total filler-NAL bytes (zero
+everywhere: no run ever approached underflow, and no VBV warnings were
+logged).  "max/rms dev" is the cumulative per-access-unit size
+difference vs the t1 run, i.e. how far the effective buffer trajectory
+wanders, in bits of the buffer (hall t16: 2407 kbit = 60% of the 4.0
+Mbit buffer, within bounds; the pair-job build reached 83%).  There is
+no numeric deviation bound: threaded ratecontrol is approximate by
+design, as in progressive.
+
+Acceptance (paff-pass-threads, three zones fixed before measuring):
+>=4x at t6 and >=5x at t16 required -- measured 4.15x and 6.27x on the
+reference clip: PASS.  Low-N: t2 sits 8% below the pair-job build
+(pairs in flight halve; accepted bound ~10%), t4 is 13% ahead.
+
+Older pair-job numbers (1920x1080 testsrc2, 200 frames, --paff --keyint 50,
+default settings, x86-64, pre-split implementation):
+
+          --bframes 3            --bframes 0
+threads:  fps      speedup       fps      speedup
+1:        31.9     1.00x        37.1     1.00x
+2:        51.7     1.62x        48.0     1.29x
+4:        64.7     2.03x        53.0     1.43x
+8:        77.2     2.42x        64.2     1.73x
+
+
+Threaded VBV determinism:
+Historically, frame-threaded encoding with VBV enabled was NOT
+byte-deterministic even at a fixed thread count: VBV decisions read live
+state of frames still being coded by other workers (the per-row-updated
+frame_size_estimated of in-flight slots at dispatch, and reference rows'
+per-row QP/qscale/bits statistics during row-level ratecontrol), so the
+output depended on worker timing.  This is fixed: dispatch-time planning
+charges in-flight frames a deterministic estimate (planned size scaled by
+the recent plan error of finished frames, plus an overshoot margin, both
+tracked over harvested -- final -- frames only), and every reference-row
+read is gated on a deterministic "row provably committed" check derived
+from the frame-thread row-wait guarantee (see row_ref_committed in
+encoder/ratecontrol.c for the derivation per coding mode: progressive
+frame lines, MBAFF pair rows, PAFF per-parity field lines; PAFF
+additionally keeps each field pass's row-bit accounting within its own
+parity).  CBR+VBV output is now byte-identical across repeat runs at a
+fixed thread count (verified at N = 2/4/8/16, with and without B-frames,
+under --paff, and at 720p).  --threads 1 and the non-VBV ratecontrol
+modes (CRF, CQP, ABR without VBV) are byte-identical before and after.
+Slice-based threading is excepted: its cross-slice reads of live
+bits_so_far / frame_size_estimated remain timing-dependent.  This
+exception covers sliced PAFF equally (--paff --sliced-threads): CRF,
+CQP and ABR-without-VBV stay byte-identical across repeat runs at a
+fixed thread count (verified at N = 2/4/8 with and without B-frames),
+while CBR+VBV output is timing-dependent and gated instead on Annex C
+CPB compliance plus zero underflow warnings.
+
+Measured consequences of the new threaded CBR+VBV trajectory (vs the old
+nondeterministic one; tools/test_vbv_determinism.sh --quality):
+- Long content (720p full length): bitrate error vs target unchanged
+  (0.000%), PSNR-Y within 0.071 dB, SSIM within 0.00005; filler bytes up
+  to +27% over the old median on one cell (more conservative planning
+  pads more).
+- Short clips (25-64 frames, i.e. startup-transient dominated): the old
+  threaded runs overshot the target by 11-16% (by 32% under --paff); the
+  new trajectory lands on or just under target, closer to --threads 1.
+  Raw PSNR/SSIM on these cells drop commensurately with the bits no
+  longer spent.
+- Conformance (tools/check_hrd.py, --nal-hrd cbr): no CPB under/overflow
+  in any post-change matrix cell; the old code itself underflows in ~1/12
+  runs on the borderline scenecut cell (its determinism was luck).
+  check_hrd.py reports a pre-existing end-of-stream finding ("removal
+  time not increasing" on the last flushing AUs) on long --bframes 3
+  streams, byte-identical before and after this change.

@@ -42,3 +42,15 @@ The goal is the same as in 2pass, but here we don't have the benefit of a previo
 
     constant quantizer:
 QPs are simply based on frame type.
+
+
+PAFF (field pictures):
+Under --paff each input frame is a complementary field pair (two coded
+pictures, two access units).  Rate control keeps frame-level QP decisions:
+one frame-level QP feeds both fields of a pair.  Bits are accounted per field,
+so ABR/CBR/CRF and 2-pass see field-granular usage; 2-pass stats and MB-tree
+stay frame-based (one entry per pair).  The VBV buffer model steps once per
+field access unit (each field's AU removed one field tick apart, using the
+actual per-AU NAL sizes), matching Annex C.1.2.  For 2-pass use --slow-firstpass
+(the default turbo first pass undershoots ~10% under PAFF).  CBR/VBV has a
+startup overshoot transient on no-B streams.  See doc/paff.txt.

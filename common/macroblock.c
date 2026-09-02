@@ -52,7 +52,7 @@ static NOINLINE void mb_mc_0xywh( x264_t *h, int x, int y, int width, int height
     {
         int v_shift = CHROMA_V_SHIFT;
         // Chroma in 4:2:0 is offset if MCing from a field of opposite parity
-        if( v_shift & MB_INTERLACED & i_ref )
+        if( v_shift & MB_INTERLACED & (FIELD_PIC ? (h->mb.pic.i_fref_parity[i_ref] ^ h->sh.b_bottom_field) : i_ref) )
             mvy += (h->mb.i_mb_y & 1)*4 - 2;
 
         int offset = (4*FDEC_STRIDE>>v_shift)*y + 2*x;
@@ -90,7 +90,10 @@ static NOINLINE void mb_mc_1xywh( x264_t *h, int x, int y, int width, int height
     else if( CHROMA_FORMAT )
     {
         int v_shift = CHROMA_V_SHIFT;
-        if( v_shift & MB_INTERLACED & i_ref )
+        /* PAFF (2.2c): chroma in 4:2:0 is offset when MCing from a field of
+         * opposite parity.  Under FIELD_PIC key on the per-entry L1 parity map
+         * (mirror single-ref L0 site above); MBAFF/progressive use raw i_ref. */
+        if( v_shift & MB_INTERLACED & (FIELD_PIC ? (h->mb.pic.i_fref_parity_l1[i_ref] ^ h->sh.b_bottom_field) : i_ref) )
             mvy += (h->mb.i_mb_y & 1)*4 - 2;
 
         int offset = (4*FDEC_STRIDE>>v_shift)*y + 2*x;
@@ -135,9 +138,14 @@ static NOINLINE void mb_mc_01xywh( x264_t *h, int x, int y, int width, int heigh
     else if( CHROMA_FORMAT )
     {
         int v_shift = CHROMA_V_SHIFT;
-        if( v_shift & MB_INTERLACED & i_ref0 )
+        /* PAFF (2.2c): bipred chroma v-offset -- under FIELD_PIC key on the
+         * per-entry parity maps (i_fref_parity / i_fref_parity_l1), mirroring
+         * the single-ref sites.  JM comparison note: JM's uv MC applies the
+         * same (i_mb_y&1)*4-2 offset when the reference field parity differs
+         * from the current picture's parity (field picture, 4:2:0 only). */
+        if( v_shift & MB_INTERLACED & (FIELD_PIC ? (h->mb.pic.i_fref_parity[i_ref0] ^ h->sh.b_bottom_field) : i_ref0) )
             mvy0 += (h->mb.i_mb_y & 1)*4 - 2;
-        if( v_shift & MB_INTERLACED & i_ref1 )
+        if( v_shift & MB_INTERLACED & (FIELD_PIC ? (h->mb.pic.i_fref_parity_l1[i_ref1] ^ h->sh.b_bottom_field) : i_ref1) )
             mvy1 += (h->mb.i_mb_y & 1)*4 - 2;
 
         h->mc.mc_chroma( tmp0, tmp0+8, 16, h->mb.pic.p_fref[0][i_ref0][4], h->mb.pic.i_stride[1],
@@ -279,7 +287,10 @@ int x264_macroblock_cache_allocate( x264_t *h )
 
     for( int i = 0; i < 2; i++ )
     {
-        int i_refs = X264_MIN(X264_REF_MAX, (i ? 1 + !!h->param.i_bframe_pyramid : h->param.i_frame_reference) ) << PARAM_INTERLACED;
+        /* PAFF field pictures address up to 2*i_frame_reference L0 field
+         * entries (each pair contributes both parities), so the per-ref MV
+         * store is doubled under any field-coding mode (MBAFF or PAFF). */
+        int i_refs = X264_MIN(X264_REF_MAX, (i ? 1 + !!h->param.i_bframe_pyramid : h->param.i_frame_reference) ) << PARAM_FIELDCODE;
         if( h->param.analyse.i_weighted_pred == X264_WEIGHTP_SMART )
             i_refs = X264_MIN(X264_REF_MAX, i_refs + 1 + (BIT_DEPTH == 8)); //smart weights add two duplicate frames, one in >8-bit
 
@@ -289,7 +300,10 @@ int x264_macroblock_cache_allocate( x264_t *h )
 
     if( h->param.analyse.i_weighted_pred )
     {
-        int i_padv = PADV << PARAM_INTERLACED;
+        /* PARAM_FIELDCODE (covers PAFF too): weighted_pred_init scales the
+         * weighted plane with i_padv = PADV << PARAM_FIELDCODE, so the
+         * buffer must be sized with the same i_padv. */
+        int i_padv = PADV << PARAM_FIELDCODE;
         int luma_plane_size = 0;
         int numweightbuf;
 
@@ -330,7 +344,7 @@ int x264_macroblock_cache_allocate( x264_t *h )
 
     for( int i = 0; i < 2; i++ )
     {
-        int i_refs = X264_MIN(X264_REF_MAX, (i ? 1 + !!h->param.i_bframe_pyramid : h->param.i_frame_reference) ) << PARAM_INTERLACED;
+        int i_refs = X264_MIN(X264_REF_MAX, (i ? 1 + !!h->param.i_bframe_pyramid : h->param.i_frame_reference) ) << PARAM_FIELDCODE;
         if( h->param.analyse.i_weighted_pred == X264_WEIGHTP_SMART )
             i_refs = X264_MIN(X264_REF_MAX, i_refs + 1 + (BIT_DEPTH == 8)); //smart weights add two duplicate frames, one in >8-bit
 
@@ -354,13 +368,13 @@ int x264_macroblock_thread_allocate( x264_t *h, int b_lookahead )
 {
     if( !b_lookahead )
     {
-        for( int i = 0; i < (PARAM_INTERLACED ? 5 : 2); i++ )
+        for( int i = 0; i < (PARAM_FIELDCODE ? 5 : 2); i++ )
             for( int j = 0; j < (CHROMA444 ? 3 : 2); j++ )
             {
                 CHECKED_MALLOC( h->intra_border_backup[i][j], (h->sps->i_mb_width*16+32) * SIZEOF_PIXEL );
                 h->intra_border_backup[i][j] += 16;
             }
-        for( int i = 0; i <= PARAM_INTERLACED; i++ )
+        for( int i = 0; i <= PARAM_FIELDCODE; i++ )
         {
             if( h->param.b_sliced_threads )
             {
@@ -409,10 +423,10 @@ void x264_macroblock_thread_free( x264_t *h, int b_lookahead )
 {
     if( !b_lookahead )
     {
-        for( int i = 0; i <= PARAM_INTERLACED; i++ )
+        for( int i = 0; i <= PARAM_FIELDCODE; i++ )
             if( !h->param.b_sliced_threads || (h == h->thread[0] && !i) )
                 x264_free( h->deblock_strength[i] );
-        for( int i = 0; i < (PARAM_INTERLACED ? 5 : 2); i++ )
+        for( int i = 0; i < (PARAM_FIELDCODE ? 5 : 2); i++ )
             for( int j = 0; j < (CHROMA444 ? 3 : 2); j++ )
                 x264_free( h->intra_border_backup[i][j] - 16 );
     }
@@ -431,20 +445,34 @@ void x264_macroblock_slice_init( x264_t *h )
     h->mb.partition = h->fdec->mb_partition;
     h->mb.field = h->fdec->field;
 
-    h->fdec->i_ref[0] = h->i_ref[0];
-    h->fdec->i_ref[1] = h->i_ref[1];
-    for( int i = 0; i < h->i_ref[0]; i++ )
-        h->fdec->ref_poc[0][i] = h->fref[0][i]->i_poc;
-    if( h->sh.i_type == SLICE_TYPE_B )
+    /* PAFF (D7/ADR-0004/1.1c): ref_poc/i_ref now carry a parity dimension.
+     * Non-PAFF / MBAFF / progressive paths write parity 0 (canonical).  Under
+     * PAFF this runs pair-level inside slice_init BEFORE the per-pass field
+     * expansion, so the per-field ref_poc/i_ref are recomputed by the PAFF
+     * driver after paff_expand_field_list (encoder.c); skip them here to avoid
+     * clobbering the other parity's stored values on a later pass. */
+    if( !h->param.b_paff )
     {
-        for( int i = 0; i < h->i_ref[1]; i++ )
-            h->fdec->ref_poc[1][i] = h->fref[1][i]->i_poc;
-
+        h->fdec->i_ref[0][0] = h->i_ref[0];
+        h->fdec->i_ref[1][0] = h->i_ref[1];
+        for( int i = 0; i < h->i_ref[0]; i++ )
+            h->fdec->ref_poc[0][0][i] = h->fref[0][i]->i_poc;
+        if( h->sh.i_type == SLICE_TYPE_B )
+            for( int i = 0; i < h->i_ref[1]; i++ )
+                h->fdec->ref_poc[1][0][i] = h->fref[1][i]->i_poc;
+    }
+    if( h->sh.i_type == SLICE_TYPE_B && !h->param.b_paff )
+    {
         map_col_to_list0(-1) = -1;
         map_col_to_list0(-2) = -2;
-        for( int i = 0; i < h->fref[1][0]->i_ref[0]; i++ )
+        /* PAFF (D7/2.2): under PAFF this is built per pass in the driver after
+         * the L0/L1 field expansion (macroblock_slice_init runs pair-level,
+         * before the expansion, so the pair-level lists here are wrong for
+         * PAFF).  The driver uses the colocated field's per-parity ref_poc and
+         * matches L0[j] by per-field POC (i_poc + i_delta_poc[parity]). */
+        for( int i = 0; i < h->fref[1][0]->i_ref[0][0]; i++ )
         {
-            int poc = h->fref[1][0]->ref_poc[0][i];
+            int poc = h->fref[1][0]->ref_poc[0][0][i];
             map_col_to_list0(i) = -2;
             for( int j = 0; j < h->i_ref[0]; j++ )
                 if( h->fref[0][j]->i_poc == poc )
@@ -456,7 +484,13 @@ void x264_macroblock_slice_init( x264_t *h )
     }
     else if( h->sh.i_type == SLICE_TYPE_P )
     {
-        if( h->sh.i_disable_deblocking_filter_idc != 1 && h->param.analyse.i_weighted_pred == X264_WEIGHTP_SMART )
+        /* PAFF: reference duplicates are disabled (they would need
+         * ref_pic_list_modification, which PAFF pins off), so L0 indices
+         * are already 1:1 with field pictures and the dup remap below is
+         * neither needed nor correct (the pair-level slice_init would fill
+         * this table before the per-pass field expansion). */
+        if( h->sh.i_disable_deblocking_filter_idc != 1 && h->param.analyse.i_weighted_pred == X264_WEIGHTP_SMART
+            && !h->param.b_paff )
         {
             deblock_ref_table(-2) = -2;
             deblock_ref_table(-1) = -1;
@@ -476,7 +510,12 @@ void x264_macroblock_slice_init( x264_t *h )
     /* init with not available (for top right idx=7,15) */
     memset( h->mb.cache.ref, -2, sizeof( h->mb.cache.ref ) );
 
-    if( h->i_ref[0] > 0 )
+    /* PAFF: inv_ref_poc is fdec metadata read by later pairs' jobs (TMVP,
+     * mvpred.c) -- under frame threading it must be published by the caller
+     * before dispatch (D3.3), so the PAFF caller computes it from the
+     * pair-level snapshots (last pass with a non-empty past list wins,
+     * matching the per-pass sequence this loop produced at i_threads == 1). */
+    if( h->i_ref[0] > 0 && !h->param.b_paff )
         for( int field = 0; field <= SLICE_MBAFF; field++ )
         {
             int curpoc = h->fdec->i_poc + h->fdec->i_delta_poc[field];
@@ -614,25 +653,39 @@ static ALWAYS_INLINE void macroblock_load_pic_pointers( x264_t *h, int mb_x, int
         // Interpolate between pixels in same field.
         if( mb_interlaced )
         {
-            plane_src = h->fref[0][j>>1]->plane_fld[i];
-            filtered_src = h->fref[0][j>>1]->filtered_fld[i];
+            /* PAFF (D16, FIELD_PIC): h->fref[0][j] already holds the frame
+             * pointer for field entry j (a previous pair, or h->fdec for the
+             * complementary field).  MBAFF: both fields of frame j>>1 share
+             * one DPB slot. */
+            int frm = FIELD_PIC ? j : j>>1;
+            plane_src = h->fref[0][frm]->plane_fld[i];
+            filtered_src = h->fref[0][frm]->filtered_fld[i];
         }
         else
         {
             plane_src = h->fref[0][j]->plane[i];
             filtered_src = h->fref[0][j]->filtered[i];
         }
-        h->mb.pic.p_fref[0][j][i*4] = plane_src + ref_pix_offset[j&1];
+        /* ref_pix_offset[0] = current (same-parity) field, [1] = opposite field.
+         * PAFF selects it from the per-entry parity map (D16); MBAFF uses j&1. */
+        int refidx = FIELD_PIC ? (h->mb.pic.i_fref_parity[j] ^ h->sh.b_bottom_field)
+                               : (j&1);
+        h->mb.pic.p_fref[0][j][i*4] = plane_src + ref_pix_offset[refidx];
 
         if( !b_chroma )
         {
             if( h->param.analyse.i_subpel_refine )
                 for( int k = 1; k < 4; k++ )
-                    h->mb.pic.p_fref[0][j][i*4+k] = filtered_src[k] + ref_pix_offset[j&1];
+                    h->mb.pic.p_fref[0][j][i*4+k] = filtered_src[k] + ref_pix_offset[refidx];
             if( !i )
             {
                 if( h->sh.weight[j][0].weightfn )
-                    h->mb.pic.p_fref_w[j] = &h->fenc->weighted[j >> mb_interlaced][ref_pix_offset[j&1]];
+                    /* MBAFF: both fields of frame j>>1 share one weighting
+                     * slot.  PAFF: j is the field-entry index and
+                     * weighted_pred_init assigns the pair's shared scaled
+                     * plane per entry (pair_slot) into the slot's shadow
+                     * (paff-pass-threads), so index j as-is. */
+                    h->mb.pic.p_fref_w[j] = &(h->param.b_paff ? h->paff_weighted : h->fenc->weighted)[FIELD_PIC ? j : (j >> mb_interlaced)][ref_pix_offset[refidx]];
                 else
                     h->mb.pic.p_fref_w[j] = h->mb.pic.p_fref[0][j][0];
             }
@@ -643,19 +696,27 @@ static ALWAYS_INLINE void macroblock_load_pic_pointers( x264_t *h, int mb_x, int
         {
             if( mb_interlaced )
             {
-                plane_src = h->fref[1][j>>1]->plane_fld[i];
-                filtered_src = h->fref[1][j>>1]->filtered_fld[i];
+                /* PAFF (D16, 2.2b): h->fref[1][j] already holds the frame
+                 * pointer for field entry j (MBAFF: both fields of frame j>>1
+                 * share one DPB slot).  Mirror the L0 fix above. */
+                int frm = FIELD_PIC ? j : j>>1;
+                plane_src = h->fref[1][frm]->plane_fld[i];
+                filtered_src = h->fref[1][frm]->filtered_fld[i];
             }
             else
             {
                 plane_src = h->fref[1][j]->plane[i];
                 filtered_src = h->fref[1][j]->filtered[i];
             }
-            h->mb.pic.p_fref[1][j][i*4] = plane_src + ref_pix_offset[j&1];
+            /* PAFF (2.2b): select the field plane via the per-entry parity map
+             * (i_fref_parity_l1) like L0; MBAFF uses j&1. */
+            int refidx = FIELD_PIC ? (h->mb.pic.i_fref_parity_l1[j] ^ h->sh.b_bottom_field)
+                                   : (j&1);
+            h->mb.pic.p_fref[1][j][i*4] = plane_src + ref_pix_offset[refidx];
 
             if( !b_chroma && h->param.analyse.i_subpel_refine )
                 for( int k = 1; k < 4; k++ )
-                    h->mb.pic.p_fref[1][j][i*4+k] = filtered_src[k] + ref_pix_offset[j&1];
+                    h->mb.pic.p_fref[1][j][i*4+k] = filtered_src[k] + ref_pix_offset[refidx];
         }
 }
 
@@ -993,8 +1054,10 @@ static ALWAYS_INLINE void macroblock_cache_load( x264_t *h, int mb_x, int mb_y, 
 
     if( b_mbaff )
     {
-        h->mb.pic.i_fref[0] = h->i_ref[0] << MB_INTERLACED;
-        h->mb.pic.i_fref[1] = h->i_ref[1] << MB_INTERLACED;
+        /* PAFF (field pictures): one field per reference frame is usable,
+         * so the list is not doubled with the opposite-parity field. */
+        h->mb.pic.i_fref[0] = h->i_ref[0] << (FIELD_PIC ? 0 : MB_INTERLACED);
+        h->mb.pic.i_fref[1] = h->i_ref[1] << (FIELD_PIC ? 0 : MB_INTERLACED);
     }
 
     if( !b_mbaff )
@@ -1270,7 +1333,7 @@ static ALWAYS_INLINE void macroblock_cache_load( x264_t *h, int mb_x, int mb_y, 
     /* Check whether skip here would cause decoder to predict interlace mode incorrectly.
      * FIXME: It might be better to change the interlace type rather than forcing a skip to be non-skip. */
     h->mb.b_allow_skip = 1;
-    if( b_mbaff )
+    if( b_mbaff && !FIELD_PIC )
     {
         if( MB_INTERLACED != h->mb.field_decoding_flag &&
             (mb_y&1) && IS_SKIP(h->mb.type[h->mb.i_mb_xy - h->mb.i_mb_stride]) )
@@ -1279,7 +1342,7 @@ static ALWAYS_INLINE void macroblock_cache_load( x264_t *h, int mb_x, int mb_y, 
 
     if( h->param.b_cabac )
     {
-        if( b_mbaff )
+        if( b_mbaff && !FIELD_PIC )
         {
             int left_xy, top_xy;
             /* Neighbours here are calculated based on field_decoding_flag */
@@ -1537,7 +1600,8 @@ void x264_macroblock_deblock_strength( x264_t *h )
         }
     }
 
-    if( h->param.analyse.i_weighted_pred == X264_WEIGHTP_SMART && h->sh.i_type == SLICE_TYPE_P )
+    if( h->param.analyse.i_weighted_pred == X264_WEIGHTP_SMART && h->sh.i_type == SLICE_TYPE_P
+        && !h->param.b_paff )
     {
         /* Handle reference frame duplicates */
         int i8 = x264_scan8[0] - 8;
@@ -1614,8 +1678,129 @@ void x264_macroblock_deblock_strength( x264_t *h )
         }
     }
 
+    /* PAFF: the spec's bS=1 test (8.7.2.1, NOTE 1) compares reference
+     * PICTURES, not list indices, and neighbouring partitions may address
+     * the same field picture through different lists (e.g. an L0-only
+     * partition against an L1-only partition of the same reference field).
+     * The shared strength function only does straight per-list comparisons,
+     * so canonicalize the cache for B field pictures: remap ref indices to
+     * picture ids and normalize each block's list usage (a single-MV
+     * prediction sits in the L0 slot; two-MV predictions are sorted by
+     * picture id).  Then the straight comparison is equivalent to the
+     * spec's per-picture comparison.  (Within one list each field picture
+     * appears at most once under the default-list expansion, so P slices
+     * need nothing.) */
+    if( FIELD_PIC && h->sh.i_type == SLICE_TYPE_B )
+    {
+        int8_t pic_id[2][X264_REF_MAX+2];
+        x264_frame_t *id_frame[2*X264_REF_MAX+4];
+        int id_par[2*X264_REF_MAX+4];
+        int n_id = 0;
+        for( int l = 0; l < 2; l++ )
+        {
+            int8_t *pm = l ? h->mb.pic.i_fref_parity_l1 : h->mb.pic.i_fref_parity;
+            for( int r = 0; r < h->mb.pic.i_fref[l]; r++ )
+            {
+                int id;
+                for( id = 0; id < n_id; id++ )
+                    if( id_frame[id] == h->fref[l][r] && id_par[id] == pm[r] )
+                        break;
+                if( id == n_id )
+                {
+                    id_frame[n_id] = h->fref[l][r];
+                    id_par[n_id] = pm[r];
+                    n_id++;
+                }
+                pic_id[l][r] = id;
+            }
+        }
+        for( int b = 0; b < 24; b++ )
+        {
+            int pos = b < 16 ? x264_scan8[b]
+                    : b < 20 ? X264_SCAN8_0 - 8 + (b-16)
+                             : X264_SCAN8_0 - 1 + 8*(b-20);
+            int8_t *ref0 = &h->mb.cache.ref[0][pos];
+            int8_t *ref1 = &h->mb.cache.ref[1][pos];
+            int16_t (*mv0)[2] = &h->mb.cache.mv[0][pos];
+            int16_t (*mv1)[2] = &h->mb.cache.mv[1][pos];
+            int v0 = *ref0 >= 0 && *ref0 < h->mb.pic.i_fref[0];
+            int v1 = *ref1 >= 0 && *ref1 < h->mb.pic.i_fref[1];
+            /* remap list indices to picture ids first */
+            *ref0 = v0 ? pic_id[0][*ref0] : -1;
+            *ref1 = v1 ? pic_id[1][*ref1] : -1;
+            if( !v0 && v1 )
+            {
+                /* single-MV prediction via L1: move to the L0 slot */
+                *ref0 = *ref1;
+                *ref1 = -1;
+                CP32( mv0, mv1 );
+                v0 = 1; v1 = 0;
+            }
+            else if( v0 && v1 && *ref0 > *ref1 )
+            {
+                /* two-MV prediction: order by picture id */
+                XCHG( int8_t, *ref0, *ref1 );
+                XCHG( int16_t, (*mv0)[0], (*mv1)[0] );
+                XCHG( int16_t, (*mv0)[1], (*mv1)[1] );
+            }
+            /* the straight comparison compares MVs even where both refs are
+             * unused (-1 == -1), so unused lists must carry a zero MV */
+            if( !v0 )
+                (*mv0)[0] = (*mv0)[1] = 0;
+            if( !v1 )
+                (*mv1)[0] = (*mv1)[1] = 0;
+        }
+    }
+
+    /* mvy_limit: field-coded MBs (MBAFF field MBs AND PAFF field pictures)
+     * compare the vertical MV in quarter-FIELD-sample units, so the bs=1
+     * threshold is 2, not 4 -- matches JM's mvlimit
+     * ((structure!=FRAME) || (mbaff&&field)) ? 2 : 4.  PAFF field pictures
+     * previously fell through to 4 (FIELD_PIC was excluded by '&& !FIELD_PIC');
+     * that only stayed latent because paff-core-ip clamped --ref to 1, so no
+     * P field ever exercised the [2,4) vertical-MV-difference band. */
     h->loopf.deblock_strength( h->mb.cache.non_zero_count, h->mb.cache.ref, h->mb.cache.mv,
-                               bs, 4 >> MB_INTERLACED, h->sh.i_type == SLICE_TYPE_B );
+                               bs, 4 >> (MB_INTERLACED || FIELD_PIC), h->sh.i_type == SLICE_TYPE_B );
+
+    if( FIELD_PIC && h->sh.i_type == SLICE_TYPE_B )
+    {
+        /* 8.7.2.1, last bS=1 bullet: when BOTH sides of the edge are bipredicted
+         * from the SAME single reference picture (possible under PAFF: the
+         * complementary/past/future field expansion can put one field picture
+         * into both lists), bS=1 requires a large MV difference in BOTH the
+         * aligned (L0 vs L0, L1 vs L1) AND the crossed (L0 vs L1) pairing.
+         * The straight per-list comparison above only checks the aligned
+         * pairing, so lower bS to 0 where the crossed pairing is also small. */
+        for( int dir = 0; dir < 2; dir++ )
+        {
+            int s1 = dir ? 1 : 8;
+            int s2 = dir ? 8 : 1;
+            for( int edge = 0; edge < 4; edge++ )
+                for( int i = 0, loc = X264_SCAN8_0+edge*s2; i < 4; i++, loc += s1 )
+                {
+                    int locn = loc - s2;
+                    if( bs[dir][edge][i] == 1
+                        && h->mb.cache.ref[0][loc]  >= 0
+                        && h->mb.cache.ref[0][loc]  == h->mb.cache.ref[1][loc]
+                        && h->mb.cache.ref[0][locn] == h->mb.cache.ref[0][loc]
+                        && h->mb.cache.ref[1][locn] == h->mb.cache.ref[0][loc] )
+                    {
+                        int16_t (*mv0)[2] = h->mb.cache.mv[0];
+                        int16_t (*mv1)[2] = h->mb.cache.mv[1];
+                        int aligned = abs( mv0[loc][0] - mv0[locn][0] ) >= 4
+                                   || abs( mv0[loc][1] - mv0[locn][1] ) >= 2
+                                   || abs( mv1[loc][0] - mv1[locn][0] ) >= 4
+                                   || abs( mv1[loc][1] - mv1[locn][1] ) >= 2;
+                        int crossed = abs( mv0[loc][0] - mv1[locn][0] ) >= 4
+                                   || abs( mv0[loc][1] - mv1[locn][1] ) >= 2
+                                   || abs( mv1[loc][0] - mv0[locn][0] ) >= 4
+                                   || abs( mv1[loc][1] - mv0[locn][1] ) >= 2;
+                        if( !( aligned && crossed ) )
+                            bs[dir][edge][i] = 0;
+                    }
+                }
+        }
+    }
 
     if( SLICE_MBAFF )
         macroblock_deblock_strength_mbaff( h, bs );
@@ -1691,7 +1876,7 @@ void x264_macroblock_cache_save( x264_t *h )
     int8_t *i4x4 = h->mb.intra4x4_pred_mode[i_mb_xy];
     uint8_t *nnz = h->mb.non_zero_count[i_mb_xy];
 
-    if( SLICE_MBAFF )
+    if( SLICE_MBAFF || FIELD_PIC )
     {
         macroblock_backup_intra( h, h->mb.i_mb_x, h->mb.i_mb_y, 1 );
         macroblock_store_pic( h, h->mb.i_mb_x, h->mb.i_mb_y, 0, 0, 1 );
@@ -1922,5 +2107,58 @@ void x264_macroblock_bipred_init( x264_t *h )
                     }
                 }
             }
+}
+
+/* PAFF (2.2d): build the bipred tables for one field pass.  Under PAFF the
+ * picture is uniformly one field, so MB_INTERLACED=1 and the per-MB load
+ * (macroblock_slice_init) reads dist_scale_factor_buf[1][parity] /
+ * bipred_weight_buf[1][parity] with parity = h->sh.b_bottom_field (the pass
+ * parity: under PAFF mb_y steps by 2, so mb_y&1 == b_bottom_field for every
+ * MB in the field).  The non-PAFF x264_macroblock_bipred_init only fills
+ * [0][0] (its mbfield/field loops are bounded by SLICE_MBAFF=0 under PAFF),
+ * so without this the [1][parity] slots are read uninitialised for B fields.
+ *
+ * Unlike MBAFF, the field-expanded L0/L1 already hold one entry per field, so
+ * the indices are not (frame,parity)-decomposed: fref[list][i] is the entry's
+ * frame and its parity is the per-entry map.  POCs are the per-field POCs
+ * (frame POC + i_delta_poc of that entry's parity), per 8.4.1.2.3. */
+void x264_macroblock_bipred_init_paff( x264_t *h, int parity )
+{
+    int cur_poc = h->fdec->i_poc + h->fdec->i_delta_poc[parity];
+    for( int i_ref0 = 0; i_ref0 < h->i_ref[0]; i_ref0++ )
+    {
+        x264_frame_t *l0 = h->fref[0][i_ref0];
+        int poc0 = l0->i_poc + l0->i_delta_poc[h->mb.pic.i_fref_parity[i_ref0]];
+        for( int i_ref1 = 0; i_ref1 < h->i_ref[1]; i_ref1++ )
+        {
+            x264_frame_t *l1 = h->fref[1][i_ref1];
+            int poc1 = l1->i_poc + l1->i_delta_poc[h->mb.pic.i_fref_parity_l1[i_ref1]];
+            int td = x264_clip3( poc1 - poc0, -128, 127 );
+            if( td == 0 /* || pic0 is a long-term ref */ )
+            {
+                h->mb.dist_scale_factor_buf[1][parity][i_ref0][i_ref1] = 256;
+                h->mb.bipred_weight_buf[1][parity][i_ref0][i_ref1] = 32;
+            }
+            else
+            {
+                int tb = x264_clip3( cur_poc - poc0, -128, 127 );
+                int tx = (16384 + (abs(td) >> 1)) / td;
+                int dist_scale_factor = x264_clip3( (tb * tx + 32) >> 6, -1024, 1023 );
+
+                h->mb.dist_scale_factor_buf[1][parity][i_ref0][i_ref1] = dist_scale_factor;
+
+                dist_scale_factor >>= 2;
+                if( h->param.analyse.b_weighted_bipred /* && pic1 is not a long-term ref */
+                      && dist_scale_factor >= -64
+                      && dist_scale_factor <= 128 )
+                {
+                    h->mb.bipred_weight_buf[1][parity][i_ref0][i_ref1] = 64 - dist_scale_factor;
+                    assert( dist_scale_factor >= -63 && dist_scale_factor <= 127 );
+                }
+                else
+                    h->mb.bipred_weight_buf[1][parity][i_ref0][i_ref1] = 32;
+            }
+        }
+    }
 }
 

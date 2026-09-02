@@ -62,7 +62,7 @@ static x264_frame_t *frame_new( x264_t *h, int b_fdec )
     int i_csp = frame_internal_csp( h->param.i_csp );
     int i_mb_count = h->mb.i_mb_count;
     int i_stride, i_width, i_lines, luma_plane_count;
-    int i_padv = PADV << PARAM_INTERLACED;
+    int i_padv = PADV << PARAM_FIELDCODE;
     int align = NATIVE_ALIGN / SIZEOF_PIXEL;
 #if ARCH_X86 || ARCH_X86_64
     if( h->param.cpu&X264_CPU_CACHELINE_64 || h->param.cpu&X264_CPU_AVX512 )
@@ -135,6 +135,8 @@ static x264_frame_t *frame_new( x264_t *h, int b_fdec )
     frame->i_frame = -1;
     frame->i_frame_num = -1;
     frame->i_lines_completed = -1;
+    frame->i_lines_completed_fld[0] =
+    frame->i_lines_completed_fld[1] = -1;
     frame->b_fdec = b_fdec;
     frame->i_pic_struct = PIC_STRUCT_AUTO;
     frame->i_field_cnt = -1;
@@ -152,7 +154,7 @@ static x264_frame_t *frame_new( x264_t *h, int b_fdec )
         int chroma_padv = i_padv >> (i_csp == X264_CSP_NV12);
         int chroma_plane_size = (frame->i_stride[1] * (frame->i_lines[1] + 2*chroma_padv));
         PREALLOC( frame->buffer[1], chroma_plane_size * SIZEOF_PIXEL );
-        if( PARAM_INTERLACED )
+        if( PARAM_FIELDCODE )
             PREALLOC( frame->buffer_fld[1], chroma_plane_size * SIZEOF_PIXEL );
     }
 
@@ -167,7 +169,7 @@ static x264_frame_t *frame_new( x264_t *h, int b_fdec )
 
         /* FIXME: Don't allocate both buffers in non-adaptive MBAFF. */
         PREALLOC( frame->buffer[p], luma_plane_size * SIZEOF_PIXEL );
-        if( PARAM_INTERLACED )
+        if( PARAM_FIELDCODE )
             PREALLOC( frame->buffer_fld[p], luma_plane_size * SIZEOF_PIXEL );
     }
 
@@ -195,7 +197,7 @@ static x264_frame_t *frame_new( x264_t *h, int b_fdec )
         PREALLOC( frame->f_row_qscale, i_lines/16 * sizeof(float) );
         if( h->param.analyse.i_me_method >= X264_ME_ESA )
             PREALLOC( frame->buffer[3], frame->i_stride[0] * (frame->i_lines[0] + 2*i_padv) * sizeof(uint16_t) << h->frames.b_have_sub8x8_esa );
-        if( PARAM_INTERLACED )
+        if( PARAM_FIELDCODE )
             PREALLOC( frame->field, i_mb_count * sizeof(uint8_t) );
         if( h->param.analyse.b_mb_info )
             PREALLOC( frame->effective_qp, i_mb_count * sizeof(uint8_t) );
@@ -238,7 +240,7 @@ static x264_frame_t *frame_new( x264_t *h, int b_fdec )
     {
         int chroma_padv = i_padv >> (i_csp == X264_CSP_NV12);
         frame->plane[1] = frame->buffer[1] + frame->i_stride[1] * chroma_padv + PADH_ALIGN;
-        if( PARAM_INTERLACED )
+        if( PARAM_FIELDCODE )
             frame->plane_fld[1] = frame->buffer_fld[1] + frame->i_stride[1] * chroma_padv + PADH_ALIGN;
     }
 
@@ -250,7 +252,7 @@ static x264_frame_t *frame_new( x264_t *h, int b_fdec )
             for( int i = 0; i < 4; i++ )
             {
                 frame->filtered[p][i] = frame->buffer[p] + i*luma_plane_size + frame->i_stride[p] * i_padv + PADH_ALIGN;
-                if( PARAM_INTERLACED )
+                if( PARAM_FIELDCODE )
                     frame->filtered_fld[p][i] = frame->buffer_fld[p] + i*luma_plane_size + frame->i_stride[p] * i_padv + PADH_ALIGN;
             }
             frame->plane[p] = frame->filtered[p][0];
@@ -259,7 +261,7 @@ static x264_frame_t *frame_new( x264_t *h, int b_fdec )
         else
         {
             frame->filtered[p][0] = frame->plane[p] = frame->buffer[p] + frame->i_stride[p] * i_padv + PADH_ALIGN;
-            if( PARAM_INTERLACED )
+            if( PARAM_FIELDCODE )
                 frame->filtered_fld[p][0] = frame->plane_fld[p] = frame->buffer_fld[p] + frame->i_stride[p] * i_padv + PADH_ALIGN;
         }
     }
@@ -553,12 +555,13 @@ static ALWAYS_INLINE void plane_expand_border( pixel *pix, int i_stride, int i_w
 #undef PPIXEL
 }
 
-void x264_frame_expand_border( x264_t *h, x264_frame_t *frame, int mb_y )
+void x264_frame_expand_border( x264_t *h, x264_frame_t *frame, int mb_y, int i_parity )
 {
+    int b_fld = SLICE_MBAFF || FIELD_PIC;
     int pad_top = mb_y == 0;
-    int pad_bot = mb_y == h->mb.i_mb_height - (1 << SLICE_MBAFF);
+    int pad_bot = mb_y == h->mb.i_mb_height - (1 << b_fld);
     int b_start = mb_y == h->i_threadslice_start;
-    int b_end   = mb_y == h->i_threadslice_end - (1 << SLICE_MBAFF);
+    int b_end   = mb_y == h->i_threadslice_end - (1 << b_fld);
     if( mb_y & SLICE_MBAFF )
         return;
     for( int i = 0; i < frame->i_plane; i++ )
@@ -567,24 +570,40 @@ void x264_frame_expand_border( x264_t *h, x264_frame_t *frame, int mb_y )
         int v_shift = i && CHROMA_V_SHIFT;
         int stride = frame->i_stride[i];
         int width = 16*h->mb.i_mb_width;
-        int height = (pad_bot ? 16*(h->mb.i_mb_height - mb_y) >> SLICE_MBAFF : 16) >> v_shift;
+        int height = (pad_bot ? 16*(h->mb.i_mb_height - mb_y) >> b_fld : 16) >> v_shift;
         int padh = PADH;
         int padv = PADV >> v_shift;
         // buffer: 2 chroma, 3 luma (rounded to 4) because deblocking goes beyond the top of the mb
         if( b_end && !b_start )
-            height += 4 >> (v_shift + SLICE_MBAFF);
+            height += 4 >> (v_shift + b_fld);
         pixel *pix;
         int starty = 16*mb_y - 4*!b_start;
-        if( SLICE_MBAFF )
+        if( b_fld )
         {
-            // border samples for each field are extended separately
+            // border samples for each field are extended separately;
+            // a parity-scoped call (PAFF reference bands) extends only its
+            // own parity's field-layout borders.
             pix = frame->plane_fld[i] + (starty*stride >> v_shift);
-            plane_expand_border( pix, stride*2, width, height, padh, padv, pad_top, pad_bot, h_shift );
-            plane_expand_border( pix+stride, stride*2, width, height, padh, padv, pad_top, pad_bot, h_shift );
+            if( i_parity < 0 )
+            {
+                plane_expand_border( pix, stride*2, width, height, padh, padv, pad_top, pad_bot, h_shift );
+                plane_expand_border( pix+stride, stride*2, width, height, padh, padv, pad_top, pad_bot, h_shift );
+            }
+            else
+                plane_expand_border( pix+i_parity*stride, stride*2, width, height, padh, padv, pad_top, pad_bot, h_shift );
 
             height = (pad_bot ? 16*(h->mb.i_mb_height - mb_y) : 32) >> v_shift;
             if( b_end && !b_start )
                 height += 4 >> v_shift;
+            /* PAFF: the frame-layout border expansion stays both-parity even
+             * for parity-scoped band calls.  A field row's plane[] border
+             * is consumed (intra cache loads of column-0 MBs) only as the
+             * value expanded from pool-stale edge pixels before the row is
+             * coded -- deterministic at a fixed thread count and identical
+             * to --threads 1 (verified: scoping it changes t1 bytes).  The
+             * wait order guarantees the consumed read happens after the
+             * producing band completed, so the write side never races the
+             * consumed value. */
             pix = frame->plane[i] + (starty*stride >> v_shift);
             plane_expand_border( pix, stride, width, height, padh, padv, pad_top, pad_bot, h_shift );
         }
@@ -596,14 +615,15 @@ void x264_frame_expand_border( x264_t *h, x264_frame_t *frame, int mb_y )
     }
 }
 
-void x264_frame_expand_border_filtered( x264_t *h, x264_frame_t *frame, int mb_y, int b_end )
+void x264_frame_expand_border_filtered( x264_t *h, x264_frame_t *frame, int mb_y, int b_end, int i_parity )
 {
     /* during filtering, 8 extra pixels were filtered on each edge,
      * but up to 3 of the horizontal ones may be wrong.
        we want to expand border from the last filtered pixel */
+    int b_fld = SLICE_MBAFF || FIELD_PIC;
     int b_start = !mb_y;
     int width = 16*h->mb.i_mb_width + 8;
-    int height = b_end ? (16*(h->mb.i_mb_height - mb_y) >> SLICE_MBAFF) + 16 : 16;
+    int height = b_end ? (16*(h->mb.i_mb_height - mb_y) >> b_fld) + 16 : 16;
     int padh = PADH - 4;
     int padv = PADV - 8;
     for( int p = 0; p < (CHROMA444 ? 3 : 1); p++ )
@@ -612,15 +632,20 @@ void x264_frame_expand_border_filtered( x264_t *h, x264_frame_t *frame, int mb_y
             int stride = frame->i_stride[p];
             // buffer: 8 luma, to match the hpel filter
             pixel *pix;
-            if( SLICE_MBAFF )
+            if( b_fld )
             {
                 pix = frame->filtered_fld[p][i] + (16*mb_y - 16) * stride - 4;
-                plane_expand_border( pix, stride*2, width, height, padh, padv, b_start, b_end, 0 );
-                plane_expand_border( pix+stride, stride*2, width, height, padh, padv, b_start, b_end, 0 );
+                if( i_parity < 0 )
+                {
+                    plane_expand_border( pix, stride*2, width, height, padh, padv, b_start, b_end, 0 );
+                    plane_expand_border( pix+stride, stride*2, width, height, padh, padv, b_start, b_end, 0 );
+                }
+                else
+                    plane_expand_border( pix+i_parity*stride, stride*2, width, height, padh, padv, b_start, b_end, 0 );
             }
 
             pix = frame->filtered[p][i] + (16*mb_y - 8) * stride - 4;
-            plane_expand_border( pix, stride, width, height << SLICE_MBAFF, padh, padv, b_start, b_end, 0 );
+            plane_expand_border( pix, stride, width, height << b_fld, padh, padv, b_start, b_end, 0 );
         }
 }
 
@@ -693,6 +718,31 @@ int x264_frame_cond_wait( x264_frame_t *frame, int i_lines_completed )
     int completed;
     x264_pthread_mutex_lock( &frame->mutex );
     while( (completed = frame->i_lines_completed) < i_lines_completed && i_lines_completed >= 0 )
+        x264_pthread_cond_wait( &frame->cv, &frame->mutex );
+    x264_pthread_mutex_unlock( &frame->mutex );
+    return completed;
+}
+
+/* PAFF: per-parity variants, in field lines (see frame->i_lines_completed_fld).
+ * Share the frame's mutex/cv with the progressive counter. */
+void x264_frame_cond_broadcast_fld( x264_frame_t *frame, int parity, int i_lines_completed )
+{
+    x264_pthread_mutex_lock( &frame->mutex );
+    frame->i_lines_completed_fld[parity] = i_lines_completed;
+    x264_pthread_cond_broadcast( &frame->cv );
+    x264_pthread_mutex_unlock( &frame->mutex );
+}
+
+int x264_frame_cond_wait_fld( x264_frame_t *frame, int parity, int i_lines_completed )
+{
+    int completed;
+    x264_pthread_mutex_lock( &frame->mutex );
+    /* Keep the i_lines_completed >= 0 guard of the progressive variant: the
+     * first row-cadence broadcast can be negative (16 - X264_THREAD_HEIGHT
+     * at band 0), so the counter does NOT grow monotonically from -1 and a
+     * -1 peek (callers pass -1 to read without waiting) could otherwise
+     * block until the next broadcast. */
+    while( (completed = frame->i_lines_completed_fld[parity]) < i_lines_completed && i_lines_completed >= 0 )
         x264_pthread_cond_wait( &frame->cv, &frame->mutex );
     x264_pthread_mutex_unlock( &frame->mutex );
     return completed;

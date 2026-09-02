@@ -343,7 +343,7 @@ static ALWAYS_INLINE void macroblock_cache_load_neighbours_deblock( x264_t *h, i
 
     h->mb.i_neighbour = 0;
     h->mb.i_mb_xy = mb_y * h->mb.i_mb_stride + mb_x;
-    h->mb.b_interlaced = PARAM_INTERLACED && h->mb.field[h->mb.i_mb_xy];
+    h->mb.b_interlaced = (PARAM_INTERLACED || FIELD_PIC) && h->mb.field[h->mb.i_mb_xy];
     h->mb.i_mb_top_y = mb_y - (1 << MB_INTERLACED);
     h->mb.i_mb_top_xy = mb_x + h->mb.i_mb_stride*h->mb.i_mb_top_y;
     h->mb.i_mb_left_xy[1] =
@@ -387,6 +387,10 @@ void x264_frame_deblock_row( x264_t *h, int mb_y )
     int chroma444 = CHROMA444;
     int chroma_height = 16 >> CHROMA_V_SHIFT;
     intptr_t uvdiff = chroma444 ? h->fdec->plane[2] - h->fdec->plane[1] : 1;
+    /* PAFF: i_mb_height is even-padded for field coding (set.c); MBs of the
+     * padding row lie outside the caller's mb_info array, which has one byte
+     * per MB of the unpadded frame grid. */
+    int mb_info_count = h->param.b_paff ? h->mb.i_mb_width * ((h->param.i_height+15)/16) : INT_MAX;
 
     for( int mb_x = 0; mb_x < h->mb.i_mb_width; mb_x += (~b_interlaced | mb_y)&1, mb_y ^= b_interlaced )
     {
@@ -522,7 +526,8 @@ void x264_frame_deblock_row( x264_t *h, int mb_y )
                  * So reset their effective QP to max, to indicate that lack of guarantee. */
                 if( h->fdec->mb_info && M32( bs[0][0] ) )
                 {
-#define RESET_EFFECTIVE_QP(xy) h->fdec->effective_qp[xy] |= 0xff * !!(h->fdec->mb_info[xy] & X264_MBINFO_CONSTANT);
+#define RESET_EFFECTIVE_QP(xy) do { int r_xy_ = (xy); if( r_xy_ < mb_info_count ) \
+    h->fdec->effective_qp[r_xy_] |= 0xff * !!(h->fdec->mb_info[r_xy_] & X264_MBINFO_CONSTANT); } while( 0 );
                     RESET_EFFECTIVE_QP(mb_xy);
                     RESET_EFFECTIVE_QP(h->mb.i_mb_left_xy[0]);
                 }
@@ -581,7 +586,7 @@ void x264_frame_deblock_row( x264_t *h, int mb_y )
                     RESET_EFFECTIVE_QP(h->mb.i_mb_top_xy);
                 }
 
-                if( (!b_interlaced || (!MB_INTERLACED && !h->mb.field[h->mb.i_mb_top_xy])) && intra_deblock )
+                if( ((!b_interlaced && !FIELD_PIC) || (!MB_INTERLACED && !h->mb.field[h->mb.i_mb_top_xy])) && intra_deblock )
                 {
                     FILTER( _intra, 1, 0, qp_top, qpc_top );
                 }
@@ -633,7 +638,7 @@ void x264_macroblock_deblock( x264_t *h )
     }
     else
         h->loopf.deblock_strength( h->mb.cache.non_zero_count, h->mb.cache.ref, h->mb.cache.mv,
-                                   bs, 4 >> MB_INTERLACED, h->sh.i_type == SLICE_TYPE_B );
+                                   bs, 4 >> (MB_INTERLACED || FIELD_PIC), h->sh.i_type == SLICE_TYPE_B );
 
     int transform_8x8 = h->mb.b_transform_8x8;
 

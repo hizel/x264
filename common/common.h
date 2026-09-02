@@ -70,12 +70,16 @@
 #if HAVE_INTERLACED
 #   define MB_INTERLACED h->mb.b_interlaced
 #   define SLICE_MBAFF h->sh.b_mbaff
+#   define FIELD_PIC h->sh.b_field_pic
 #   define PARAM_INTERLACED h->param.b_interlaced
 #else
 #   define MB_INTERLACED 0
 #   define SLICE_MBAFF 0
+#   define FIELD_PIC 0
 #   define PARAM_INTERLACED 0
 #endif
+/* any field-coding mode: MBAFF or PAFF field pictures */
+#define PARAM_FIELDCODE (PARAM_INTERLACED || h->param.b_paff)
 
 #ifdef CHROMA_FORMAT
 #    define CHROMA_H_SHIFT (CHROMA_FORMAT == CHROMA_420 || CHROMA_FORMAT == CHROMA_422)
@@ -198,6 +202,12 @@ typedef struct
     {
         int i_difference_of_pic_nums;
         int i_poc;
+        /* PAFF (D4): target field parity of this opcode (0=top, 1=bottom).
+         * Encoder-internal only -- not written to the bitstream (the decoder
+         * resolves the target field from difference_of_pic_nums and the
+         * current slice's field_pic_flag per 8.2.5.4.1).  Unused for frame
+         * pictures. */
+        uint8_t i_field_parity;
     } mmco[X264_REF_MAX];
 
     int i_cabac_init_idc;
@@ -267,6 +277,46 @@ typedef struct
     int i_ssim_cnt;
 } x264_frame_stat_t;
 
+/* PAFF frame-thread job parameters: written by the caller (serially, after
+ * this slot's context sync, before dispatch) and read-only by the pool job.
+ * Kept outside the thread_sync_context memcpy region. */
+typedef struct
+{
+    /* which field pass of the pair THIS slot's job codes (0 = first in
+     * coding order, 1 = second).  The prologue fills both [pass] halves
+     * identically into both slots and then sets this per slot; the job
+     * reads only its own pass's half (paff-pass-threads D3).  Unused by
+     * the monolithic --threads 1 driver. */
+    int          pass;
+    /* pair-level reference lists, per pass: [0] = pre-marking (pass 0),
+     * [1] = post-marking (pass 1, with the first field's DPB marking
+     * applied).  The job presents these to slice_init and restores the
+     * post-marking view for frame-end consumers. */
+    int          pair_count[2][2];                 /* [pass][list] */
+    x264_frame_t *pair_fref[2][2][X264_REF_MAX+3]; /* [pass][list][entry] */
+    /* per-pass field-expanded lists (decoder default order, 8.2.4.2.4/8.2.4.2.5)
+     * and per-entry parity/frame maps, expanded by the caller before dispatch. */
+    int          i_ref[2][2];                      /* [pass][list] */
+    x264_frame_t *fref[2][2][X264_REF_MAX+3];      /* [pass][list][entry] */
+    int8_t       i_fref_frame[2][2][X264_REF_MAX*2];
+    int8_t       i_fref_parity[2][2][X264_REF_MAX*2];
+    int          i_paff_field_ref[2][2];           /* [pass][list] */
+    int          i_num_ref_idx_active[2][2];       /* [pass][list] */
+    int          b_num_ref_idx_override[2];        /* [pass] */
+    /* slice-header values fixed by the caller (the job never writes the
+     * canonical counters): the pre-increment frame_num (7.4.3: one per
+     * complementary pair) and the pre-toggle idr_pic_id of an IDR first field. */
+    int          i_frame_num;
+    int          i_idr_pic_id;
+    /* pair-level coding parameters (the caller's locals at dispatch time).
+     * No i_nal_ref_idc: the job codes both passes against the live
+     * h->i_nal_ref_idc, as slice_write does. */
+    int          i_global_qp;
+    int          i_nal_type;
+    int          base_poc;
+    int          pair_slice_type;
+} x264_paff_job_t;
+
 struct x264_t
 {
     /* encoder parameters */
@@ -296,6 +346,11 @@ struct x264_t
         int         i_bitstream;    /* size of p_bitstream */
         uint8_t     *p_bitstream;   /* will hold data for all nal */
         bs_t        bs;
+        /* PAFF: NAL index where the pair's second field AU starts (count of
+         * NALs completed by the end of the first field pass).  Set by the
+         * PAFF pair driver every pair; the per-field VBV model splits the
+         * frame's NAL payload sums at this boundary. */
+        int         i_paff_au_boundary;
     } out;
 
     uint8_t *nal_buffer;
@@ -303,6 +358,58 @@ struct x264_t
 
     x264_t          *reconfig_h;
     int             reconfig;
+
+    /* PAFF frame-thread state (slot-local, outside the sync region):
+     * job parameters for the pool work item, and the DPB pairs evicted by
+     * this slot's caller-side first-field marking whose push_unused is
+     * deferred until this slot's job is harvested (a pass-0 list may still
+     * reference them; NULL-terminated). */
+    x264_paff_job_t paff_job;
+    x264_frame_t   *paff_evicted[X264_REF_MAX+3];
+    /* PAFF pass threading: per-slot shadow of fenc->weighted[] and
+     * fenc->i_lines_weighted.  The weighted-reference machinery
+     * (weighted_pred_init, x264_analyse_weight_frame, p_fref_w) is per-pass
+     * state; kept on the shared pair fenc, the pair's two pass jobs would
+     * race the pointer array and the row-progress counter (the
+     * paff-pass-threads weightp determinism fix).  The monolithic --threads
+     * 1 driver uses the same shadow: its two passes run sequentially on one
+     * context, so the shadowed values are identical. */
+    pixel          *paff_weighted[X264_REF_MAX];
+    int             paff_i_lines_weighted;
+    /* paff-sliced-threads (D3e): pair-scoped sliced-thread bookkeeping on
+     * the main context (thread[0]).  paff_slice_stash deep-copies pass-0's
+     * merged worker slice NALs (nal array, then payload blob) OUT of
+     * h->out for the duration of pass 1: a bitstream realloc mid-pass-1
+     * corrupts h's borrowed pass-0 pointers -- a worker's realloc moves
+     * only that worker's buffer and fixes up only its own nal entries,
+     * and h's own realloc shifts every entry it still owns by the buffer
+     * delta.  The stash is re-inserted ahead of pass 1's NALs after the
+     * pass-1 join and freed at the next pair's stash-out or at close --
+     * after the pair's output has been consumed (encapsulated into
+     * h->nal_buffer).  i_paff_slice_stash_base is the h->out.nal index
+     * the stashed entries belong at; i_paff_slice_pass0_bs/base are the
+     * pass-0 bitstream baselines of the pass-1 i_misc_bits corrections
+     * (workers: bare bs_pos; h: bs_pos + i_nal*NALU_OVERHEAD*8). */
+    uint8_t        *paff_slice_stash;
+    int             i_paff_slice_stash_count;
+    int             i_paff_slice_stash_base;
+    int             i_paff_slice_pass0_bs;
+    int             i_paff_slice_pass0_base;
+    /* paff-sliced-threads (D4): the pair-level row-VBV plan and maximum,
+     * saved while the per-field budget is active and restored after the
+     * pass's join (update_vbv's plan-error tracker reads them at pair
+     * end). */
+    double          paff_slice_pair_plan;
+    double          paff_slice_pair_maximum;
+    /* PAFF pass threading (master slot only): harvested fencs awaiting
+     * deferred recycle.  The pair pipeline is shallower than the slot
+     * count (pairs in flight = slots/2), so a fenc pushed unused at the
+     * pair's harvest re-enters the pool N - slots/2 calls EARLIER than in
+     * the pair-granular scheme -- while the lookahead can still reference
+     * its lowres in cost analysis (races frame_init_lowres, corrupts
+     * lowres_mvs).  The FIFO restores the upstream recycle margin. */
+    x264_frame_t   *paff_fenc_defer[X264_THREAD_MAX];
+    int             i_paff_fenc_defer;
 
     /**** thread synchronization starts here ****/
 
@@ -368,6 +475,19 @@ struct x264_t
     /* Slice header backup, for SEI_DEC_REF_PIC_MARKING */
     int b_sh_backup;
     x264_slice_header_t sh_backup;
+
+    /* PAFF (D4): one-shot warning flag for ignored per-frame pic_struct
+     * (pulldown) inputs, which PAFF cannot honour. */
+    int b_paff_pic_struct_warned;
+
+    /* PAFF (task 5.3): one-shot warning flag for the hard-clamped mmco[]
+     * capacity guard -- PAFF emits two eviction opcodes per field pair,
+     * halving the X264_REF_MAX opcode budget; once exhausted further
+     * evictions are skipped rather than overflowing the buffer. */
+    int b_paff_mmco_clamp_warned;
+    /* one-shot warning flag for the PAFF-B L1 field-entry clamp (bipred
+     * table capacity); same pattern as b_paff_mmco_clamp_warned */
+    int b_paff_l1_clamp_warned;
 
     /* cabac context */
     x264_cabac_t    cabac;
@@ -601,6 +721,31 @@ struct x264_t
 
             /* pointer over mb of the references */
             int i_fref[2];
+            /* PAFF field pictures (D16): the expanded L0 list interleaves
+             * single-parity entries (the complementary first field sits
+             * mid-list), so expanded index j no longer maps to frame j>>1.
+             * i_fref_parity[j] is the absolute parity (0=top, 1=bottom) of
+             * field entry j; set once per pass by paff_expand_field_list and
+             * read by MC plane selection (macroblock_load_pic_pointers), the
+             * chroma v-offset (me.c), deblock_ref_table and ref_poc.
+             * i_fref_frame[j] is field entry j's index into the pair-level
+             * fref[0] (-1 for the complementary field = h->fdec); it is read
+             * ONLY by the ratecontrol ref-count folding (ratecontrol.c).
+             * i_paff_field_ref0 is the field-entry count of the last pass
+             * (same value as i_fref[0] after expansion), kept for that fold. */
+            int8_t i_fref_parity[X264_REF_MAX*2];
+            int8_t i_fref_frame[X264_REF_MAX*2];
+            int i_paff_field_ref0;          /* field-entry count of the last pass */
+            /* PAFF (1.1b): L1 counterparts of the L0 field-entry maps above,
+             * filled by the L1 field expansion (paff_expand_field_list with
+             * i_list=1).  i_fref_parity_l1 is read by MC plane selection, the
+             * chroma v-offset and the colocated-parity route in
+             * map_col_to_list0.  i_fref_frame_l1 currently has NO readers
+             * (ratecontrol folds L0 only); it is kept for symmetry with L0
+             * and for future per-field colocated consumers. */
+            int8_t i_fref_parity_l1[X264_REF_MAX*2];
+            int8_t i_fref_frame_l1[X264_REF_MAX*2];
+            int i_paff_field_ref1;          /* field-entry count of the last L1 pass */
             /* [12]: yN, yH, yV, yHV, (NV12 ? uv : I444 ? (uN, uH, uV, uHV, vN, ...)) */
             pixel *p_fref[2][X264_REF_MAX*2][12];
             pixel *p_fref_w[X264_REF_MAX*2];  /* weighted fullpel luma */
@@ -668,6 +813,11 @@ struct x264_t
         /* B_direct and weighted prediction */
         int16_t dist_scale_factor_buf[2][2][X264_REF_MAX*2][4];
         int16_t (*dist_scale_factor)[4];
+        /* int8_t cannot hold the boundary weight 128 (nor can the
+         * signed-byte-multiply pixel_avg asm represent the -64/128 extrema);
+         * reachable only by field pictures, and PAFF force-disables weightb,
+         * so the store sites only assert the range.  Widen this if weightb
+         * is ever enabled for field pictures (see doc/paff.txt). */
         int8_t bipred_weight_buf[2][2][X264_REF_MAX*2][4];
         int8_t (*bipred_weight)[4];
         /* maps fref1[0]'s ref indices into the current list0 */

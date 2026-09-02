@@ -227,6 +227,39 @@ static int mb_predict_mv_direct16x16_temporal( x264_t *h )
         }
         offset = 0;
     }
+    else if( FIELD_PIC )
+    {
+        /* PAFF (2.2, fork-and-rework D2): uniformly-field picture.  RefPicList1[0]
+         * is a single field entry (the L1 expansion produces one-parity
+         * entries), so colPic = fref[1][0] and the colocated field parity is
+         * i_fref_parity_l1[0] -- no POC-based field selection for
+         * field_pic_flag==1 (Table 8-6).  Co-located MB addressing (Table 8-8,
+         * both CurrPic and colPic coded as fields -> mbAddrCol3,
+         * vertMvScale One_To_One): in field-MB terms the co-located row tracks
+         * the current field's own row, offset to the colocated field's parity
+         * in the full-frame buffer (== i_mb_y when col and curr share parity,
+         * which the same-parity-first L1 expansion makes the common case).
+         * The colocated field's stored ref indices are already field indices
+         * (preshift 0) and its MVs are in field coordinates (yshift 1 =
+         * identity, both curr and col are fields). */
+        int col_parity = h->mb.pic.i_fref_parity_l1[0];
+        /* PAFF (2.2a): 8.4.1.2.4 single-field rule -- if the colocated field's
+         * parity is absent from the DPB (IDR survivor), temporal direct has no
+         * valid colocated source; bail (falls back to spatial/skip).  The L1
+         * expansion normally contributes only available fields so this is a
+         * defensive guard, but it enforces the rule at the consumer. */
+        if( !(h->fref[1][0]->i_field_avail & (1 << col_parity)) )
+            return 0;
+        mb_y = (h->mb.i_mb_y & ~1) + col_parity;
+        mb_xy = mb_x + h->mb.i_mb_stride * mb_y;
+        type_col[0] = type_col[1] = h->fref[1][0]->mb_type[mb_xy];
+        partition_col[0] = partition_col[1] = h->fref[1][0]->mb_partition[mb_xy];
+        preshift = 0;
+        postshift = 0;
+        yshift = 1;
+        h->mb.i_partition = partition_col[0];
+        offset = 0;
+    }
     int i_mb_4x4 = 16 * h->mb.i_mb_stride * mb_y + 4 * mb_x;
     int i_mb_8x8 =  4 * h->mb.i_mb_stride * mb_y + 2 * mb_x;
 
@@ -370,8 +403,37 @@ static ALWAYS_INLINE int mb_predict_mv_direct16x16_spatial( x264_t *h, int b_int
             h->mb.i_partition = partition_col[0];
         }
     }
-    int i_mb_4x4 = b_interlaced ? 4 * (h->mb.i_b4_stride*mb_y + mb_x) : h->mb.i_b4_xy;
-    int i_mb_8x8 = b_interlaced ? 2 * (h->mb.i_b8_stride*mb_y + mb_x) : h->mb.i_b8_xy;
+    else if( FIELD_PIC )
+    {
+        /* PAFF (2.3, fork-and-rework D2): uniformly-field picture.  The
+         * colocated picture is RefPicList1[0] -- a single field entry -- at
+         * parity i_fref_parity_l1[0] (Table 8-6: for field_pic_flag==1, when
+         * RefPicList1[0] is a decoded field, colPic = RefPicList1[0]; no
+         * topAbsDiffPOC/bottomAbsDiffPOC field selection as in MBAFF).
+         * Address the colocated field's MB at its parity row in the
+         * interleaved frame buffer ((i_mb_y & ~1) + col_parity), not the
+         * current field's row -- the current and colocated fields may have
+         * opposite parity (Table 8-8, both CurrPic and colPic coded as
+         * fields -> mbAddrCol tracks the current field's own row, which in
+         * field-MB terms is the colocated field's row offset to its parity).
+         * Mirrors the temporal FIELD_PIC branch (2.2).  The neighbour-median
+         * MV prediction above is unchanged: for a uniformly-field picture
+         * the cache neighbours are ordinary field neighbours (§8.4.1.3.2),
+         * no MBAFF pair structure. */
+        int col_parity = h->mb.pic.i_fref_parity_l1[0];
+        /* PAFF (2.2a): 8.4.1.2.4 single-field rule -- defensive; the L1
+         * expansion contributes only available fields so i_fref_parity_l1[0]
+         * is always an available parity.  Match the temporal path's guard. */
+        if( !(h->fref[1][0]->i_field_avail & (1 << col_parity)) )
+            return 0;
+        mb_y = (h->mb.i_mb_y & ~1) + col_parity;
+        mb_xy = mb_x + h->mb.i_mb_stride * mb_y;
+        type_col[0] = type_col[1] = h->fref[1][0]->mb_type[mb_xy];
+        partition_col[0] = partition_col[1] = h->fref[1][0]->mb_partition[mb_xy];
+        h->mb.i_partition = partition_col[0];
+    }
+    int i_mb_4x4 = (b_interlaced || FIELD_PIC) ? 4 * (h->mb.i_b4_stride*mb_y + mb_x) : h->mb.i_b4_xy;
+    int i_mb_8x8 = (b_interlaced || FIELD_PIC) ? 2 * (h->mb.i_b8_stride*mb_y + mb_x) : h->mb.i_b8_xy;
 
     int8_t *l1ref0 = &h->fref[1][0]->ref[0][i_mb_8x8];
     int8_t *l1ref1 = &h->fref[1][0]->ref[1][i_mb_8x8];
@@ -548,7 +610,17 @@ void x264_mb_predict_mv_ref16x16( x264_t *h, int i_list, int i_ref, int16_t (*mv
     {
         int idx = i_list ? h->fref[1][0]->i_frame-h->fenc->i_frame-1
                          : h->fenc->i_frame-h->fref[0][0]->i_frame-1;
-        if( idx <= h->param.i_bframe )
+        /* PAFF: after the per-pass field expansion, fref[list][0] can be the
+         * complementary field of the current pair (h->fdec, which shares
+         * fenc->i_frame) -- e.g. a --ref 1 P/B second field whose pair-level
+         * past reference was evicted by sliding-window between passes
+         * (8.2.5.1, mirrored by the PAFF driver).  The frame-level lowres
+         * lookahead never searches a picture against itself, so lowres_mvs
+         * holds no valid candidate for idx<0 and the slot is out of bounds;
+         * skip it.  Non-PAFF always places a distinct past (L0) / future (L1)
+         * frame at fref[list][0], so idx stays >= 0 there -- this guard is
+         * inert outside PAFF. */
+        if( idx >= 0 && idx <= h->param.i_bframe )
         {
             int16_t (*lowres_mv)[2] = h->fenc->lowres_mvs[i_list][idx];
             if( lowres_mv[0][0] != 0x7fff )
@@ -578,13 +650,29 @@ void x264_mb_predict_mv_ref16x16( x264_t *h, int i_list, int i_ref, int16_t (*mv
 #undef SET_MVP
 
     /* temporal predictors */
-    if( h->fref[0][0]->i_ref[0] > 0 )
+    /* PAFF (D7): i_ref[0] is per-parity.  PAFF (2.2b): under FIELD_PIC i_ref is
+     * a field-expanded index -- the reference frame is fref[i_list][i_ref]
+     * (not fref[i_list][i_ref>>1]) and its parity is the per-entry map
+     * (i_fref_parity / i_fref_parity_l1), not the MBAFF i_ref&1 decomposition.
+     * The non-PAFF path is unchanged. */
+    if( h->fref[0][0]->i_ref[0][0] > 0 )
     {
         x264_frame_t *l0 = h->fref[0][0];
         int field = h->mb.i_mb_y&1;
         int curpoc = h->fdec->i_poc + h->fdec->i_delta_poc[field];
-        int refpoc = h->fref[i_list][i_ref>>SLICE_MBAFF]->i_poc;
-        refpoc += l0->i_delta_poc[field^(i_ref&1)];
+        int refpoc;
+        if( FIELD_PIC )
+        {
+            x264_frame_t *ref = h->fref[i_list][i_ref];
+            int ref_parity = i_list ? h->mb.pic.i_fref_parity_l1[i_ref]
+                                    : h->mb.pic.i_fref_parity[i_ref];
+            refpoc = ref->i_poc + ref->i_delta_poc[ref_parity];
+        }
+        else
+        {
+            refpoc = h->fref[i_list][i_ref>>SLICE_MBAFF]->i_poc;
+            refpoc += l0->i_delta_poc[field^(i_ref&1)];
+        }
 
 #define SET_TMVP( dx, dy ) \
         { \

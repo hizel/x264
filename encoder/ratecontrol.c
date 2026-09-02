@@ -160,6 +160,16 @@ struct x264_ratecontrol_t
     double frame_size_maximum;  /* Maximum frame size due to MinCR */
     double frame_size_planned;
     double slice_size_planned;
+    /* Threaded-VBV plan-error tracker (VBV only): leaky integrators
+     * (x = 0.95*x + sample, so the steady state is 20x the mean sample,
+     * not the mean) of finished frames' planned size, actual size, and
+     * their overshoot.  Updated at harvest (frame end), where all inputs
+     * are final, so the values are timing-independent; used to charge
+     * in-flight frames at dispatch in place of the live
+     * frame_size_estimated refinement. */
+    double plan_error_planned;
+    double plan_error_actual;
+    double plan_error_overshoot;
     predictor_t *row_pred;
     predictor_t row_preds[3][2];
     predictor_t *pred_b_from_p; /* predict B-frame size from P-frame satd */
@@ -421,8 +431,11 @@ static int macroblock_tree_rescale_init( x264_t *h, x264_ratecontrol_t *rc )
     float dstdim[2] = {    h->param.i_width / 16.f,    h->param.i_height / 16.f};
     int srcdimi[2] = {ceil(srcdim[0]), ceil(srcdim[1])};
     int dstdimi[2] = {ceil(dstdim[0]), ceil(dstdim[1])};
-    if( h->param.b_interlaced || h->param.b_fake_interlaced )
+    if( h->param.b_interlaced || h->param.b_fake_interlaced || h->param.b_paff )
     {
+        /* PAFF pads sps->i_mb_height to even like MBAFF (set.c), so the
+         * fractional-dim rounding must match or src_mb_count (qp_buffer
+         * size) comes out short and mbtree_fix8_pack overflows it. */
         srcdimi[1] = (srcdimi[1]+1)&~1;
         dstdimi[1] = (dstdimi[1]+1)&~1;
     }
@@ -1537,13 +1550,127 @@ void x264_ratecontrol_start( x264_t *h, int i_force_qp, int overhead )
         rc->last_non_b_pict_type = h->sh.i_type;
 }
 
+/* Threaded-VBV determinism: is reference frame fref's row i_row provably
+ * final ("committed") while the calling thread codes row y = h->mb.i_mb_y?
+ *
+ * A frame-threaded VBV decision may only read state that is final at
+ * decision time.  Reference row statistics (f_row_qp / f_row_qscale /
+ * i_row_bits) are written by the reference's own worker at the end of each
+ * row's coding, and rewritten if the row is reencoded (VBV row reencode
+ * always finishes before the worker advances to the next row).  So row r's
+ * stats are final once the reference worker has moved past row r.  Progress
+ * is published through the frame completion counter
+ * (x264_frame_cond_broadcast), and mb_analyse_init blocks the calling
+ * thread at the start of row y until every reference's counter reaches
+ * pix_y + i_mv_range_thread (the wait runs in both deterministic and
+ * --non-deterministic mode; only the MV clamp differs).  "Row r is final
+ * while row y is coded" is therefore a pure function of (r, y,
+ * i_mv_range_thread, coding mode) -- the counter itself is never read here;
+ * it is timing-dependent.
+ *
+ * Derivation per coding mode (progressive/MBAFF line-checked against
+ * upstream 0480cb05; PAFF is a local extension of this tree):
+ *
+ * progressive (units: frame lines):
+ *   broadcast at the start of row m:  counter = 16m - X264_THREAD_HEIGHT
+ *   (fdec_filter_row; none at row 0; end-of-frame sentinel adds 10000).
+ *   Row r is final when the worker starts row r+1:
+ *       T(r) = 16*(r+1) - X264_THREAD_HEIGHT          (r < i_mb_height-1)
+ *   wait guarantee while coding row y:
+ *       G(y) = 16*y + i_mv_range_thread
+ *
+ * MBAFF (units: frame lines; rows are MB rows, pair rows interleaved
+ * column-wise):
+ *   broadcast at the start of pair row 2k:  counter = 32k - 2*X264_THREAD_HEIGHT
+ *   (fdec_filter_row returns early on odd rows).  Both rows of pair k-1
+ *   (including any reencode) are final then:
+ *       T(r) = 16*(r + 2 - (r&1)) - 2*X264_THREAD_HEIGHT   (r < i_mb_height-2)
+ *   the wait runs at pair starts only (even y), with pix_y = (y|1)*16:
+ *       G(y) = 16*(y|1) + i_mv_range_thread
+ *
+ * PAFF (units: field lines of each parity; per-parity counters):
+ *   coded rows step by 2 (m = p, p+2, ...; p = pass parity); broadcast at
+ *   the start of coded row m:  counter[p] = 8*(m-p) - 16 - X264_THREAD_HEIGHT
+ *   (paff_filter_row; the first broadcast is at m = p+4 and certifies the
+ *   first two coded rows at 16 - X264_THREAD_HEIGHT).
+ *   Row r (parity q = r&1) is final once the parity-q pass starts row r+2:
+ *       T(r) = 8*(r-q) - X264_THREAD_HEIGHT           (r < i_mb_height-2)
+ *   wait guarantee while coding row y, per reference entry of parity q':
+ *       counter[q'] >= 16*(y>>1) + i_mv_range_thread
+ *   Only parities present in this pass's expanded field lists are bounded,
+ *   so the reference frame must appear with parity q in L0/L1.
+ *
+ * Rows whose finalization needs the end-of-pass sentinel (the last coded
+ * row of the frame / pair / parity) are never provably committed under the
+ * guarantee and fall back.  The one-row margin (16 lines) covers any
+ * off-by-one in the broadcast cadence.
+ *
+ * With the default i_mv_range_thread (24) the current row (the row_pred[1]
+ * update) and one future row (the B-frame qp_min clamp) are covered in all
+ * modes; deeper future rows (predict_row_size) fall back.
+ *
+ * Caveat: the derivation assumes the coding loop advances row-monotonically.
+ * i_slice_max_size slice restarts can recode an earlier row after its
+ * broadcast; that combination is outside this guarantee. */
+static int row_ref_committed( x264_t *h, x264_frame_t *fref, int i_row )
+{
+    if( h->i_thread_frames <= 1 )
+        return 1;
+    int y = h->mb.i_mb_y;
+    int mvr = h->param.analyse.i_mv_range_thread;
+    if( FIELD_PIC )
+    {
+        /* PAFF: per-parity counters; the wait only bounds parities present
+         * in this pass's field lists, so find a matching entry first. */
+        int q = i_row & 1;
+        int waited = 0;
+        for( int l = 0; l <= (h->sh.i_type == SLICE_TYPE_B) && !waited; l++ )
+        {
+            int8_t *parity_map = l ? h->mb.pic.i_fref_parity_l1 : h->mb.pic.i_fref_parity;
+            for( int j = 0; j < h->i_ref[l]; j++ )
+                if( h->fref[l][j]->orig == fref->orig && parity_map[j] == q )
+                {
+                    waited = 1;
+                    break;
+                }
+        }
+        if( !waited || i_row >= h->mb.i_mb_height - 2 )
+            return 0;
+        int committed_at = 8*(i_row - q) - X264_THREAD_HEIGHT;
+        int guarantee = 16*(y>>1) + mvr;
+        return committed_at + 16 <= guarantee;
+    }
+    else if( SLICE_MBAFF )
+    {
+        if( i_row >= h->mb.i_mb_height - 2 )
+            return 0;
+        int committed_at = 16*(i_row + 2 - (i_row&1)) - 2*X264_THREAD_HEIGHT;
+        int guarantee = 16*(y|1) + mvr;
+        return committed_at + 16 <= guarantee;
+    }
+    else
+    {
+        if( i_row >= h->mb.i_mb_height - 1 )
+            return 0;
+        int committed_at = 16*(i_row+1) - X264_THREAD_HEIGHT;
+        int guarantee = 16*y + mvr;
+        return committed_at + 16 <= guarantee;
+    }
+}
+
 static float predict_row_size( x264_t *h, int y, float qscale )
 {
     /* average between two predictors:
      * absolute SATD, and scaled bit cost of the colocated row in the previous frame */
     x264_ratecontrol_t *rc = h->rc;
     float pred_s = predict_size( &rc->row_pred[0], qscale, h->fdec->i_row_satd[y] );
-    if( h->sh.i_type == SLICE_TYPE_I || qscale >= h->fref[0][0]->f_row_qscale[y] )
+    if( h->sh.i_type == SLICE_TYPE_I )
+        return pred_s;
+    /* Threaded: read the reference row only if its stats are provably final
+     * (see row_ref_committed); otherwise take the SATD-only prediction. */
+    if( !row_ref_committed( h, h->fref[0][0], y ) )
+        return pred_s;
+    if( qscale >= h->fref[0][0]->f_row_qscale[y] )
     {
         if( h->sh.i_type == SLICE_TYPE_P
             && h->fref[0][0]->i_type == h->fdec->i_type
@@ -1569,7 +1696,18 @@ static float predict_row_size( x264_t *h, int y, float qscale )
 static int row_bits_so_far( x264_t *h, int y )
 {
     int bits = 0;
-    for( int i = h->i_threadslice_start; i <= y; i++ )
+    /* PAFF threaded: the pair's two passes share the row arrays and run
+     * as concurrent pool jobs, so rows of the opposite parity are live
+     * writes of the sibling pass.  Sum only this pass's parity rows (the
+     * pass's own writes) to keep the total timing-independent.  At
+     * --threads 1 the sibling field is already final, so the original
+     * full sum is kept (byte-identity).  paff-sliced-threads (D6): the
+     * same parity-only sum applies -- a slice thread's band owns only
+     * its parity's rows, and the row-VBV budget is field-granular (D4).
+     * The gate must NOT be a bare FIELD_PIC: the t1 step-1 sum is
+     * load-bearing for non-sliced byte-identity. */
+    int step = (FIELD_PIC && (h->i_thread_frames > 1 || h->param.b_sliced_threads)) ? 2 : 1;
+    for( int i = h->i_threadslice_start; i <= y; i += step )
         bits += h->fdec->i_row_bits[i];
     return bits;
 }
@@ -1578,7 +1716,16 @@ static float predict_row_size_to_end( x264_t *h, int y, float qp )
 {
     float qscale = qp2qscale( qp );
     float bits = 0;
-    for( int i = y+1; i < h->i_threadslice_end; i++ )
+    /* paff-sliced-threads (D6): a sliced field pass budgets per FIELD
+     * (D4), so the remaining-size prediction sums only own-parity rows
+     * of the band: start at y+2 (y+1 is the SIBLING parity's row -- a
+     * naive step-2 from y+1 would sum the wrong field's rows) and step
+     * 2.  Non-sliced modes keep the contiguous sum: at --threads 1 the
+     * pair-level plan (and its frozen byte-identity) covers both
+     * parities, and the frame-threaded pass keeps the landed snapshot
+     * semantics. */
+    int step = 1 + (FIELD_PIC && h->param.b_sliced_threads);
+    for( int i = y+1 + (FIELD_PIC && h->param.b_sliced_threads); i < h->i_threadslice_end; i += step )
         bits += predict_row_size( h, i, qscale );
     return bits;
 }
@@ -1609,7 +1756,8 @@ int x264_ratecontrol_mb( x264_t *h, int bits )
     h->fdec->f_row_qscale[y] = qscale;
 
     update_predictor( &rc->row_pred[0], qscale, h->fdec->i_row_satd[y], h->fdec->i_row_bits[y] );
-    if( h->sh.i_type != SLICE_TYPE_I && rc->qpm < h->fref[0][0]->f_row_qp[y] )
+    if( h->sh.i_type != SLICE_TYPE_I && row_ref_committed( h, h->fref[0][0], y )
+        && rc->qpm < h->fref[0][0]->f_row_qp[y] )
         update_predictor( &rc->row_pred[1], qscale, h->fdec->i_row_satds[0][0][y], h->fdec->i_row_bits[y] );
 
     /* update ratecontrol per-mbpair in MBAFF */
@@ -1655,7 +1803,12 @@ int x264_ratecontrol_mb( x264_t *h, int bits )
         /* B-frames shouldn't use lower QP than their reference frames. */
         if( h->sh.i_type == SLICE_TYPE_B )
         {
-            qp_min = X264_MAX( qp_min, X264_MAX( h->fref[0][0]->f_row_qp[y+1], h->fref[1][0]->f_row_qp[y+1] ) );
+            /* The clamp reads a FUTURE row of both references; only apply it
+             * when that row is provably committed in both, else keep the
+             * unclamped qp_min (uncoded rows read as 0, which is equivalent
+             * to no clamp, so the fallback matches the no-reference case). */
+            if( row_ref_committed( h, h->fref[0][0], y+1 ) && row_ref_committed( h, h->fref[1][0], y+1 ) )
+                qp_min = X264_MAX( qp_min, X264_MAX( h->fref[0][0]->f_row_qp[y+1], h->fref[1][0]->f_row_qp[y+1] ) );
             rc->qpm = X264_MAX( rc->qpm, qp_min );
         }
 
@@ -1690,7 +1843,7 @@ int x264_ratecontrol_mb( x264_t *h, int bits )
         rc->qpm -= step_size;
         float b2 = bits_so_far + predict_row_size_to_end( h, y, rc->qpm ) + size_of_other_slices;
         while( rc->qpm > qp_min && rc->qpm < prev_row_qp
-               && (rc->qpm > h->fdec->f_row_qp[0] || rc->single_frame_vbv)
+               && (rc->qpm > h->fdec->f_row_qp[(FIELD_PIC && (h->i_thread_frames > 1 || h->param.b_sliced_threads)) ? h->i_threadslice_start : 0] || rc->single_frame_vbv)
                && (b2 < max_frame_size)
                && ((b2 < rc->frame_size_planned * 0.8f) || (b2 < b_max)) )
         {
@@ -1873,10 +2026,20 @@ int x264_ratecontrol_end( x264_t *h, int bits, int *filler )
         int use_old_stats = h->param.rc.b_stat_read && rc->rce->refs > 1;
         for( int i = 0; i < (use_old_stats ? rc->rce->refs : h->i_ref[0]); i++ )
         {
-            int refcount = use_old_stats         ? rc->rce->refcount[i]
-                         : PARAM_INTERLACED      ? h->stat.frame.i_mb_count_ref[0][i*2]
-                                                 + h->stat.frame.i_mb_count_ref[0][i*2+1]
-                         :                         h->stat.frame.i_mb_count_ref[0][i];
+            int refcount;
+            if( use_old_stats )
+                refcount = rc->rce->refcount[i];
+            else if( h->param.b_paff )
+                /* PAFF (D17/b): the field-pair driver already folded the
+                 * per-field-entry counts into pair counts per pass (while
+                 * each pass's entry->pair map was live), so the merged
+                 * stats carry pair-level counts directly. */
+                refcount = h->stat.frame.i_mb_count_ref[0][i];
+            else if( PARAM_INTERLACED )
+                refcount = h->stat.frame.i_mb_count_ref[0][i*2]
+                         + h->stat.frame.i_mb_count_ref[0][i*2+1];
+            else
+                refcount = h->stat.frame.i_mb_count_ref[0][i];
             if( fprintf( rc->p_stat_file_out, "%d ", refcount ) < 0 )
                 goto fail;
         }
@@ -2133,20 +2296,17 @@ static void update_predictor( predictor_t *p, float q, float var, float bits )
     p->offset += new_offset;
 }
 
-// update VBV after encoding a frame
-static int update_vbv( x264_t *h, int bits )
+// step the decoder CPB model over one access unit: remove the AU's bits
+// (checking underflow), then add the bits arriving during its display
+// duration (checking overflow).  Filler is emitted only for the last AU
+// of the frame (b_last_au) -- mid-frame overflow is clamped instead.
+static int vbv_au_step( x264_t *h, int64_t bits, int64_t i_cpb_duration, int b_last_au, const char *au_prefix )
 {
     int filler = 0;
     int bitrate = h->sps->vui.hrd.i_bit_rate_unscaled;
     x264_ratecontrol_t *rcc = h->rc;
     x264_ratecontrol_t *rct = h->thread[0]->rc;
     int64_t buffer_size = (int64_t)h->sps->vui.hrd.i_cpb_size_unscaled * h->sps->vui.i_time_scale;
-
-    if( rcc->last_satd >= h->mb.i_mb_count )
-        update_predictor( &rct->pred[h->sh.i_type], qp2qscale( rcc->qpa_rc ), rcc->last_satd, bits );
-
-    if( !rcc->b_vbv )
-        return filler;
 
     uint64_t buffer_diff = (uint64_t)bits * h->sps->vui.i_time_scale;
     rct->buffer_fill_final -= buffer_diff;
@@ -2156,9 +2316,9 @@ static int update_vbv( x264_t *h, int bits )
     {
         double underflow = (double)rct->buffer_fill_final_min / h->sps->vui.i_time_scale;
         if( rcc->rate_factor_max_increment && rcc->qpm >= rcc->qp_novbv + rcc->rate_factor_max_increment )
-            x264_log( h, X264_LOG_DEBUG, "VBV underflow due to CRF-max (frame %d, %.0f bits)\n", h->i_frame, underflow );
+            x264_log( h, X264_LOG_DEBUG, "VBV underflow due to CRF-max (%sframe %d, %.0f bits)\n", au_prefix, h->i_frame, underflow );
         else
-            x264_log( h, X264_LOG_WARNING, "VBV underflow (frame %d, %.0f bits)\n", h->i_frame, underflow );
+            x264_log( h, X264_LOG_WARNING, "VBV underflow (%sframe %d, %.0f bits)\n", au_prefix, h->i_frame, underflow );
         rct->buffer_fill_final =
         rct->buffer_fill_final_min = 0;
     }
@@ -2166,20 +2326,44 @@ static int update_vbv( x264_t *h, int bits )
     if( h->param.i_avcintra_class )
         buffer_diff = buffer_size;
     else
-        buffer_diff = (uint64_t)bitrate * h->sps->vui.i_num_units_in_tick * h->fenc->i_cpb_duration;
+        buffer_diff = (uint64_t)bitrate * h->sps->vui.i_num_units_in_tick * i_cpb_duration;
     rct->buffer_fill_final += buffer_diff;
     rct->buffer_fill_final_min += buffer_diff;
 
-    if( rct->buffer_fill_final > buffer_size )
+    /* PAFF: the filler emitted at the pair's last field AU can only bound
+     * the fill at the NEXT pair's first-field removal.  The peak before
+     * the SECOND field's own removal (one tick of arrival after the first
+     * field's, with only the first field's bits removed in between) is not
+     * correctable by filler, so keep one field tick of headroom: start
+     * emitting filler when the fill exceeds cpb_size minus one tick of
+     * arrival.  Then fill_before(tr(f0)) <= size - tick and the
+     * second-field peak stays <= size - bits(f0) <= size. */
+    int64_t eff_buffer_size = buffer_size;
+#if HAVE_INTERLACED
+    if( h->param.b_paff && h->param.rc.b_filler && b_last_au )
+        eff_buffer_size = buffer_size - buffer_diff;
+#endif
+
+    if( rct->buffer_fill_final > eff_buffer_size )
     {
-        if( h->param.rc.b_filler )
+        if( h->param.rc.b_filler && b_last_au )
         {
             int64_t scale = (int64_t)h->sps->vui.i_time_scale * 8;
-            filler = (rct->buffer_fill_final - buffer_size + scale - 1) / scale;
+            filler = (rct->buffer_fill_final - eff_buffer_size + scale - 1) / scale;
             bits = h->param.i_avcintra_class ? filler * 8 : X264_MAX( (FILLER_OVERHEAD - h->param.b_annexb), filler ) * 8;
             buffer_diff = (uint64_t)bits * h->sps->vui.i_time_scale;
             rct->buffer_fill_final -= buffer_diff;
             rct->buffer_fill_final_min -= buffer_diff;
+        }
+        else if( h->param.rc.b_filler )
+        {
+            /* PAFF mid-pair AU: filler can only be written at pair end
+             * (into the last field's AU), so there is nothing to emit yet.
+             * Do NOT clamp: clamping would discard the excess from the
+             * model while the decoder's CPB still holds it, letting the
+             * true fill drift above cpb_size unnoticed (found by the
+             * Annex C simulator, task 2.4).  Carry the excess; the pair's
+             * last AU emits filler for it. */
         }
         else
         {
@@ -2187,6 +2371,49 @@ static int update_vbv( x264_t *h, int bits )
             rct->buffer_fill_final_min = X264_MIN( rct->buffer_fill_final_min, buffer_size );
         }
     }
+
+    return filler;
+}
+
+// update VBV after encoding a frame
+static int update_vbv( x264_t *h, int bits )
+{
+    int filler = 0;
+    x264_ratecontrol_t *rcc = h->rc;
+    x264_ratecontrol_t *rct = h->thread[0]->rc;
+
+    if( rcc->last_satd >= h->mb.i_mb_count )
+        update_predictor( &rct->pred[h->sh.i_type], qp2qscale( rcc->qpa_rc ), rcc->last_satd, bits );
+
+    if( !rcc->b_vbv )
+        return filler;
+
+    /* Update the plan-error tracker (see vbv_inflight_bits): runs at frame
+     * end in coding order, so the tracked values are deterministic. */
+    rct->plan_error_overshoot = rct->plan_error_overshoot * 0.95 + X264_MAX( 0, bits - rcc->frame_size_planned );
+    rct->plan_error_planned = rct->plan_error_planned * 0.95 + rcc->frame_size_planned;
+    rct->plan_error_actual  = rct->plan_error_actual * 0.95 + bits;
+
+#if HAVE_INTERLACED
+    if( h->param.b_paff )
+    {
+        /* Annex C: each field is its own access unit, removed one field
+         * tick after the previous AU (C.1.2); a pair's i_cpb_duration is 2
+         * ticks, so each step adds one tick of arrival.  A pair-level step
+         * provably misses CPB underflow when the first field is large (its
+         * AU is removed one tick before the pair's bits finish arriving).
+         * Per-AU sizes are the actual NAL payload sums split at the
+         * boundary recorded by the pair driver; their total equals the
+         * frame size passed in.  Filler goes to the pair's last AU. */
+        int64_t au_bits[2] = { 0, 0 };
+        for( int i = 0; i < h->out.i_nal; i++ )
+            au_bits[i >= h->out.i_paff_au_boundary] += (int64_t)h->out.nal[i].i_payload * 8;
+        vbv_au_step( h, au_bits[0], h->fenc->i_cpb_duration/2, 0, "field 0 of " );
+        filler = vbv_au_step( h, au_bits[1], h->fenc->i_cpb_duration - h->fenc->i_cpb_duration/2, 1, "field 1 of " );
+    }
+    else
+#endif
+        filler = vbv_au_step( h, bits, h->fenc->i_cpb_duration, 1, "" );
 
     return filler;
 }
@@ -2213,6 +2440,27 @@ void x264_hrd_fullness( x264_t *h )
     rct->buffer_fill_final_min = X264_MIN( rct->buffer_fill_final_min, decoder_buffer_fill );
 }
 
+/* Deterministic stand-in for the removed X264_MAX(frame_size_planned,
+ * frame_size_estimated) refinement: the live estimate is timing-dependent,
+ * so in-flight frames are charged their planned size scaled by the recent
+ * plan error of finished frames (a ratio of two integrators, in which the
+ * 20x steady-state factor cancels), plus the overshoot integrator as a
+ * one-sided safety margin.  The margin is deliberately ~20x the mean
+ * per-frame overshoot: undersizing it lets the model drift optimistic when
+ * in-flight frames overspend their plans (measured: CPB underflow at a
+ * scenecut, tools/check_hrd.py).  All inputs are final at decision time.
+ * Non-VBV rate control is unaffected (gated on b_vbv), keeping non-VBV
+ * output byte-identical. */
+static double vbv_inflight_bits( x264_t *h, x264_t *t )
+{
+    x264_ratecontrol_t *rct = h->thread[0]->rc;
+    double bits = t->rc->frame_size_planned;
+    if( rct->b_vbv && rct->plan_error_planned > 0 )
+        bits = bits * X264_MAX( 1.0, x264_clip3f( rct->plan_error_actual / rct->plan_error_planned, 0.5, 2.0 ) )
+             + rct->plan_error_overshoot;
+    return bits;
+}
+
 // provisionally update VBV according to the planned size of all frames currently in progress
 static void update_vbv_plan( x264_t *h, int overhead )
 {
@@ -2224,10 +2472,9 @@ static void update_vbv_plan( x264_t *h, int overhead )
         for( int i = 1; i < h->i_thread_frames; i++ )
         {
             x264_t *t = h->thread[ (j+i)%h->i_thread_frames ];
-            double bits = t->rc->frame_size_planned;
+            double bits = vbv_inflight_bits( h, t );
             if( !t->b_thread_active )
                 continue;
-            bits = X264_MAX(bits, t->rc->frame_size_estimated);
             rcc->buffer_fill -= bits;
             rcc->buffer_fill = X264_MAX( rcc->buffer_fill, 0 );
             rcc->buffer_fill += t->rc->buffer_rate;
@@ -2484,10 +2731,14 @@ static float rate_estimate_qscale( x264_t *h )
             for( int i = 1; i < h->i_thread_frames; i++ )
             {
                 x264_t *t = h->thread[(j+i) % h->i_thread_frames];
+                /* Plain planned size here: this loop steers the frame QP
+                 * (bitrate trajectory), where the conservative charge would
+                 * systematically undershoot the target on short clips.  The
+                 * conservative charge is applied where it protects
+                 * conformance: update_vbv_plan's buffer model. */
                 double bits = t->rc->frame_size_planned;
                 if( !t->b_thread_active )
                     continue;
-                bits = X264_MAX(bits, t->rc->frame_size_estimated);
                 predicted_bits += bits;
             }
         }
@@ -2692,13 +2943,32 @@ void x264_threads_distribute_ratecontrol( x264_t *h )
     {
         x264_t *t = h->thread[i];
         if( t != h )
+        {
             memcpy( t->rc, rc, offsetof(x264_ratecontrol_t, row_pred) );
+            /* paff-sliced-threads (D5): the pair-level QP accumulators are
+             * zeroed once per pair by ratecontrol_start, but sliced PAFF
+             * runs two distribute/merge cycles per pair -- without this,
+             * the pass-1 distribute copies the pass-0 accumulated base
+             * into every worker and the merge adds it back once per
+             * worker (an N-fold double count in the pair's average-QP
+             * statistics, poisoning 2-pass stats).  Zero them in each
+             * non-main worker: merge folds only i >= 1, and h's own rc
+             * carries the running pair total, so the sum stays exact. */
+            if( FIELD_PIC )
+            {
+                t->rc->qpa_rc = 0;
+                t->rc->qpa_aq = 0;
+            }
+        }
         t->rc->row_pred = t->rc->row_preds[h->sh.i_type];
         /* Calculate the planned slice size. */
         if( rc->b_vbv && rc->frame_size_planned )
         {
             int size = 0;
-            for( row = t->i_threadslice_start; row < t->i_threadslice_end; row++ )
+            /* paff-sliced-threads (D6): a field pass's band covers every
+             * second frame-coordinate row (start is own-parity by
+             * construction, end is one past the last coded row). */
+            for( row = t->i_threadslice_start; row < t->i_threadslice_end; row += 1+FIELD_PIC )
                 size += h->fdec->i_row_satd[row];
             t->rc->slice_size_planned = predict_size( &rc->pred[h->sh.i_type + (i+1)*5], qscale, size );
         }
@@ -2726,6 +2996,80 @@ void x264_threads_distribute_ratecontrol( x264_t *h )
     }
 }
 
+/* paff-sliced-threads (D4): scale the pair-level row-VBV plan to the
+ * current FIELD pass, called from threaded_slices_write before the
+ * distribute.  The row-VBV plan covers the PAIR, so the sliced
+ * normalization and the per-row guards would see a doubled budget.
+ * Pass 0 gets the pair plan scaled by its parity's share of the row SATD
+ * (known for the whole frame before dispatch); pass 1 gets the exact
+ * leftover (pair plan minus pass-0 actual bits -- available because pass
+ * 0 has fully completed; the units are the pass-0 stat.frame sum of
+ * tex+mv+misc, the units the plan and the row predictors live in),
+ * floored at 5% of the pair plan so an overshooting first field cannot
+ * hand the normalization a zero/negative plan (NaN-prone trust-coefficient
+ * division, garbage size_of_other_slices_planned).  With the floor the
+ * arithmetic stays in its normal regime and an exhausted pair budget
+ * still drives the second field to qp_absolute_max through the normal
+ * row-VBV loops.  frame_size_maximum is scaled by the same factor; the
+ * pair plan is restored on h after the pass's join (update_vbv's
+ * plan-error tracker integrates bits - frame_size_planned at pair end).
+ * One X264_LOG_DEBUG line per field budget: the budgets have no API/log
+ * surface otherwise, and the test matrix reads them for the budget-sum
+ * assertion. */
+void x264_paff_slice_field_budget( x264_t *h, int pass )
+{
+    x264_ratecontrol_t *rc = h->rc;
+    if( !rc->b_vbv || rc->frame_size_planned <= 0 )
+        return;
+
+    double pair_plan = rc->frame_size_planned;
+    double pair_maximum = rc->frame_size_maximum;
+    double field_plan;
+
+    if( !pass )
+    {
+        int parity = h->sh.b_bottom_field;
+        int64_t pair_satd = 0, pass_satd = 0;
+        for( int y = 0; y < h->mb.i_mb_height; y++ )
+        {
+            pair_satd += h->fdec->i_row_satd[y];
+            if( (y & 1) == parity )
+                pass_satd += h->fdec->i_row_satd[y];
+        }
+        double share = pair_satd ? (double)pass_satd / pair_satd : 0.5;
+        field_plan = pair_plan * share;
+    }
+    else
+    {
+        field_plan = pair_plan - h->fdec->i_field_bits[0];
+        if( field_plan < pair_plan * 0.05 )
+            field_plan = pair_plan * 0.05;
+    }
+
+    h->paff_slice_pair_plan = pair_plan;
+    h->paff_slice_pair_maximum = pair_maximum;
+    rc->frame_size_maximum = pair_maximum * (field_plan / pair_plan);
+    rc->frame_size_planned = field_plan;
+    x264_log( h, X264_LOG_DEBUG, "paff field budget: pass %d plan %.0f bits (pair plan %.0f)\n",
+              pass, field_plan, pair_plan );
+}
+
+/* paff-sliced-threads (D4): restore the pair-level plan/max after the
+ * pass's join (see x264_paff_slice_field_budget). */
+void x264_paff_slice_restore_pair_plan( x264_t *h )
+{
+    x264_ratecontrol_t *rc = h->rc;
+    if( rc->b_vbv && h->paff_slice_pair_plan > 0 )
+    {
+        rc->frame_size_planned = h->paff_slice_pair_plan;
+        rc->frame_size_maximum = h->paff_slice_pair_maximum;
+        /* consume the mark: the next pair's field budget may early-return
+         * (frame_size_planned <= 0) without setting it, and a stale mark
+         * would install the PREVIOUS pair's plan here */
+        h->paff_slice_pair_plan = 0;
+    }
+}
+
 void x264_threads_merge_ratecontrol( x264_t *h )
 {
     x264_ratecontrol_t *rc = h->rc;
@@ -2738,10 +3082,13 @@ void x264_threads_merge_ratecontrol( x264_t *h )
         if( h->param.rc.i_vbv_buffer_size )
         {
             int size = 0;
-            for( int row = t->i_threadslice_start; row < t->i_threadslice_end; row++ )
+            /* paff-sliced-threads (D6): same stride-2 band rows as the
+             * distribute; the band's MB count is half the contiguous
+             * row span. */
+            for( int row = t->i_threadslice_start; row < t->i_threadslice_end; row += 1+FIELD_PIC )
                 size += h->fdec->i_row_satd[row];
             int bits = t->stat.frame.i_mv_bits + t->stat.frame.i_tex_bits + t->stat.frame.i_misc_bits;
-            int mb_count = (t->i_threadslice_end - t->i_threadslice_start) * h->mb.i_mb_width;
+            int mb_count = ((t->i_threadslice_end - t->i_threadslice_start + FIELD_PIC) / (1+FIELD_PIC)) * h->mb.i_mb_width;
             update_predictor( &rc->pred[h->sh.i_type+(i+1)*5], qp2qscale( rct->qpa_rc/mb_count ), size, bits );
         }
         if( !i )
@@ -2800,6 +3147,72 @@ void x264_thread_sync_ratecontrol( x264_t *cur, x264_t *prev, x264_t *next )
     }
     //FIXME row_preds[] (not strictly necessary, but would improve prediction)
     /* the rest of the variables are either constant or thread-local */
+}
+
+/* PAFF pass-granular frame threading (paff-pass-threads D3/D6): give the
+ * pair's second-pass slot a deterministic dispatch-time snapshot of the
+ * ratecontrol state.  Its row VBV then sees PREDICTED first-field bits --
+ * the progressive threading semantics (a frame coding against an in-flight
+ * previous frame predicts its bits the same way).  Same memcpy shape as
+ * x264_threads_distribute_ratecontrol, plus the row predictor array (the
+ * monolithic --threads 1 driver's second pass sees the first pass's
+ * predictors; the dispatch-time snapshot is the deterministic
+ * approximation of that).  The end-chain vars are NOT copied: they flow
+ * through pass-0 slots only (x264_thread_sync_ratecontrol). */
+void x264_paff_sync_ratecontrol( x264_t *dst, x264_t *src )
+{
+    /* The end-chain vars updated by x264_ratecontrol_end and the central
+     * VBV accumulator buffer_fill_final (authoritative on thread[0], which
+     * is a pass-1 slot for some pair of every round-robin cycle) must NOT
+     * be clobbered by the snapshot: they flow through pass-0 slots only
+     * (x264_thread_sync_ratecontrol's cur->next chain, which the pass-1
+     * slot skips).  Save and restore them around the memcpy. */
+    int64_t buffer_fill_final     = dst->rc->buffer_fill_final;
+    int64_t buffer_fill_final_min = dst->rc->buffer_fill_final_min;
+    double cplxr_sum           = dst->rc->cplxr_sum;
+    double expected_bits_sum   = dst->rc->expected_bits_sum;
+    int64_t filler_bits_sum    = dst->rc->filler_bits_sum;
+    double wanted_bits_window  = dst->rc->wanted_bits_window;
+    int    bframe_bits         = dst->rc->bframe_bits;
+    int    initial_cpb_removal_delay        = dst->rc->initial_cpb_removal_delay;
+    int    initial_cpb_removal_delay_offset = dst->rc->initial_cpb_removal_delay_offset;
+    double nrt_first_access_unit            = dst->rc->nrt_first_access_unit;
+    double previous_cpb_final_arrival_time  = dst->rc->previous_cpb_final_arrival_time;
+    /* The plan-error tracker is likewise authoritative on thread[0] only
+     * (updated in update_vbv at pair end), so it needs the same protection
+     * from the snapshot. */
+    double plan_error_planned   = dst->rc->plan_error_planned;
+    double plan_error_actual    = dst->rc->plan_error_actual;
+    double plan_error_overshoot = dst->rc->plan_error_overshoot;
+
+    memcpy( dst->rc, src->rc, offsetof(x264_ratecontrol_t, row_pred) );
+    memcpy( dst->rc->row_preds, src->rc->row_preds, sizeof(src->rc->row_preds) );
+    dst->rc->row_pred = dst->rc->row_preds[src->sh.i_type];
+
+    dst->rc->buffer_fill_final     = buffer_fill_final;
+    dst->rc->buffer_fill_final_min = buffer_fill_final_min;
+    dst->rc->cplxr_sum           = cplxr_sum;
+    dst->rc->expected_bits_sum   = expected_bits_sum;
+    dst->rc->filler_bits_sum    = filler_bits_sum;
+    dst->rc->wanted_bits_window  = wanted_bits_window;
+    dst->rc->bframe_bits         = bframe_bits;
+    dst->rc->initial_cpb_removal_delay        = initial_cpb_removal_delay;
+    dst->rc->initial_cpb_removal_delay_offset = initial_cpb_removal_delay_offset;
+    dst->rc->nrt_first_access_unit            = nrt_first_access_unit;
+    dst->rc->previous_cpb_final_arrival_time  = previous_cpb_final_arrival_time;
+    dst->rc->plan_error_planned   = plan_error_planned;
+    dst->rc->plan_error_actual    = plan_error_actual;
+    dst->rc->plan_error_overshoot = plan_error_overshoot;
+}
+
+/* PAFF pass-granular frame threading: fold the second-pass slot's per-frame
+ * ratecontrol accumulators into the first-pass slot's at the pair's
+ * harvest rendezvous (the monolithic driver accumulates both passes onto
+ * one context; same sums). */
+void x264_paff_merge_ratecontrol( x264_t *h, x264_t *h1 )
+{
+    h->rc->qpa_rc += h1->rc->qpa_rc;
+    h->rc->qpa_aq += h1->rc->qpa_aq;
 }
 
 static int find_underflow( x264_t *h, double *fills, int *t0, int *t1, int over )

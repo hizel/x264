@@ -714,6 +714,12 @@ static void help( x264_param_t *defaults, int longhelp )
     H2( "      --slice-min-mbs <integer> Limit the size of each slice in macroblocks (min)\n");
     H0( "      --tff                   Enable interlaced mode (top field first)\n" );
     H0( "      --bff                   Enable interlaced mode (bottom field first)\n" );
+    H2( "      --paff                  Enable PAFF interlaced mode (field pictures).\n"
+        "                              Field order follows --tff/--bff. Each input frame is\n"
+        "                              coded as a complementary field pair. Mutually exclusive\n"
+        "                              with MBAFF and AVC-Intra; incompatible with pulldown.\n"
+        "                              Frame threading and sliced threads are supported.\n"
+        "                              See doc/paff.txt.\n" );
     H2( "      --constrained-intra     Enable constrained intra prediction.\n" );
     H0( "      --pulldown <string>     Use soft pulldown to change frame rate\n"
         "                                  - %s (requires cfr input)\n", stringify_names( buf, x264_pulldown_names ) );
@@ -799,7 +805,7 @@ static void help( x264_param_t *defaults, int longhelp )
         "                                  - tesa: hadamard exhaustive search (slow)\n" );
     else H1( "                                  - dia, hex, umh\n" );
     H2( "      --merange <integer>     Maximum motion vector search range [%d]\n", defaults->analyse.i_me_range );
-    H2( "      --mvrange <integer>     Maximum motion vector length [-1 (auto)]\n" );
+    H2( "      --mvrange <integer>     Maximum motion vector length [-1 (auto)]; in field lines under --paff, where auto is the halved level limit\n" );
     H2( "      --mvrange-thread <int>  Minimum buffer between threads [-1 (auto)]\n" );
     H1( "  -m, --subme <integer>       Subpixel motion estimation and mode decision [%d]\n", defaults->analyse.i_subpel_refine );
     H2( "                                  - 0: fullpel only (not recommended)\n"
@@ -1167,6 +1173,7 @@ static struct option long_options[] =
     { "nal-hrd",              required_argument, NULL, 0 },
     { "pulldown",             required_argument, NULL, OPT_PULLDOWN },
     { "fake-interlaced",      no_argument,       NULL, 0 },
+    { "paff",                 no_argument,       NULL, 0 },
     { "frame-packing",        required_argument, NULL, 0 },
     { "mastering-display",    required_argument, NULL, 0 },
     { "cll",                  required_argument, NULL, 0 },
@@ -1402,6 +1409,7 @@ static int parse( int argc, char **argv, x264_param_t *param, cli_opt_t *opt )
     int b_user_ref = 0;
     int b_user_fps = 0;
     int b_user_interlaced = 0;
+    int b_user_mbaff = 0;
     cli_input_opt_t input_opt;
     cli_output_opt_t output_opt;
     char *preset = NULL;
@@ -1529,6 +1537,10 @@ static int parse( int argc, char **argv, x264_param_t *param, cli_opt_t *opt )
                 goto generic_option;
             case OPT_INTERLACED:
                 b_user_interlaced = 1;
+                /* tff/bff select field order (valid under --paff too);
+                 * only an explicit --interlaced is an MBAFF request */
+                if( !strcmp( long_options[long_options_index].name, "interlaced" ) )
+                    b_user_mbaff = 1;
                 goto generic_option;
             case OPT_TCFILE_IN:
                 tcfile_name = optarg;
@@ -1619,6 +1631,12 @@ generic_option:
     /* Apply profile restrictions. */
     if( x264_param_apply_profile( param, profile ) < 0 )
         return -1;
+
+    /* --tff/--bff select field order under --paff too; only an explicit
+     * --interlaced is an MBAFF request, which --paff silently overrides
+     * in encode() -- say so. */
+    if( param->b_paff && b_user_mbaff )
+        x264_cli_log( "x264", X264_LOG_WARNING, "--paff is mutually exclusive with --interlaced: ignoring MBAFF request, coding field pictures\n" );
 
     /* Get the file name */
     FAIL_IF_ERROR( optind > argc - 1 || !output_filename, "No %s file. Run x264 --help for a list of options.\n",
@@ -1768,7 +1786,7 @@ generic_option:
         x264_cli_log( "x264", X264_LOG_WARNING, "input appears to be interlaced, enabling %cff interlaced mode.\n"
                       "                If you want otherwise, use --no-interlaced or --%cff\n",
                       info.tff ? 't' : 'b', info.tff ? 'b' : 't' );
-        param->b_interlaced = 1;
+        param->b_interlaced = X264_INTERLACED_MBAFF;
         param->b_tff = !!info.tff;
 #else
         x264_cli_log( "x264", X264_LOG_WARNING, "input appears to be interlaced, but not compiled with interlaced support\n" );
@@ -1946,9 +1964,21 @@ static int encode( x264_param_t *param, cli_opt_t *opt )
 
     opt->b_progress &= param->i_log_level < X264_LOG_DEBUG;
 
+    /* PAFF: give CLI users a working default instead of an init error.
+     * The library itself stays strict and rejects invalid combinations.
+     * B field pictures are supported (paff-b-frames); P weighted
+     * prediction (weightp) is supported since paff-sei-hrd-rc task 2.5;
+     * weighted biprediction (weightb) is disabled by the library. */
+    if( param->b_paff )
+    {
+        /* --tff/--bff select field order only; MBAFF stays off. */
+        param->b_interlaced = X264_INTERLACED_OFF;
+    }
+
     /* set up pulldown */
     if( opt->i_pulldown && !param->b_vfr_input )
     {
+        FAIL_IF_ERROR2( param->b_paff, "--pulldown is not supported with --paff (every frame is coded as one field pair)\n" );
         param->b_pulldown = 1;
         param->b_pic_struct = 1;
         pulldown = &pulldown_values[opt->i_pulldown];
