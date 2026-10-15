@@ -18,6 +18,7 @@
 *.dylib
 .*.swp
 .depend
+.env
 .DS_Store
 TAGS
 config.h

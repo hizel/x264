@@ -60,8 +60,15 @@
 #   opengop         open-GOP round-trips vs JM: non-IDR Ip keyframe pairs
 #                   plus a hard-scene-cut clip whose GOP-tail B pairs MUST
 #                   reference across the I pair to decode correctly
-#   all             baseline-check + paff + matrix + rc + la_range
-#                   + wide_range + motion + opengop (default)
+#   rtrn            RTRN broadcast profile regression (ticket #63682 DoD 3,
+#                   doc/paff.txt "The RTRN broadcast profile"): mediainfo
+#                   field table, GOP geometry + IDR discipline (ffprobe
+#                   cadence + python3 NAL scan), TFF/BFF, byte-repeat at
+#                   --threads 1/4, env-gated TS-level cell (FFMPEG_PAFF).
+#                   Needs mediainfo and python3; skips with a message
+#                   when absent
+#   all             baseline-check + paff + matrix + rc + sliced + la_range
+#                   + wide_range + motion + opengop + rtrn (default)
 #
 # Environment:
 #   X264      path to the x264 CLI binary      (default: ./x264)
@@ -87,6 +94,8 @@
 #   WB2_MODES mode subset for weightb2 (default: "prog tff bff"); use
 #             "prog" for the stage-1 positive control, which needs no
 #             local validation revert
+#   FFMPEG_PAFF path to a PAFF-capable ffmpeg binary for the rtrn
+#             TS-level cell (default: unset -- the cell is skipped)
 
 set -u
 
@@ -1531,6 +1540,265 @@ cmd_la_range() {
     fi
 }
 
+# RTRN broadcast profile regression (ticket #63682 DoD 3; openspec
+# rtrn-profile-regression, design D3/D5).  Unlike the other commands the
+# clip is synthesized in python3 (byte-stable on every machine, cut-free
+# by construction) and the geometry is pinned -- the profile assertions
+# (SAR 16:11, DAR 16:9, Main@L3) are geometry-bound, so WIDTH/HEIGHT/
+# FRAMES overrides are deliberately ignored here.
+# Pinned RTRN clip geometry (design D3): the profile assertions
+# (SAR 16:11, DAR 16:9, Main@L3) are geometry-bound, so the WIDTH/HEIGHT/
+# FRAMES overrides are deliberately ignored by the rtrn command.
+RTRN_W=720
+RTRN_H=576
+RTRN_FRAMES=56
+
+# Synthesize the RTRN regression clip in python3 (design D3): byte-stable
+# on every machine and scene-cut-free by construction.  A sine wave
+# oscillates horizontally with even (top) and odd (bottom) rows moving in
+# quadrature at different amplitudes, so the two fields carry genuinely
+# different motion while the relative field phase stays bounded forever
+# (an unbounded linear per-parity drift trips scenecut and breaks the GOP
+# cadence this suite asserts).
+make_rtrn_clip() {
+    local clip=$1
+    if [ ! -f "$clip" ]; then
+        python3 - "$clip" <<'EOF'
+import math, sys
+
+W, H, N = 720, 576, 56
+
+# 8 luma wave tables at stepped DC levels (a coarse vertical gradient);
+# three sine periods across the width, values inside 16..235.
+tabs = [bytes(max(16, min(235, int(96 + 8*g + 60*math.sin(2*math.pi*3*x/W))))
+              for x in range(W)) for g in range(8)]
+
+# Field-parity motion, period = one GOP: amplitude 6 px on even (top)
+# rows, 4 px in quadrature on odd (bottom) rows.
+def shift(y, t):
+    if y % 2 == 0:
+        return int(round(6 * math.sin(2*math.pi*t/28)))
+    return int(round(4 * math.sin(2*math.pi*t/28 + math.pi/2)))
+
+with open(sys.argv[1], "wb") as out:
+    for t in range(N):
+        frame = bytearray()
+        for y in range(H):
+            tab = tabs[y*8//H]
+            s = shift(y, t) % W
+            frame += tab[s:] + tab[:s]
+        out.write(frame)
+        out.write(b"\x80" * (W*H//2))  # neutral chroma
+EOF
+    fi
+}
+
+# The RTRN reference profile (ticket #63682 reference line mapped to the
+# x264 CLI; design D4/D6): PAFF field pictures, open GOP, fixed GOP of 28
+# (--min-keyint 28 is clamped by the encoder to keyint/2+1 -- documented,
+# not fought), 3 B-frames without adaptive decision, 4 refs, Main@L3,
+# ABR 2720k bounded by VBV 3500k/1400k with HRD signaling off (ticket
+# requirement 11), AUD, BT.601 PAL colorimetry, limited range, SAR 16:11,
+# 25 fps.
+# Args: $1 = output .264, $2 = tff|bff, $3 = thread count.
+rtrn_encode() {
+    "$X264" "$WORKDIR/rtrn_clip.yuv" --input-res ${RTRN_W}x${RTRN_H} \
+        --frames $RTRN_FRAMES --fps 25 --threads "$3" \
+        --paff --$2 --open-gop --bframes 3 --b-adapt 0 \
+        --keyint 28 --min-keyint 28 --ref 4 \
+        --profile main --level 3.0 \
+        --bitrate 2720 --vbv-maxrate 3500 --vbv-bufsize 1400 \
+        --aud --sar 16:11 --range tv \
+        --colorprim bt470bg --transfer bt470bg --colormatrix bt470bg \
+        -o "$1" 2>"$1.log"
+}
+
+# Extract a "key : value" field from mediainfo text output (design D2:
+# text output, not JSON -- MediaInfo 24.11's JSON omits the fields this
+# suite cares about most).
+rtrn_mi() {  # $1 = mediainfo output file, $2 = key
+    sed -n "s/^$2 *: //p" "$1" | head -1
+}
+
+# Assert the customer-visible field table (ticket #63682 DoD 3): exact
+# value compare per property, so MediaInfo format drift fails loudly
+# (design D2).
+# Args: $1 = tag, $2 = .264 stream, $3 = expected scan order.
+rtrn_check_fields() {
+    local tag=$1 mi=$WORKDIR/rtrn_$1.mediainfo.txt
+    mediainfo "$2" > "$mi"
+    local key want got
+    while IFS='|' read -r key want; do
+        got=$(rtrn_mi "$mi" "$key")
+        if [ "$got" = "$want" ]; then
+            ok "rtrn/$tag: $key = $want"
+        else
+            bad "rtrn/$tag: $key: expected '$want', got '$got'"
+        fi
+    done <<EOF
+Scan type|Interlaced
+Scan type, store method|Separated fields
+Scan order|$3
+Format profile|Main@L3
+Format settings|CABAC / 4 Ref Frames
+Color range|Limited
+Color primaries|BT.601 PAL
+Transfer characteristics|BT.470 System B/G
+Matrix coefficients|BT.470 System B/G
+Frame rate|25.000 FPS
+Display aspect ratio|16:9
+EOF
+}
+
+# GOP geometry and keyframe discipline (design D1): pict_type cadence and
+# the 2-field-AU-per-frame packet count from ffprobe, IDR discipline from
+# a python3 Annex-B NAL-type scan (ffprobe cannot do it -- it flags
+# open-GOP recovery-point I frames with key_frame=1 too).
+# Args: $1 = tag, $2 = .264 stream.
+rtrn_check_gop() {
+    local tag=$1 stream=$2 packets
+    ffprobe -v error -select_streams v \
+        -show_entries frame=pict_type,key_frame -of csv=p=0 "$stream" \
+        > "$WORKDIR/rtrn_$tag.frames.csv"
+    packets=$(ffprobe -v error -select_streams v -count_packets \
+        -show_entries stream=nb_read_packets -of csv=p=0 "$stream")
+    local line
+    while IFS= read -r line; do
+        case $line in
+            "ok "*)  ok  "rtrn/$tag: ${line#ok }" ;;
+            "bad "*) bad "rtrn/$tag: ${line#bad }" ;;
+        esac
+    done < <(python3 - "$WORKDIR/rtrn_$tag.frames.csv" "$stream" "$packets" $RTRN_FRAMES <<'EOF'
+import sys
+
+csv_path, stream_path = sys.argv[1], sys.argv[2]
+packets, nframes = int(sys.argv[3]), int(sys.argv[4])
+
+def report(good, msg):
+    print(("ok " if good else "bad ") + msg)
+
+# ffprobe csv order is key_frame,pict_type
+frames = []
+for ln in open(csv_path):
+    p = ln.strip().split(",")
+    if len(p) >= 2:
+        frames.append((int(p[0]), p[1]))
+
+report(len(frames) == nframes,
+       f"decoded frame count = {len(frames)} (expect {nframes})")
+report(bool(frames) and frames[0] == (1, "I"),
+       f"first frame is key_frame=1 I (got {frames[0] if frames else 'none'})")
+
+# I-picture cadence: IDR at stream start, one recovery I per 28 frames
+ipos = [i for i, (_, pt) in enumerate(frames) if pt == "I"]
+report(ipos == [0, 28], f"I-picture cadence N=28 (I at {ipos}, expect [0, 28])")
+
+# Non-B cadence M=4 (I B B B P repetition) over both GOPs' steady
+# region; the 4-frame end-of-stream drain (B B P) is excluded
+nb = [i for i, (_, pt) in enumerate(frames[:52]) if pt != "B"]
+expect = list(range(0, 28, 4)) + list(range(28, 52, 4))
+report(nb == expect, f"non-B cadence M=4 (non-B at {nb}, expect {expect})")
+
+report(packets == 2 * nframes,
+       f"field-AU count = {packets} (expect {2 * nframes} = 2 per frame)")
+
+# IDR discipline: count nal_unit_type 5 slices.  Emulation prevention
+# guarantees no start-code lookalikes inside NAL payloads, so a plain
+# start-code scan is reliable.
+data = open(stream_path, "rb").read()
+idr = 0
+i = 0
+while True:
+    j = data.find(b"\x00\x00\x01", i)
+    if j < 0 or j + 4 > len(data):
+        break
+    if data[j + 3] & 0x1f == 5:
+        idr += 1
+    i = j + 3
+report(idr == 1, f"exactly one IDR slice in the stream (found {idr})")
+EOF
+)
+}
+
+# Optional container-level cell (design D1): the `Format settings, GOP:
+# M=4, N=28` MediaInfo line exists only in a container context, and the
+# system ffmpeg cannot remux raw PAFF (the mpegts muxer rejects
+# timestamp-less field access units), so the full reference command line
+# from ticket #63682 runs only when FFMPEG_PAFF points at a PAFF-capable
+# ffmpeg build.
+rtrn_ts_cell() {
+    if [ -z "${FFMPEG_PAFF:-}" ]; then
+        echo "rtrn: FFMPEG_PAFF unset -- TS-level cell skipped (needs a PAFF-capable ffmpeg; the sapsan build from #65229 is the intended source)"
+        return
+    fi
+    [ -x "$FFMPEG_PAFF" ] || { bad "rtrn: FFMPEG_PAFF not executable: $FFMPEG_PAFF"; return; }
+    "$FFMPEG_PAFF" -y -loglevel error \
+        -f rawvideo -pix_fmt yuv420p -s 720x576 -r 25 -i "$WORKDIR/rtrn_clip.yuv" \
+        -f lavfi -i anullsrc=r=48000:cl=stereo \
+        -vf "setparams=field_mode=tff:color_primaries=bt470bg:color_trc=bt470bg:colorspace=bt470bg:range=limited" \
+        -c:v libx264 -paff 1 -flags +ildct+ilme -flags -cgop \
+        -bf 3 -b_strategy 0 -g 28 -keyint_min 28 -refs 4 \
+        -profile:v main -level 3.0 -b:v 2720k -maxrate 3500k -bufsize 1400k -aud 1 \
+        -c:a mp2 -b:a 192k -ac 2 -shortest -f mpegts "$WORKDIR/rtrn_ref.ts" 2>"$WORKDIR/rtrn_ref.ts.log" \
+        || "$FFMPEG_PAFF" -y -loglevel error \
+        -f rawvideo -pix_fmt yuv420p -s 720x576 -r 25 -i "$WORKDIR/rtrn_clip.yuv" \
+        -vf "setparams=field_mode=tff:color_primaries=bt470bg:color_trc=bt470bg:colorspace=bt470bg:range=limited" \
+        -c:v libx264 -paff 1 -flags +ildct+ilme -flags -cgop \
+        -bf 3 -b_strategy 0 -g 28 -keyint_min 28 -refs 4 \
+        -profile:v main -level 3.0 -b:v 2720k -maxrate 3500k -bufsize 1400k -aud 1 \
+        -f mpegts "$WORKDIR/rtrn_ref.ts" 2>"$WORKDIR/rtrn_ref.ts.log" \
+        || { bad "rtrn: FFMPEG_PAFF reference encode failed (see $WORKDIR/rtrn_ref.ts.log)"; return; }
+    rtrn_check_fields ts "$WORKDIR/rtrn_ref.ts" "Top Field First"
+    local got
+    got=$(rtrn_mi "$WORKDIR/rtrn_ts.mediainfo.txt" "Format settings, GOP")
+    if [ "$got" = "M=4, N=28" ]; then
+        ok "rtrn/ts: Format settings, GOP = M=4, N=28"
+    else
+        bad "rtrn/ts: Format settings, GOP: expected 'M=4, N=28', got '$got'"
+    fi
+}
+
+cmd_rtrn() {
+    if ! command -v mediainfo >/dev/null; then
+        echo "rtrn: mediainfo not found in PATH -- rtrn cells skipped (field-table assertions need it)"
+        return
+    fi
+    if ! command -v python3 >/dev/null; then
+        echo "rtrn: python3 not found in PATH -- rtrn cells skipped (clip synthesis and NAL scan need it)"
+        return
+    fi
+    make_rtrn_clip "$WORKDIR/rtrn_clip.yuv"
+
+    # TFF reference encode and its assertions
+    rtrn_encode "$WORKDIR/rtrn_tff.264" tff 1 \
+        || { bad "rtrn: reference encode failed (see $WORKDIR/rtrn_tff.264.log)"; return; }
+    rtrn_check_fields tff "$WORKDIR/rtrn_tff.264" "Top Field First"
+    rtrn_check_gop tff "$WORKDIR/rtrn_tff.264"
+
+    # BFF parity variant
+    rtrn_encode "$WORKDIR/rtrn_bff.264" bff 1 \
+        || { bad "rtrn: BFF encode failed (see $WORKDIR/rtrn_bff.264.log)"; return; }
+    rtrn_check_fields bff "$WORKDIR/rtrn_bff.264" "Bottom Field First"
+    rtrn_check_gop bff "$WORKDIR/rtrn_bff.264"
+
+    # Byte-repeat: both PAFF pair drivers (design D7) -- the monolithic
+    # pair driver at --threads 1 and the frame-threaded pool jobs at
+    # --threads 4; each pair must be byte-identical (t1 vs t4 is not).
+    local n
+    for n in 1 4; do
+        rtrn_encode "$WORKDIR/rtrn_t${n}a.264" tff $n >/dev/null \
+            && rtrn_encode "$WORKDIR/rtrn_t${n}b.264" tff $n >/dev/null \
+            || { bad "rtrn: byte-repeat encode at --threads $n failed"; continue; }
+        if cmp -s "$WORKDIR/rtrn_t${n}a.264" "$WORKDIR/rtrn_t${n}b.264"; then
+            ok "rtrn: byte-repeat at --threads $n is bit-identical"
+        else
+            bad "rtrn: byte-repeat at --threads $n differs"
+        fi
+    done
+
+    rtrn_ts_cell
+}
+
 cmds=${@:-all}
 check_tools $cmds
 mkdir -p "$WORKDIR"
@@ -1549,7 +1817,8 @@ for cmd in $cmds; do
         weightb2)       cmd_weightb2 ;;
         mbtree)         cmd_mbtree ;;
         opengop)        cmd_opengop ;;
-        all)            cmd_baseline_check; cmd_paff; cmd_matrix; cmd_rc; cmd_sliced; cmd_la_range; cmd_wide_range; cmd_motion; cmd_opengop ;;
+        rtrn)           cmd_rtrn ;;
+        all)            cmd_baseline_check; cmd_paff; cmd_matrix; cmd_rc; cmd_sliced; cmd_la_range; cmd_wide_range; cmd_motion; cmd_opengop; cmd_rtrn ;;
         *)              die "unknown command: $cmd" ;;
     esac
 done

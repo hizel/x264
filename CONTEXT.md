@@ -58,6 +58,14 @@ _Avoid_: pure-field picture
 **Field order (TFF/BFF)**:
 Which field is displayed first: top (TFF) or bottom (BFF).
 
+**RTRN profile**:
+The customer delivery profile for RTRN (Russian Television and Radio
+Broadcasting Network, РТРС): PAFF TFF, open GOP, GOP geometry M=4/N=28,
+ref 4, Main@L3, ABR 2720 kbit/s with VBV 3500/1400 and HRD off, AUD,
+BT.601 PAL colorimetry, SAR 16:11, 25 fps. Requirements from ticket
+#11121, profile named in ticket #63682.
+_Avoid_: RTRS, reference profile
+
 ## Threading
 
 **Frame-thread slot**:

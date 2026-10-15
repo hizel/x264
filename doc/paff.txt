@@ -470,6 +470,76 @@ Known decoder quirks
     the same fixed-function decode is reachable through VA-API/iHD.
 
 
+The RTRN broadcast profile
+--------------------------
+
+RTRN (Russian Television and Radio Broadcasting Network) requires a
+specific H.264 stream shape for SD delivery.  The reference verification
+line (ffmpeg + libx264) is:
+
+    ffmpeg -i in.ts \
+      -vf "setparams=field_mode=tff:color_primaries=bt470bg:color_trc=bt470bg:colorspace=bt470bg:range=limited" \
+      -c:v libx264 -paff 1 -flags +ildct+ilme -flags -cgop \
+      -bf 3 -b_strategy 0 -g 28 -keyint_min 28 -refs 4 \
+      -profile:v main -level 3.0 -b:v 2720k -maxrate 3500k -bufsize 1400k -aud 1 \
+      -c:a mp2 -b:a 192k -ac 2 -f mpegts out.ts
+
+Requirement-by-requirement mapping to the x264 CLI:
+
+    1. IDR only at SCTE marks   --open-gop: recovery (non-IDR I) keyframe
+                                  pairs instead of IDRs, so the default
+                                  stream carries exactly one IDR (the
+                                  stream start).  Keyframes forced at
+                                  SCTE marks are an API-level concern
+                                  (i_keyint-controlled forced IDR), out
+                                  of scope for the CLI profile.
+    2. open GOP                 --open-gop
+    3. PAFF instead of MBAFF    --paff --tff
+    4. bitrate 2.72 Mbit/s      --bitrate 2720 --vbv-maxrate 3500
+                                  --vbv-bufsize 1400.  "CBR" here is
+                                  container-level CBR (constant muxrate
+                                  is the muxer's job); the elementary
+                                  stream is ABR bounded by the VBV.
+                                  --nal-hrd cbr is impossible at
+                                  bitrate != vbv-maxrate (the encoder
+                                  warns and silently downgrades to VBR),
+                                  and requirement 11 deactivates HRD
+                                  anyway.
+    5. GOP = 28 frames          --keyint 28 --min-keyint 28.  Note:
+                                  --min-keyint 28 is clamped by the
+                                  encoder to keyint/2+1 = 15; this is
+                                  upstream behaviour, visible in the
+                                  Encoding settings line, not a bug.
+    6. fps = 25                 --fps 25
+    7. BBBP                     --bframes 3 --b-adapt 0
+    8. AVC Level 3.0            --profile main --level 3.0
+    9. Reference Frames = 4     --ref 4
+   10. AR 16:9 (aspect_ratio_idc = 4)
+                                --sar 16:11 (PAL 720x576 with overscan;
+                                NOT 64:45)
+   11. HRD deactivated          the default -- carry no --nal-hrd at all
+
+plus, from the reference line rather than the numbered requirements:
+AUD units (--aud), BT.601 PAL colorimetry (--colorprim bt470bg
+--transfer bt470bg --colormatrix bt470bg) and limited range (--range tv).
+
+Regression coverage: tools/test_paff.sh rtrn encodes this profile on a
+synthesized 720x576 clip and asserts the customer-visible stream shape --
+the MediaInfo field table (Interlaced / Separated fields / scan order,
+Main@L3, CABAC / 4 Ref Frames, BT.601 PAL / BT.470 B/G, Limited, 25 fps,
+DAR 16:9), the GOP geometry (N=28, M=4, two field access units per frame,
+exactly one IDR via a NAL-type scan), a BFF parity variant, and
+byte-repeat at --threads 1 and --threads 4 (both PAFF pair drivers).
+The suite needs mediainfo and python3 on PATH and skips visibly without
+them.  MediaInfo only computes the "Format settings, GOP: M=4, N=28" line
+in a container context, and the system ffmpeg cannot remux raw PAFF (the
+mpegts muxer rejects timestamp-less field access units -- a data point
+for the remux limitation tracked separately), so the container-level cell
+runs the full reference line only when FFMPEG_PAFF points at a
+PAFF-capable ffmpeg build (the sapsan build is the intended source) and
+is skipped otherwise.
+
+
 Testing
 -------
 
@@ -486,6 +556,9 @@ Testing
   * tools/test_paff_ci.sh: JM-free CI smoke; includes sliced-PAFF cells
     (N=4 encode with the expected slice count, the field-row thread clamp,
     fixed-N byte repeatability, sliced CBR+VBV CPB check).
+  * tools/test_paff.sh rtrn: RTRN broadcast profile regression -- the
+    customer-visible stream shape asserted with mediainfo/ffprobe; see
+    "The RTRN broadcast profile".
   * tools/check_hrd.py: Annex C CPB simulator for --nal-hrd cbr streams.
   * tools/test_paff.sh opengop: open-GOP round-trips vs JM -- keyint-driven
     non-IDR Ip keyframe pairs plus a hard-scene-cut clip whose GOP-tail B
